@@ -53,12 +53,12 @@ public class JobRepository : IJobRepository
             INSERT INTO Jobs (
                 Id, Name, Description, BucketA_Json, BucketB_Json, Mode, ScheduleType,
                 IntervalMinutes, CronExpression, IsEnabled, ReplicationGracePeriodMinutes,
-                DetectSequenceGaps, MaxSequenceGapThreshold, CreatedAtUtc, UpdatedAtUtc,
+                DetectSequenceGaps, MaxSequenceGapThreshold, AlertConfig_Json, CreatedAtUtc, UpdatedAtUtc,
                 LastRunTimeUtc, NextRunTimeUtc, LastRunStatus
             ) VALUES (
                 @Id, @Name, @Description, @BucketA_Json, @BucketB_Json, @Mode, @ScheduleType,
                 @IntervalMinutes, @CronExpression, @IsEnabled, @ReplicationGracePeriodMinutes,
-                @DetectSequenceGaps, @MaxSequenceGapThreshold, @CreatedAtUtc, @UpdatedAtUtc,
+                @DetectSequenceGaps, @MaxSequenceGapThreshold, @AlertConfig_Json, @CreatedAtUtc, @UpdatedAtUtc,
                 @LastRunTimeUtc, @NextRunTimeUtc, @LastRunStatus
             )
             ON CONFLICT(Id) DO UPDATE SET
@@ -74,6 +74,7 @@ public class JobRepository : IJobRepository
                 ReplicationGracePeriodMinutes = excluded.ReplicationGracePeriodMinutes,
                 DetectSequenceGaps = excluded.DetectSequenceGaps,
                 MaxSequenceGapThreshold = excluded.MaxSequenceGapThreshold,
+                AlertConfig_Json = excluded.AlertConfig_Json,
                 UpdatedAtUtc = excluded.UpdatedAtUtc,
                 LastRunTimeUtc = excluded.LastRunTimeUtc,
                 NextRunTimeUtc = excluded.NextRunTimeUtc,
@@ -95,6 +96,7 @@ public class JobRepository : IJobRepository
             job.ReplicationGracePeriodMinutes,
             DetectSequenceGaps = job.DetectSequenceGaps ? 1 : 0,
             job.MaxSequenceGapThreshold,
+            AlertConfig_Json = JsonSerializer.Serialize(job.AlertConfig),
             CreatedAtUtc = job.CreatedAtUtc.ToString("O"),
             UpdatedAtUtc = job.UpdatedAtUtc.ToString("O"),
             LastRunTimeUtc = job.LastRunTimeUtc?.ToString("O"),
@@ -165,6 +167,11 @@ public class JobRepository : IJobRepository
         if (r.BucketB_Json != null)
         {
             job.BucketB = JsonSerializer.Deserialize<S3BucketConfig>((string)r.BucketB_Json) ?? new();
+        }
+
+        if (r is IDictionary<string, object> dict && dict.TryGetValue("AlertConfig_Json", out var alertJson) && alertJson is string jsonStr && !string.IsNullOrWhiteSpace(jsonStr))
+        {
+            job.AlertConfig = JsonSerializer.Deserialize<JobAlertConfig>(jsonStr) ?? new();
         }
 
         return job;

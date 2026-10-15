@@ -284,4 +284,50 @@ public class ServiceClient
             return false;
         }
     }
+
+    public async Task<(bool Success, string Message)> TestSmtpAsync(JobAlertConfig config)
+    {
+        try
+        {
+            var resp = await _http.PostAsJsonAsync("/api/alerts/test-smtp", config);
+            if (resp.IsSuccessStatusCode)
+            {
+                var result = await resp.Content.ReadFromJsonAsync<AlertTestResponse>();
+                if (result != null) return (result.Success, result.Message);
+            }
+        }
+        catch
+        {
+            // Worker service may be offline - fallback to direct test
+        }
+
+        var directService = new S3CompareService.Core.Notifications.AlertNotificationService();
+        return await directService.TestSmtpConnectionAsync(config);
+    }
+
+    public async Task<(bool Success, string Message)> TestAzureWebhookAsync(JobAlertConfig config)
+    {
+        try
+        {
+            var resp = await _http.PostAsJsonAsync("/api/alerts/test-azure-webhook", config);
+            if (resp.IsSuccessStatusCode)
+            {
+                var result = await resp.Content.ReadFromJsonAsync<AlertTestResponse>();
+                if (result != null) return (result.Success, result.Message);
+            }
+        }
+        catch
+        {
+            // Worker service may be offline - fallback to direct test
+        }
+
+        var directService = new S3CompareService.Core.Notifications.AlertNotificationService();
+        return await directService.TestAzureWebhookAsync(config);
+    }
+}
+
+public class AlertTestResponse
+{
+    public bool Success { get; set; }
+    public string Message { get; set; } = string.Empty;
 }

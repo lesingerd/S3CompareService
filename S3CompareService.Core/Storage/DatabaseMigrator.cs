@@ -31,6 +31,7 @@ public class DatabaseMigrator
                 ReplicationGracePeriodMinutes INTEGER NOT NULL DEFAULT 15,
                 DetectSequenceGaps INTEGER NOT NULL DEFAULT 1,
                 MaxSequenceGapThreshold INTEGER NOT NULL DEFAULT 25,
+                AlertConfig_Json TEXT,
                 CreatedAtUtc TEXT NOT NULL,
                 UpdatedAtUtc TEXT NOT NULL,
                 LastRunTimeUtc TEXT,
@@ -147,5 +148,17 @@ public class DatabaseMigrator
         ";
 
         await conn.ExecuteAsync(new CommandDefinition(sql, cancellationToken: cancellationToken)).ConfigureAwait(false);
+
+        // Incremental column migration for existing databases
+        var columns = (await conn.QueryAsync<string>(
+            new CommandDefinition("SELECT name FROM pragma_table_info('Jobs')", cancellationToken: cancellationToken)
+        ).ConfigureAwait(false)).ToList();
+
+        if (!columns.Contains("AlertConfig_Json", StringComparer.OrdinalIgnoreCase))
+        {
+            await conn.ExecuteAsync(
+                new CommandDefinition("ALTER TABLE Jobs ADD COLUMN AlertConfig_Json TEXT;", cancellationToken: cancellationToken)
+            ).ConfigureAwait(false);
+        }
     }
 }

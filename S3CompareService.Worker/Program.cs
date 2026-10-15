@@ -2,6 +2,7 @@ using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using S3CompareService.Core.Engine;
 using S3CompareService.Core.Models;
+using S3CompareService.Core.Notifications;
 using S3CompareService.Core.Storage;
 using S3CompareService.Worker.Services;
 
@@ -41,6 +42,7 @@ builder.Services.AddSingleton<IJobRepository, JobRepository>();
 builder.Services.AddSingleton<IScanRunRepository, ScanRunRepository>();
 builder.Services.AddSingleton<IDifferenceRepository, DifferenceRepository>();
 builder.Services.AddSingleton<IAuditLogRepository, AuditLogRepository>();
+builder.Services.AddSingleton<IAlertNotificationService, AlertNotificationService>();
 
 // Engine & Coordination
 builder.Services.AddSingleton<ScanExecutionCoordinator>();
@@ -268,6 +270,19 @@ app.MapGet("/api/logs", async (IAuditLogRepository repo, [FromQuery] int count =
 {
     var logs = await repo.GetRecentLogsAsync(count, level);
     return Results.Ok(logs);
+});
+
+// 13. Alert Testing
+app.MapPost("/api/alerts/test-smtp", async ([FromBody] JobAlertConfig config, IAlertNotificationService alertService) =>
+{
+    var (success, message) = await alertService.TestSmtpConnectionAsync(config);
+    return Results.Ok(new { Success = success, Message = message });
+});
+
+app.MapPost("/api/alerts/test-azure-webhook", async ([FromBody] JobAlertConfig config, IAlertNotificationService alertService) =>
+{
+    var (success, message) = await alertService.TestAzureWebhookAsync(config);
+    return Results.Ok(new { Success = success, Message = message });
 });
 
 app.Run();

@@ -76,7 +76,8 @@ public class CrashRecoveryTests
         Assert.AreEqual(1, unfinished.Count);
 
         // Run recovery manager
-        var coordinator = new ScanExecutionCoordinator(_jobRepo, _runRepo, _diffRepo, _auditRepo, NullLogger<ScanExecutionCoordinator>.Instance);
+        var alertService = new S3CompareService.Core.Notifications.AlertNotificationService(_auditRepo);
+        var coordinator = new ScanExecutionCoordinator(_jobRepo, _runRepo, _diffRepo, _auditRepo, alertService, NullLogger<ScanExecutionCoordinator>.Instance);
         var recovery = new CrashRecoveryManager(_runRepo, _jobRepo, _auditRepo, coordinator, NullLogger<CrashRecoveryManager>.Instance);
 
         await recovery.RunStartupRecoveryAsync();

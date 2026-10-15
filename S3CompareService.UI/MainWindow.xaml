@@ -620,6 +620,172 @@
                                         </StackPanel>
                                     </Border>
                                 </Grid>
+
+                                <!-- ALERTS & NOTIFICATIONS (THRESHOLDS, SMTP & AZURE) -->
+                                <Border Background="#25272B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="14" Margin="0,16,0,0">
+                                    <StackPanel>
+                                        <Grid Margin="0,0,0,12">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                <TextBlock Text="🔔 ALERTS &amp; NOTIFICATIONS (PER-JOB THRESHOLDS, SMTP &amp; AZURE)" FontWeight="Bold" Foreground="#4EC9B0" FontSize="13" />
+                                            </StackPanel>
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                                <CheckBox Content="Enable Alerting for this Job" IsChecked="{Binding SelectedJob.AlertConfig.IsEnabled}" FontWeight="Bold" Foreground="#81C784" VerticalAlignment="Center" Margin="0,0,16,0" />
+                                                <CheckBox Content="Alert on Scan Failure" IsChecked="{Binding SelectedJob.AlertConfig.AlertOnScanFailure}" Foreground="#FF6B6B" VerticalAlignment="Center" Margin="0,0,16,0" />
+                                                <CheckBox Content="Notify on Clean Scan" IsChecked="{Binding SelectedJob.AlertConfig.NotifyOnCleanScan}" Foreground="#9CDCFE" VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </Grid>
+
+                                        <!-- THRESHOLDS SECTION -->
+                                        <Border Background="#1E1E1E" BorderBrush="#333337" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,12">
+                                            <StackPanel>
+                                                <TextBlock Text="DISPARITY ALERT THRESHOLDS (CONFIRMED DIFFERENCES)" FontWeight="SemiBold" Foreground="#DCDCAA" Margin="0,0,0,8" />
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="10" />
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="10" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <Grid.RowDefinitions>
+                                                        <RowDefinition Height="Auto" />
+                                                        <RowDefinition Height="6" />
+                                                        <RowDefinition Height="Auto" />
+                                                    </Grid.RowDefinitions>
+
+                                                    <!-- Col 1 -->
+                                                    <StackPanel Grid.Column="0" Grid.Row="0">
+                                                        <TextBlock Text="Max Confirmed Disparities:" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxDisparitiesThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+                                                    <StackPanel Grid.Column="0" Grid.Row="2">
+                                                        <TextBlock Text="Max Missing in Bucket B (Target):" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxMissingInBThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+
+                                                    <!-- Col 2 -->
+                                                    <StackPanel Grid.Column="2" Grid.Row="0">
+                                                        <TextBlock Text="Max Missing in Bucket A (Source):" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxMissingInAThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+                                                    <StackPanel Grid.Column="2" Grid.Row="2">
+                                                        <TextBlock Text="Max Size Mismatches:" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxSizeMismatchThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+
+                                                    <!-- Col 3 -->
+                                                    <StackPanel Grid.Column="4" Grid.Row="0">
+                                                        <TextBlock Text="Max ETag / Hash Mismatches:" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxEtagMismatchThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+                                                    <StackPanel Grid.Column="4" Grid.Row="2">
+                                                        <TextBlock Text="Max Sequence / Numerical Gaps:" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxSequenceGapsThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+                                                </Grid>
+                                                <TextBlock Text="ℹ️ Thresholds trigger when confirmed disparities exceed the set limit. In-flight objects within the Replication Grace Period are automatically excluded to prevent false alerts." 
+                                                           Foreground="#888888" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap" />
+                                            </StackPanel>
+                                        </Border>
+
+                                        <!-- NOTIFICATION TARGETS: SMTP (EMAIL) & AZURE -->
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="12" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <!-- EMAIL / SMTP CONFIGURATION -->
+                                            <Border Grid.Column="0" Background="#1E1E1E" BorderBrush="#333337" BorderThickness="1" CornerRadius="4" Padding="12">
+                                                <StackPanel>
+                                                    <Grid Margin="0,0,0,8">
+                                                        <TextBlock Text="EMAIL / SMTP NOTIFICATIONS" FontWeight="SemiBold" Foreground="#9CDCFE" VerticalAlignment="Center" />
+                                                        <Button Content="Test SMTP Email" Command="{Binding TestSmtpCommand}" HorizontalAlignment="Right" Style="{StaticResource SecondaryButton}" Padding="8,3" FontSize="11" />
+                                                    </Grid>
+
+                                                    <Grid Margin="0,0,0,6">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="8" />
+                                                            <ColumnDefinition Width="70" />
+                                                            <ColumnDefinition Width="8" />
+                                                            <ColumnDefinition Width="Auto" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <StackPanel Grid.Column="0">
+                                                            <TextBlock Text="SMTP Host:" Margin="0,0,0,2" FontSize="11" />
+                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.SmtpHost, UpdateSourceTrigger=PropertyChanged}" />
+                                                        </StackPanel>
+                                                        <StackPanel Grid.Column="2">
+                                                            <TextBlock Text="Port:" Margin="0,0,0,2" FontSize="11" />
+                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.SmtpPort, UpdateSourceTrigger=PropertyChanged}" />
+                                                        </StackPanel>
+                                                        <StackPanel Grid.Column="4" VerticalAlignment="Bottom">
+                                                            <CheckBox Content="SSL/TLS" IsChecked="{Binding SelectedJob.AlertConfig.SmtpEnableSsl}" Margin="0,0,0,6" />
+                                                        </StackPanel>
+                                                    </Grid>
+
+                                                    <Grid Margin="0,0,0,6">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="8" />
+                                                            <ColumnDefinition Width="*" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <StackPanel Grid.Column="0">
+                                                            <TextBlock Text="Username / Account:" Margin="0,0,0,2" FontSize="11" />
+                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.SmtpUsername, UpdateSourceTrigger=PropertyChanged}" />
+                                                        </StackPanel>
+                                                        <StackPanel Grid.Column="2">
+                                                            <TextBlock Text="Password / Secret:" Margin="0,0,0,2" FontSize="11" />
+                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.SmtpPassword, UpdateSourceTrigger=PropertyChanged}" />
+                                                        </StackPanel>
+                                                    </Grid>
+
+                                                    <Grid Margin="0,0,0,4">
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="*" />
+                                                            <ColumnDefinition Width="8" />
+                                                            <ColumnDefinition Width="*" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <StackPanel Grid.Column="0">
+                                                            <TextBlock Text="Sender Email (From):" Margin="0,0,0,2" FontSize="11" />
+                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.FromEmail, UpdateSourceTrigger=PropertyChanged}" />
+                                                        </StackPanel>
+                                                        <StackPanel Grid.Column="2">
+                                                            <TextBlock Text="Recipients (To, comma-separated):" Margin="0,0,0,2" FontSize="11" />
+                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.ToEmails, UpdateSourceTrigger=PropertyChanged}" />
+                                                        </StackPanel>
+                                                    </Grid>
+                                                </StackPanel>
+                                            </Border>
+
+                                            <!-- AZURE ALERTING INTEGRATION -->
+                                            <Border Grid.Column="2" Background="#1E1E1E" BorderBrush="#333337" BorderThickness="1" CornerRadius="4" Padding="12">
+                                                <StackPanel>
+                                                    <Grid Margin="0,0,0,8">
+                                                        <TextBlock Text="AZURE ALERTING INTEGRATION" FontWeight="SemiBold" Foreground="#4EC9B0" VerticalAlignment="Center" />
+                                                        <Button Content="Test Azure Webhook" Command="{Binding TestAzureWebhookCommand}" HorizontalAlignment="Right" Style="{StaticResource SecondaryButton}" Padding="8,3" FontSize="11" />
+                                                    </Grid>
+
+                                                    <TextBlock Text="Azure Webhook URL (Logic App / Azure Function / Action Group):" Margin="0,0,0,2" FontSize="11" />
+                                                    <TextBox Text="{Binding SelectedJob.AlertConfig.AzureWebhookUrl, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                                    <TextBlock Text="Azure App Insights Connection String (Optional Telemetry):" Margin="0,0,0,2" FontSize="11" />
+                                                    <TextBox Text="{Binding SelectedJob.AlertConfig.AzureAppInsightsConnectionString, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                                    <Border Background="#1A2634" BorderBrush="#2D4A6E" BorderThickness="1" CornerRadius="3" Padding="8" Margin="0,4,0,0">
+                                                        <TextBlock Text="☁️ Azure Logic Apps allow instant webhook alerts directly to Microsoft Teams channels, SMS, or PagerDuty without writing code. Simply paste the HTTP Trigger URL here." 
+                                                                   FontSize="11" Foreground="#9CDCFE" TextWrapping="Wrap" />
+                                                    </Border>
+                                                </StackPanel>
+                                            </Border>
+                                        </Grid>
+                                    </StackPanel>
+                                </Border>
                             </StackPanel>
                         </ScrollViewer>
                     </Border>

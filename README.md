@@ -17,6 +17,17 @@ It runs continuous comparisons on automated schedules (interval or cron), captur
 - **Replication Lag Grace Period (In-Flight Replication Shield)**:
   - Configurable window (e.g., 15 minutes) to ignore recent files from causing disparity alerts while replication jobs are actively copying data across regions.
   - Full raw data is **100% preserved** in the database with clipping and tag annotations (`[IN_FLIGHT_REPLICATION]` vs `[CONFIRMED_DISPARITY]`), allowing clean reporting while retaining complete audit trails.
+- **Per-Job Alert Thresholds & Automated Notifications**:
+  - Configurable alert thresholds per job: Max Confirmed Disparities, Max Missing in Bucket B (Target), Max Missing in Bucket A (Source), Max Size Mismatches, Max ETag/Hash Mismatches, and Max Sequence Gaps.
+  - **Lag-Aware Alerting**: Disparity thresholds evaluate against confirmed differences only, automatically preventing false alarm pages when objects are within the active replication grace period.
+  - Failure alerting immediately triggers on network drops, S3 permission errors, or service interruptions.
+  - Optional clean scan digests for automated audit logging.
+- **Enterprise Notification Dispatchers**:
+  - **SMTP / Email**: Rich HTML alert emails featuring job status, metrics summary, and confirmed disparity samples with host, port, SSL, authentication, sender, and recipient configuration.
+  - **Azure-Based Alerting**:
+    - **Azure Logic Apps / Webhook**: Seamless zero-code integration. Provide an HTTP Trigger URL to route structured JSON payloads directly to Microsoft Teams channels, Slack, SMS, or PagerDuty.
+    - **Azure Application Insights**: Direct ingestion endpoint telemetry using connection strings to feed Azure Monitor dashboards and custom alerting rules.
+  - Built-in test buttons in the UI and REST API (`/api/alerts/test-smtp`, `/api/alerts/test-azure-webhook`) for instant connectivity verification.
 - **Crash Recovery & Ephemeral Data Resilience**:
   - Continuous incremental checkpointing to database every 5 seconds.
   - Service automatically detects interrupted scans upon startup, recovers state, and can resume from `LastEvaluatedKey`.

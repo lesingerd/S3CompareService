@@ -23,6 +23,7 @@ public class ScanExecutionCoordinator
     private readonly IScanRunRepository _scanRunRepo;
     private readonly IDifferenceRepository _diffRepo;
     private readonly IAuditLogRepository _auditLogRepo;
+    private readonly S3CompareService.Core.Notifications.IAlertNotificationService _alertService;
     private readonly ILogger<ScanExecutionCoordinator> _logger;
 
     private readonly ConcurrentDictionary<string, ActiveScanContext> _activeScansByRunId = new();
@@ -33,12 +34,14 @@ public class ScanExecutionCoordinator
         IScanRunRepository scanRunRepo,
         IDifferenceRepository diffRepo,
         IAuditLogRepository auditLogRepo,
+        S3CompareService.Core.Notifications.IAlertNotificationService alertService,
         ILogger<ScanExecutionCoordinator> logger)
     {
         _jobRepo = jobRepo;
         _scanRunRepo = scanRunRepo;
         _diffRepo = diffRepo;
         _auditLogRepo = auditLogRepo;
+        _alertService = alertService;
         _logger = logger;
     }
 
@@ -117,6 +120,13 @@ public class ScanExecutionCoordinator
                 await engine.RunAsync(cts.Token);
                 await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Completed);
                 _logger.LogInformation("Scan execution finished for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
+
+                // Evaluate Alert Thresholds & Dispatch Notifications
+                var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(job, run);
+                if (shouldAlert)
+                {
+                    await _alertService.DispatchAlertsAsync(job, run, reasons);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -127,6 +137,13 @@ public class ScanExecutionCoordinator
             {
                 _logger.LogError(ex, "Scan execution failed for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
                 await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Failed);
+
+                // Dispatch failure alert if configured
+                var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(job, run);
+                if (shouldAlert)
+                {
+                    await _alertService.DispatchAlertsAsync(job, run, reasons);
+                }
             }
             finally
             {

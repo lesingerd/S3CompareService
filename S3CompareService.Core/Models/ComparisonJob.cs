@@ -27,6 +27,8 @@ public class ComparisonJob
     public bool DetectSequenceGaps { get; set; } = true;
     public int MaxSequenceGapThreshold { get; set; } = 25;
 
+    public JobAlertConfig AlertConfig { get; set; } = new();
+
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime? LastRunTimeUtc { get; set; }

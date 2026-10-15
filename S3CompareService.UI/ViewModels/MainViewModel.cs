@@ -48,6 +48,10 @@ public class MainViewModel : ViewModelBase
         get => _selectedJob;
         set
         {
+            if (value != null && value.AlertConfig == null)
+            {
+                value.AlertConfig = new JobAlertConfig();
+            }
             if (SetField(ref _selectedJob, value))
             {
                 OnPropertyChanged(nameof(HasSelectedJob));
@@ -194,6 +198,8 @@ public class MainViewModel : ViewModelBase
     public RelayCommand RunJobNowCommand { get; }
     public RelayCommand TestConnectionACommand { get; }
     public RelayCommand TestConnectionBCommand { get; }
+    public RelayCommand TestSmtpCommand { get; }
+    public RelayCommand TestAzureWebhookCommand { get; }
 
     public RelayCommand RefreshRunsCommand { get; }
     public RelayCommand RefreshDifferencesCommand { get; }
@@ -238,6 +244,8 @@ public class MainViewModel : ViewModelBase
 
         TestConnectionACommand = new RelayCommand(async () => await TestConnectionAsync(true));
         TestConnectionBCommand = new RelayCommand(async () => await TestConnectionAsync(false));
+        TestSmtpCommand = new RelayCommand(async () => await TestSmtpAsync());
+        TestAzureWebhookCommand = new RelayCommand(async () => await TestAzureWebhookAsync());
 
         RefreshRunsCommand = new RelayCommand(async () => await LoadRunsAsync());
         RefreshDifferencesCommand = new RelayCommand(async () => await LoadDifferencesAsync());
@@ -395,6 +403,40 @@ public class MainViewModel : ViewModelBase
         {
             MessageBox.Show($"[FAILED] {sideName} connection failed:\n{msg}", $"{sideName} Test", MessageBoxButton.OK, MessageBoxImage.Error);
             StatusMessage = $"{sideName} test failed.";
+        }
+    }
+
+    public async Task TestSmtpAsync()
+    {
+        if (SelectedJob == null) return;
+        StatusMessage = "Sending test alert via SMTP...";
+        var (ok, msg) = await _client.TestSmtpAsync(SelectedJob.AlertConfig);
+        if (ok)
+        {
+            MessageBox.Show($"[SUCCESS] SMTP alert test succeeded:\n{msg}", "SMTP Alert Test", MessageBoxButton.OK, MessageBoxImage.Information);
+            StatusMessage = "SMTP alert test successful.";
+        }
+        else
+        {
+            MessageBox.Show($"[FAILED] SMTP alert test failed:\n{msg}", "SMTP Alert Test", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusMessage = "SMTP alert test failed.";
+        }
+    }
+
+    public async Task TestAzureWebhookAsync()
+    {
+        if (SelectedJob == null) return;
+        StatusMessage = "Sending test payload to Azure webhook...";
+        var (ok, msg) = await _client.TestAzureWebhookAsync(SelectedJob.AlertConfig);
+        if (ok)
+        {
+            MessageBox.Show($"[SUCCESS] Azure alert test succeeded:\n{msg}", "Azure Webhook Test", MessageBoxButton.OK, MessageBoxImage.Information);
+            StatusMessage = "Azure webhook test successful.";
+        }
+        else
+        {
+            MessageBox.Show($"[FAILED] Azure alert test failed:\n{msg}", "Azure Webhook Test", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusMessage = "Azure webhook test failed.";
         }
     }
 
