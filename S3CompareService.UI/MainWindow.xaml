@@ -1,0 +1,714 @@
+<Window x:Class="S3CompareService.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:converters="clr-namespace:S3CompareService.UI.Converters"
+        xmlns:vm="clr-namespace:S3CompareService.UI.ViewModels"
+        mc:Ignorable="d"
+        Title="S3 Compare Continuous Service Manager" 
+        Height="900" Width="1440"
+        MinHeight="750" MinWidth="1100"
+        WindowStartupLocation="CenterScreen"
+        Background="#1E1E1E" Foreground="#CCCCCC"
+        Icon="icon.ico">
+
+    <Window.DataContext>
+        <vm:MainViewModel />
+    </Window.DataContext>
+
+    <Window.Resources>
+        <converters:DifferenceTypeToBrushConverter x:Key="DiffBrushConverter" />
+        <converters:GracePeriodTagConverter x:Key="GraceTagConverter" />
+        <converters:InverseBooleanConverter x:Key="InverseBoolConverter" />
+        <BooleanToVisibilityConverter x:Key="BoolToVisConverter" />
+
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#CCCCCC" />
+            <Setter Property="FontSize" Value="13" />
+        </Style>
+
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#2D2D30" />
+            <Setter Property="Foreground" Value="#FFFFFF" />
+            <Setter Property="BorderBrush" Value="#3F3F46" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#2D2D30" />
+            <Setter Property="Foreground" Value="#FFFFFF" />
+            <Setter Property="BorderBrush" Value="#3F3F46" />
+            <Setter Property="Padding" Value="6,4" />
+        </Style>
+
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#0E639C" />
+            <Setter Property="Foreground" Value="#FFFFFF" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="12,6" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}" CornerRadius="3" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#1177BB" />
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Background" Value="#3E3E42" />
+                    <Setter Property="Foreground" Value="#7F7F7F" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="SuccessButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#2E7D32" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#388E3C" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="DangerButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#C62828" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#D32F2F" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="SecondaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="#3E3E42" />
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#505054" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style TargetType="TabItem">
+            <Setter Property="Background" Value="#252526" />
+            <Setter Property="Foreground" Value="#999999" />
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Padding" Value="16,8" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border Name="TabBorder" Background="{TemplateBinding Background}" Margin="0,0,2,0" CornerRadius="4,4,0,0" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#1E1E1E" />
+                                <Setter Property="Foreground" Value="#007ACC" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Foreground" Value="#FFFFFF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="DataGrid">
+            <Setter Property="Background" Value="#252526" />
+            <Setter Property="Foreground" Value="#CCCCCC" />
+            <Setter Property="RowBackground" Value="#252526" />
+            <Setter Property="AlternatingRowBackground" Value="#2A2A2B" />
+            <Setter Property="BorderBrush" Value="#3F3F46" />
+            <Setter Property="GridLinesVisibility" Value="Horizontal" />
+            <Setter Property="HorizontalGridLinesBrush" Value="#333337" />
+            <Setter Property="HeadersVisibility" Value="Column" />
+            <Setter Property="CanUserAddRows" Value="False" />
+            <Setter Property="CanUserDeleteRows" Value="False" />
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="SelectionMode" Value="Single" />
+            <Setter Property="AutoGenerateColumns" Value="False" />
+        </Style>
+
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="#2D2D30" />
+            <Setter Property="Foreground" Value="#E0E0E0" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Padding" Value="8,6" />
+            <Setter Property="BorderBrush" Value="#3F3F46" />
+            <Setter Property="BorderThickness" Value="0,0,1,1" />
+        </Style>
+
+        <Style TargetType="DataGridCell">
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="DataGridCell">
+                        <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter VerticalAlignment="Center" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#094771" />
+                    <Setter Property="Foreground" Value="#FFFFFF" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <!-- Header -->
+            <RowDefinition Height="Auto" />
+            <!-- Active Scan Monitor Banner -->
+            <RowDefinition Height="Auto" />
+            <!-- Main Content Tabs -->
+            <RowDefinition Height="*" />
+            <!-- Status Bar -->
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- HEADER -->
+        <Border Grid.Row="0" Background="#252526" BorderBrush="#3F3F46" BorderThickness="0,0,0,1" Padding="16,10">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Image Source="icon.png" Width="32" Height="32" Margin="0,0,12,0" />
+                    <StackPanel>
+                        <TextBlock Text="S3 COMPARE SERVICE" FontSize="18" FontWeight="Bold" Foreground="#4EC9B0" />
+                        <TextBlock Text="Continuous Bucket Comparison, Replication Lag Shield &amp; Audit Engine" FontSize="11" Foreground="#888888" />
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Status indicator -->
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Border Background="#2D2D30" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="10,4" Margin="0,0,12,0">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="SERVICE: " FontWeight="Bold" Foreground="#AAAAAA" />
+                            <TextBlock Text="{Binding ServiceStatus.Status}" FontWeight="Bold" 
+                                       Foreground="{Binding ServiceStatus.Status, Converter={x:Null}}" Margin="0,0,12,0" />
+                            <TextBlock Text="Uptime: " Foreground="#888888" />
+                            <TextBlock Text="{Binding ServiceStatus.Uptime}" Foreground="#CCCCCC" Margin="0,0,12,0" />
+                            <TextBlock Text="RAM: " Foreground="#888888" />
+                            <TextBlock Text="{Binding ServiceStatus.MemoryMB, StringFormat={}{0:F1} MB}" Foreground="#CCCCCC" />
+                        </StackPanel>
+                    </Border>
+
+                    <Button Content="Start Service" Command="{Binding StartServiceCommand}" Style="{StaticResource SuccessButton}" Margin="0,0,6,0" />
+                    <Button Content="Stop" Command="{Binding StopServiceCommand}" Style="{StaticResource DangerButton}" Margin="0,0,6,0" />
+                    <Button Content="Restart" Command="{Binding RestartServiceCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,6,0" />
+                    <Button Content="Refresh" Command="{Binding RefreshStatusCommand}" Style="{StaticResource SecondaryButton}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- LIVE ACTIVE SCAN BANNER -->
+        <Border Grid.Row="1" Background="#1B3828" BorderBrush="#2E7D32" BorderThickness="0,0,0,2" Padding="14,8"
+                Visibility="{Binding CurrentActiveScan, Converter={StaticResource BoolToVisConverter}}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="▶ SCANNING ACTIVE:" FontWeight="Bold" Foreground="#81C784" Margin="0,0,8,0" />
+                    <TextBlock Text="{Binding CurrentActiveScan.JobName}" FontWeight="Bold" Foreground="#FFFFFF" Margin="0,0,16,0" />
+                    <TextBlock Text="Duration: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.Duration}" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,16,0" />
+                    <TextBlock Text="Speed: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.ItemsPerSecond, StringFormat={}{0:N0} obj/s}" FontWeight="SemiBold" Foreground="#81C784" Margin="0,0,16,0" />
+                    <TextBlock Text="Evaluated: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.ObjectsCompared, StringFormat={}{0:N0}}" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,16,0" />
+                    <TextBlock Text="Matched: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.MatchedCount, StringFormat={}{0:N0}}" FontWeight="SemiBold" Foreground="#4EC9B0" Margin="0,0,16,0" />
+                    <TextBlock Text="Raw Diffs: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.TotalDifferences, StringFormat={}{0:N0}}" FontWeight="Bold" Foreground="#F48771" Margin="0,0,16,0" />
+                    <TextBlock Text="Confirmed: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.FilteredDifferencesCount, StringFormat={}{0:N0}}" FontWeight="Bold" Foreground="#FF6B6B" Margin="0,0,16,0" />
+                    <TextBlock Text="In-Flight Lag: " Foreground="#A5D6A7" />
+                    <TextBlock Text="{Binding CurrentActiveScan.InFlightDifferencesCount, StringFormat={}{0:N0}}" FontWeight="Bold" Foreground="#FFD166" />
+                </StackPanel>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button Content="Pause" Command="{Binding PauseActiveScanCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,6,0" />
+                    <Button Content="Resume" Command="{Binding ResumeActiveScanCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,6,0" />
+                    <Button Content="Cancel Scan" Command="{Binding CancelActiveScanCommand}" Style="{StaticResource DangerButton}" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- MAIN TABS -->
+        <TabControl Grid.Row="2" Background="#1E1E1E" BorderThickness="0" Margin="10,6">
+
+            <!-- TAB 1: JOBS & SCHEDULES -->
+            <TabItem Header="Comparison Jobs">
+                <Grid Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="340" />
+                        <ColumnDefinition Width="10" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <!-- Left: Jobs List -->
+                    <Border Grid.Column="0" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <Border Background="#2D2D30" Padding="10,8" BorderBrush="#3F3F46" BorderThickness="0,0,0,1">
+                                <TextBlock Text="SCHEDULED JOBS" FontWeight="Bold" Foreground="#4EC9B0" />
+                            </Border>
+
+                            <ListBox Grid.Row="1" ItemsSource="{Binding Jobs}" SelectedItem="{Binding SelectedJob}"
+                                     Background="Transparent" BorderThickness="0" Foreground="#CCCCCC">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Padding="8,6" BorderBrush="#333337" BorderThickness="0,0,0,1">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <StackPanel>
+                                                    <TextBlock Text="{Binding Name}" FontWeight="Bold" Foreground="#FFFFFF" />
+                                                    <TextBlock Text="{Binding Description}" FontSize="11" Foreground="#888888" TextTrimming="CharacterEllipsis" />
+                                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                                        <TextBlock Text="Interval: " FontSize="11" Foreground="#666666" />
+                                                        <TextBlock Text="{Binding IntervalMinutes, StringFormat={}{0}m}" FontSize="11" Foreground="#4EC9B0" Margin="0,0,8,0" />
+                                                        <TextBlock Text="Grace: " FontSize="11" Foreground="#666666" />
+                                                        <TextBlock Text="{Binding ReplicationGracePeriodMinutes, StringFormat={}{0}m}" FontSize="11" Foreground="#DCDCAA" />
+                                                    </StackPanel>
+                                                </StackPanel>
+                                                <Border Grid.Column="1" Background="{Binding IsEnabled, Converter={x:Null}}" CornerRadius="3" Padding="6,2" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding IsEnabled, Converter={x:Null}}" FontSize="10" FontWeight="Bold" />
+                                                </Border>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+
+                            <Border Grid.Row="2" Background="#2D2D30" Padding="8" BorderBrush="#3F3F46" BorderThickness="0,1,0,0">
+                                <Button Content="+ Add New Compare Job" Command="{Binding NewJobCommand}" HorizontalAlignment="Stretch" />
+                            </Border>
+                        </Grid>
+                    </Border>
+
+                    <!-- Right: Selected Job Editor -->
+                    <Border Grid.Column="2" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="16"
+                            IsEnabled="{Binding HasSelectedJob}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <Grid Margin="0,0,0,16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="JOB CONFIGURATION &amp; REPLICATION SETTINGS" FontSize="15" FontWeight="Bold" Foreground="#4EC9B0" />
+                                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                        <Button Content="▶ Run Now" Command="{Binding RunJobNowCommand}" Style="{StaticResource SuccessButton}" Margin="0,0,8,0" />
+                                        <Button Content="Save Job" Command="{Binding SaveJobCommand}" Margin="0,0,8,0" />
+                                        <Button Content="Delete" Command="{Binding DeleteJobCommand}" Style="{StaticResource DangerButton}" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <!-- General Info -->
+                                <Grid Margin="0,0,0,12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="140" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="120" />
+                                        <ColumnDefinition Width="140" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Job Name:" VerticalAlignment="Center" />
+                                    <TextBox Grid.Column="1" Text="{Binding SelectedJob.Name, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,12,0" />
+                                    <CheckBox Grid.Column="2" Content="Enabled" IsChecked="{Binding SelectedJob.IsEnabled}" VerticalAlignment="Center" FontWeight="Bold" Foreground="#81C784" />
+                                    <ComboBox Grid.Column="3" SelectedValue="{Binding SelectedJob.Mode}" SelectedValuePath="DataContext">
+                                        <ComboBoxItem Content="Listing Only (Fast)" />
+                                        <ComboBoxItem Content="Full Data (Byte Stream)" />
+                                    </ComboBox>
+                                </Grid>
+
+                                <Grid Margin="0,0,0,16">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="140" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="Description:" VerticalAlignment="Center" />
+                                    <TextBox Grid.Column="1" Text="{Binding SelectedJob.Description, UpdateSourceTrigger=PropertyChanged}" />
+                                </Grid>
+
+                                <!-- Schedule & Replication Lag Shield -->
+                                <Border Background="#2D2D30" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
+                                    <StackPanel>
+                                        <TextBlock Text="SCHEDULE &amp; REPLICATION LAG PROTECTION" FontWeight="Bold" Foreground="#DCDCAA" Margin="0,0,0,8" />
+                                        
+                                        <Grid Margin="0,0,0,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="160" />
+                                                <ColumnDefinition Width="140" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="220" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <TextBlock Text="Run Interval (Minutes):" VerticalAlignment="Center" />
+                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.IntervalMinutes, UpdateSourceTrigger=PropertyChanged}" />
+
+                                            <TextBlock Grid.Column="3" Text="Replication Grace Period (Minutes):" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="#FFD166" />
+                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.ReplicationGracePeriodMinutes, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" />
+                                        </Grid>
+
+                                        <Border Background="#22272B" BorderBrush="#4A3F28" BorderThickness="1" CornerRadius="3" Padding="8" Margin="0,4,0,0">
+                                            <TextBlock Text="🛡️ REPLICATION LAG SHIELD: Objects modified within the grace period (e.g. 15 min) prior to scan are recorded with full raw metadata but tagged as [IN-FLIGHT REPLICATION] so in-progress bucket replication does not trigger false alarms. Reports can filter these cleanly while retaining 100% complete raw data." 
+                                                       FontSize="11" Foreground="#FFD166" TextWrapping="Wrap" />
+                                        </Border>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- Bucket A and Bucket B Columns -->
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="16" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+
+                                    <!-- BUCKET A -->
+                                    <Border Grid.Column="0" Background="#2A2A2B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12">
+                                        <StackPanel>
+                                            <Grid Margin="0,0,0,10">
+                                                <TextBlock Text="BUCKET A (SOURCE / PRIMARY)" FontWeight="Bold" Foreground="#4EC9B0" />
+                                                <Button Content="Test Connection" Command="{Binding TestConnectionACommand}" HorizontalAlignment="Right" Style="{StaticResource SecondaryButton}" Padding="8,3" FontSize="11" />
+                                            </Grid>
+
+                                            <TextBlock Text="Endpoint Preset:" Margin="0,0,0,2" />
+                                            <ComboBox ItemsSource="{Binding PresetsA}" SelectedItem="{Binding SelectedPresetA}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Endpoint URL:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketA.EndpointUrl, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Region:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketA.Region, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Bucket Name:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketA.BucketName, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Prefix (Optional):" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketA.Prefix, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Access Key ID:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketA.AccessKey, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Secret Access Key:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketA.SecretKey, UpdateSourceTrigger=PropertyChanged}" />
+                                        </StackPanel>
+                                    </Border>
+
+                                    <!-- BUCKET B -->
+                                    <Border Grid.Column="2" Background="#2A2A2B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12">
+                                        <StackPanel>
+                                            <Grid Margin="0,0,0,10">
+                                                <TextBlock Text="BUCKET B (TARGET / REPLICA)" FontWeight="Bold" Foreground="#9CDCFE" />
+                                                <Button Content="Test Connection" Command="{Binding TestConnectionBCommand}" HorizontalAlignment="Right" Style="{StaticResource SecondaryButton}" Padding="8,3" FontSize="11" />
+                                            </Grid>
+
+                                            <TextBlock Text="Endpoint Preset:" Margin="0,0,0,2" />
+                                            <ComboBox ItemsSource="{Binding PresetsB}" SelectedItem="{Binding SelectedPresetB}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Endpoint URL:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketB.EndpointUrl, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Region:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketB.Region, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Bucket Name:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketB.BucketName, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Prefix (Optional):" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketB.Prefix, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Access Key ID:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketB.AccessKey, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+
+                                            <TextBlock Text="Secret Access Key:" Margin="0,0,0,2" />
+                                            <TextBox Text="{Binding SelectedJob.BucketB.SecretKey, UpdateSourceTrigger=PropertyChanged}" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                            </StackPanel>
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 2: AUDIT RUNS & HISTORY -->
+            <TabItem Header="Audit Runs &amp; History">
+                <Grid Margin="0,10,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <Button Content="Refresh Runs" Command="{Binding RefreshRunsCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,10,0" />
+                        <TextBlock Text="Select a scan run to view its metadata snapshots and browse differences." VerticalAlignment="Center" Foreground="#888888" />
+                    </StackPanel>
+
+                    <!-- Runs DataGrid -->
+                    <DataGrid Grid.Row="1" ItemsSource="{Binding Runs}" SelectedItem="{Binding SelectedRun}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Job Name" Binding="{Binding JobName}" Width="180" />
+                            <DataGridTextColumn Header="Start Time (UTC)" Binding="{Binding StartTimeUtc, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="150" />
+                            <DataGridTextColumn Header="Duration" Binding="{Binding FormattedDuration}" Width="80" />
+                            <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100" />
+                            <DataGridTextColumn Header="Objects Evaluated" Binding="{Binding ObjectsCompared, StringFormat={}{0:N0}}" Width="120" />
+                            <DataGridTextColumn Header="Matched" Binding="{Binding MatchedCount, StringFormat={}{0:N0}}" Width="100" />
+                            <DataGridTextColumn Header="Raw Diffs" Binding="{Binding TotalDifferences, StringFormat={}{0:N0}}" Width="90" />
+                            <DataGridTextColumn Header="Confirmed Disparities" Binding="{Binding FilteredDifferencesCount, StringFormat={}{0:N0}}" Width="150" />
+                            <DataGridTextColumn Header="In-Flight Lag" Binding="{Binding InFlightDifferencesCount, StringFormat={}{0:N0}}" Width="110" />
+                            <DataGridTextColumn Header="Grace Period" Binding="{Binding ReplicationGracePeriodMinutes, StringFormat={}{0}m}" Width="100" />
+                            <DataGridTextColumn Header="Clipped Window" Binding="{Binding ScanWindowNotes}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <!-- Snapshots Footer -->
+                    <Border Grid.Row="2" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,10,0,0"
+                            Visibility="{Binding HasSelectedRun, Converter={StaticResource BoolToVisConverter}}">
+                        <StackPanel>
+                            <TextBlock Text="BUCKET METADATA SNAPSHOT AT SCAN TIME" FontWeight="Bold" Foreground="#4EC9B0" Margin="0,0,0,6" />
+                            <ItemsControl ItemsSource="{Binding SelectedRunSnapshots}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Background="#2D2D30" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="3" Padding="8,4" Margin="0,0,0,4">
+                                            <StackPanel Orientation="Horizontal">
+                                                <TextBlock Text="Side: " FontWeight="Bold" Foreground="#888888" />
+                                                <TextBlock Text="{Binding BucketSide}" FontWeight="Bold" Foreground="#4EC9B0" Margin="0,0,12,0" />
+                                                <TextBlock Text="Bucket: " Foreground="#888888" />
+                                                <TextBlock Text="{Binding BucketName}" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,12,0" />
+                                                <TextBlock Text="Total Objects: " Foreground="#888888" />
+                                                <TextBlock Text="{Binding TotalObjects, StringFormat={}{0:N0}}" Foreground="#CCCCCC" Margin="0,0,12,0" />
+                                                <TextBlock Text="Total Size: " Foreground="#888888" />
+                                                <TextBlock Text="{Binding FormattedTotalSize}" Foreground="#CCCCCC" Margin="0,0,12,0" />
+                                                <TextBlock Text="Endpoint: " Foreground="#888888" />
+                                                <TextBlock Text="{Binding EndpointUrl}" Foreground="#9CDCFE" />
+                                            </StackPanel>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 3: DISPARITY EXPLORER -->
+            <TabItem Header="Disparity Explorer">
+                <Grid Margin="0,10,0,0">
+                    <Grid.RowDefinitions>
+                        <!-- Filters -->
+                        <RowDefinition Height="Auto" />
+                        <!-- Grid -->
+                        <RowDefinition Height="*" />
+                        <!-- Detail Side-by-Side card -->
+                        <RowDefinition Height="180" />
+                    </Grid.RowDefinitions>
+
+                    <!-- Filter Bar -->
+                    <Border Grid.Row="0" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="10" Margin="0,0,0,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Grace Period Mode -->
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <TextBlock Text="Filter Mode:" FontWeight="Bold" Margin="0,0,8,0" VerticalAlignment="Center" />
+                                <RadioButton Content="Confirmed Disparities Only (Shielded)" IsChecked="{Binding GracePeriodFilterMode, Converter={x:Null}}" 
+                                             GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="#81C784" />
+                                <RadioButton Content="All Raw Differences" IsChecked="{Binding GracePeriodFilterMode, Converter={x:Null}}" 
+                                             GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="#CCCCCC" />
+                                <RadioButton Content="In-Flight Lag Only" IsChecked="{Binding GracePeriodFilterMode, Converter={x:Null}}" 
+                                             GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,16,0" Foreground="#FFD166" />
+                            </StackPanel>
+
+                            <!-- Search Key -->
+                            <StackPanel Grid.Column="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,0,16,0">
+                                <TextBlock Text="Search Key:" VerticalAlignment="Center" Margin="0,0,8,0" />
+                                <TextBox Text="{Binding FilterSearchKey, UpdateSourceTrigger=PropertyChanged}" Width="200" />
+                            </StackPanel>
+
+                            <!-- Pagination -->
+                            <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
+                                <Button Content="◀ Prev" Command="{Binding PrevDiffPageCommand}" Style="{StaticResource SecondaryButton}" Padding="8,4" Margin="0,0,6,0" />
+                                <TextBlock Text="{Binding PaginationDisplay}" VerticalAlignment="Center" Margin="0,0,6,0" Foreground="#AAAAAA" />
+                                <Button Content="Next ▶" Command="{Binding NextDiffPageCommand}" Style="{StaticResource SecondaryButton}" Padding="8,4" />
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+
+                    <!-- Differences Table -->
+                    <DataGrid Grid.Row="1" ItemsSource="{Binding Differences}" SelectedItem="{Binding SelectedDifference}">
+                        <DataGrid.Columns>
+                            <!-- Scan Window Tag -->
+                            <DataGridTemplateColumn Header="Replication Tag" Width="170">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Border Background="{Binding IsWithinGracePeriod, Converter={StaticResource GraceTagConverter}}" 
+                                                CornerRadius="3" Padding="6,2" HorizontalAlignment="Left">
+                                            <TextBlock Text="{Binding IsWithinGracePeriod, Converter={StaticResource GraceTagConverter}, ConverterParameter=Text}" 
+                                                       FontWeight="Bold" FontSize="10" Foreground="#1E1E1E" />
+                                        </Border>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <!-- Difference Type -->
+                            <DataGridTemplateColumn Header="Difference Type" Width="160">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding TypeDisplay}" FontWeight="Bold" Foreground="{Binding Type, Converter={StaticResource DiffBrushConverter}}" />
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+
+                            <DataGridTextColumn Header="Object Key" Binding="{Binding Key}" Width="350" />
+                            <DataGridTextColumn Header="Bucket A Size" Binding="{Binding BucketASizeDisplay}" Width="110" />
+                            <DataGridTextColumn Header="Bucket B Size" Binding="{Binding BucketBSizeDisplay}" Width="110" />
+                            <DataGridTextColumn Header="Bucket A Modified (UTC)" Binding="{Binding BucketALastModified, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="160" />
+                            <DataGridTextColumn Header="Bucket B Modified (UTC)" Binding="{Binding BucketBLastModified, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="160" />
+                            <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+
+                    <!-- Side-by-Side Detail Inspection Card -->
+                    <Border Grid.Row="2" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,10,0,0">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="10" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+
+                            <!-- Bucket A Details -->
+                            <Border Grid.Column="0" Background="#2A2A2B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="3" Padding="10">
+                                <StackPanel>
+                                    <TextBlock Text="BUCKET A OBJECT DETAIL" FontWeight="Bold" Foreground="#4EC9B0" Margin="0,0,0,6" />
+                                    <TextBlock Text="{Binding SelectedDifference.Key, StringFormat='Key: {0}'}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="0,0,0,4" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketASizeDisplay, StringFormat='Size: {0}'}" Margin="0,0,0,2" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketAETag, StringFormat='ETag: {0}'}" Margin="0,0,0,2" Foreground="#9CDCFE" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketAStorageClass, StringFormat='Storage Class: {0}'}" Margin="0,0,0,2" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketALastModified, StringFormat='Last Modified: {0:yyyy-MM-dd HH:mm:ss UTC}'}" Foreground="#DCDCAA" />
+                                </StackPanel>
+                            </Border>
+
+                            <!-- Bucket B Details -->
+                            <Border Grid.Column="2" Background="#2A2A2B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="3" Padding="10">
+                                <StackPanel>
+                                    <TextBlock Text="BUCKET B OBJECT DETAIL" FontWeight="Bold" Foreground="#9CDCFE" Margin="0,0,0,6" />
+                                    <TextBlock Text="{Binding SelectedDifference.Key, StringFormat='Key: {0}'}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="0,0,0,4" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketBSizeDisplay, StringFormat='Size: {0}'}" Margin="0,0,0,2" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketBETag, StringFormat='ETag: {0}'}" Margin="0,0,0,2" Foreground="#9CDCFE" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketBStorageClass, StringFormat='Storage Class: {0}'}" Margin="0,0,0,2" />
+                                    <TextBlock Text="{Binding SelectedDifference.BucketBLastModified, StringFormat='Last Modified: {0:yyyy-MM-dd HH:mm:ss UTC}'}" Foreground="#DCDCAA" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 4: EXPORT & REPORTS -->
+            <TabItem Header="Export &amp; Reports">
+                <Border Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="20" Margin="0,10,0,0">
+                    <StackPanel MaxWidth="700" HorizontalAlignment="Left">
+                        <TextBlock Text="EXPORT AUDIT REPORTS" FontSize="16" FontWeight="Bold" Foreground="#4EC9B0" Margin="0,0,0,10" />
+                        <TextBlock Text="Generate CSV or JSON reports from the currently selected scan run with replication lag filters applied." Foreground="#AAAAAA" Margin="0,0,0,16" />
+
+                        <Border Background="#2D2D30" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="14" Margin="0,0,0,16">
+                            <StackPanel>
+                                <TextBlock Text="Selected Run for Export:" FontWeight="Bold" Foreground="#FFFFFF" Margin="0,0,0,4" />
+                                <TextBlock Text="{Binding SelectedRun.JobName, StringFormat='Job: {0}'}" Foreground="#CCCCCC" />
+                                <TextBlock Text="{Binding SelectedRun.StartTimeUtc, StringFormat='Run Time: {0:yyyy-MM-dd HH:mm:ss UTC}'}" Foreground="#CCCCCC" />
+                                <TextBlock Text="{Binding SelectedRun.FilteredDifferencesCount, StringFormat='Confirmed Disparities: {0:N0}'}" FontWeight="SemiBold" Foreground="#FF6B6B" />
+                                <TextBlock Text="{Binding SelectedRun.InFlightDifferencesCount, StringFormat='In-Flight Replication Lag: {0:N0}'}" FontWeight="SemiBold" Foreground="#FFD166" />
+                            </StackPanel>
+                        </Border>
+
+                        <StackPanel Orientation="Horizontal">
+                            <Button Content="📥 Export Difference Report (CSV)" Command="{Binding ExportCsvCommand}" Style="{StaticResource SuccessButton}" Padding="16,10" Margin="0,0,12,0" />
+                            <Button Content="📥 Export Full Audit Dataset (JSON)" Command="{Binding ExportJsonCommand}" Style="{StaticResource SecondaryButton}" Padding="16,10" />
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </TabItem>
+
+            <!-- TAB 5: SERVICE LOGS & AUDIT -->
+            <TabItem Header="Service Audit Logs">
+                <Grid Margin="0,10,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <Button Content="Refresh Logs" Command="{Binding RefreshLogsCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,10,0" />
+                        <TextBlock Text="Includes service startups, automatic crash recovery checkpoints, and scheduler diagnostics." VerticalAlignment="Center" Foreground="#888888" />
+                    </StackPanel>
+
+                    <DataGrid Grid.Row="1" ItemsSource="{Binding AuditLogs}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Timestamp (UTC)" Binding="{Binding TimestampUtc, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="160" />
+                            <DataGridTextColumn Header="Level" Binding="{Binding Level}" Width="90" />
+                            <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130" />
+                            <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="500" />
+                            <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <!-- STATUS BAR -->
+        <Border Grid.Row="3" Background="#007ACC" Padding="12,4">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding StatusMessage}" Foreground="#FFFFFF" FontSize="11" FontWeight="SemiBold" />
+                <TextBlock Grid.Column="1" Text="{Binding ServiceStatus.DatabasePath, StringFormat='Database: {0}'}" Foreground="#E0E0E0" FontSize="11" />
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="S3CompareService.Core/S3CompareService.Core.csproj" />
+  <Project Path="S3CompareService.Tests/S3CompareService.Tests.csproj" />
+  <Project Path="S3CompareService.UI/S3CompareService.UI.csproj" />
+  <Project Path="S3CompareService.Worker/S3CompareService.Worker.csproj" />
+</Solution>
