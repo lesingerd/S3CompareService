@@ -69,3 +69,25 @@ public class InverseBooleanConverter : IValueConverter
         return false;
     }
 }
+
+public class IntToBooleanConverter : IValueConverter
+{
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        if (value is int val && parameter != null && int.TryParse(parameter.ToString(), out int target))
+        {
+            return val == target;
+        }
+        return false;
+    }
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        if (value is bool b && b && parameter != null && int.TryParse(parameter.ToString(), out int target))
+        {
+            return target;
+        }
+        return System.Windows.Data.Binding.DoNothing;
+    }
+}
+

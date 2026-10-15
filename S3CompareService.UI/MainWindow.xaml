@@ -4,6 +4,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:converters="clr-namespace:S3CompareService.UI.Converters"
+        xmlns:models="clr-namespace:S3CompareService.Core.Models;assembly=S3CompareService.Core"
         xmlns:vm="clr-namespace:S3CompareService.UI.ViewModels"
         mc:Ignorable="d"
         Title="S3 Compare Continuous Service Manager" 
@@ -21,7 +22,14 @@
         <converters:DifferenceTypeToBrushConverter x:Key="DiffBrushConverter" />
         <converters:GracePeriodTagConverter x:Key="GraceTagConverter" />
         <converters:InverseBooleanConverter x:Key="InverseBoolConverter" />
+        <converters:IntToBooleanConverter x:Key="IntToBoolConverter" />
         <BooleanToVisibilityConverter x:Key="BoolToVisConverter" />
+
+        <!-- Override system popup brushes so ComboBox popup chrome never falls back to white/grey -->
+        <SolidColorBrush x:Key="{x:Static SystemColors.WindowBrushKey}" Color="#252526"/>
+        <SolidColorBrush x:Key="{x:Static SystemColors.WindowTextBrushKey}" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#094771"/>
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#FFFFFF"/>
 
         <Style TargetType="TextBlock">
             <Setter Property="Foreground" Value="#CCCCCC" />
@@ -37,11 +45,162 @@
             <Setter Property="VerticalContentAlignment" Value="Center" />
         </Style>
 
+        <!-- Dark ComboBox ToggleButton Template -->
+        <ControlTemplate x:Key="DarkComboBoxToggleButtonTemplate" TargetType="ToggleButton">
+            <Border x:Name="TemplateRoot"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="3"
+                    SnapsToDevicePixels="True">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="26"/>
+                    </Grid.ColumnDefinitions>
+                    <Border Grid.Column="1" Background="Transparent" SnapsToDevicePixels="True">
+                        <Path x:Name="Arrow"
+                              Width="9"
+                              Height="5"
+                              HorizontalAlignment="Center"
+                              VerticalAlignment="Center"
+                              Data="M0,0 L4.5,4.5 L9,0 Z"
+                              Fill="#CCCCCC"
+                              SnapsToDevicePixels="True"/>
+                    </Border>
+                </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="TemplateRoot" Property="BorderBrush" Value="#007ACC"/>
+                    <Setter TargetName="Arrow" Property="Fill" Value="#4EC9B0"/>
+                </Trigger>
+                <Trigger Property="IsChecked" Value="True">
+                    <Setter TargetName="TemplateRoot" Property="BorderBrush" Value="#007ACC"/>
+                    <Setter TargetName="Arrow" Property="Fill" Value="#4EC9B0"/>
+                </Trigger>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter TargetName="TemplateRoot" Property="Opacity" Value="0.5"/>
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+
+        <!-- Dark ComboBoxItem Style -->
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Background" Value="#252526"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border x:Name="Bd"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                Padding="{TemplateBinding Padding}"
+                                SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#094771"/>
+                                <Setter Property="Foreground" Value="#FFFFFF"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#007ACC"/>
+                                <Setter Property="Foreground" Value="#FFFFFF"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#666666"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Dark ComboBox Style with Custom ControlTemplate -->
         <Style TargetType="ComboBox">
-            <Setter Property="Background" Value="#2D2D30" />
-            <Setter Property="Foreground" Value="#FFFFFF" />
-            <Setter Property="BorderBrush" Value="#3F3F46" />
-            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="Background" Value="#2D2D30"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#3F3F46"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="8,4"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="MaxDropDownHeight" Value="350"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid x:Name="MainGrid" SnapsToDevicePixels="True">
+                            <ToggleButton x:Name="ToggleButton"
+                                          Template="{StaticResource DarkComboBoxToggleButtonTemplate}"
+                                          Background="{TemplateBinding Background}"
+                                          BorderBrush="{TemplateBinding BorderBrush}"
+                                          BorderThickness="{TemplateBinding BorderThickness}"
+                                          Focusable="False"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          ClickMode="Press"/>
+
+                            <ContentPresenter x:Name="ContentSite"
+                                              IsHitTestVisible="False"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                              Margin="8,4,28,4"
+                                              VerticalAlignment="Center"
+                                              HorizontalAlignment="Left"
+                                              TextElement.Foreground="{TemplateBinding Foreground}"/>
+
+                            <Popup x:Name="PART_Popup"
+                                   AllowsTransparency="True"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   Placement="Bottom"
+                                   PopupAnimation="Slide"
+                                   Focusable="False">
+                                <Grid x:Name="DropDown"
+                                      MinWidth="{Binding ActualWidth, ElementName=MainGrid}"
+                                      MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                    <Border x:Name="DropDownBorder"
+                                            Background="#252526"
+                                            BorderBrush="#3F3F46"
+                                            BorderThickness="1"
+                                            CornerRadius="4"
+                                            Margin="0,2,0,4">
+                                        <Border.Effect>
+                                            <DropShadowEffect BlurRadius="8" ShadowDepth="3" Opacity="0.5" Color="#000000"/>
+                                        </Border.Effect>
+                                        <ScrollViewer SnapsToDevicePixels="True">
+                                            <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+                                        </ScrollViewer>
+                                    </Border>
+                                </Grid>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="HasItems" Value="False">
+                                <Setter TargetName="DropDownBorder" Property="MinHeight" Value="36"/>
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ToggleButton" Property="BorderBrush" Value="#007ACC"/>
+                            </Trigger>
+                            <Trigger Property="IsFocused" Value="True">
+                                <Setter TargetName="ToggleButton" Property="BorderBrush" Value="#007ACC"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="MainGrid" Property="Opacity" Value="0.5"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
         <Style TargetType="Button">
@@ -348,9 +507,9 @@
                                     <TextBlock Text="Job Name:" VerticalAlignment="Center" />
                                     <TextBox Grid.Column="1" Text="{Binding SelectedJob.Name, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,12,0" />
                                     <CheckBox Grid.Column="2" Content="Enabled" IsChecked="{Binding SelectedJob.IsEnabled}" VerticalAlignment="Center" FontWeight="Bold" Foreground="#81C784" />
-                                    <ComboBox Grid.Column="3" SelectedValue="{Binding SelectedJob.Mode}" SelectedValuePath="DataContext">
-                                        <ComboBoxItem Content="Listing Only (Fast)" />
-                                        <ComboBoxItem Content="Full Data (Byte Stream)" />
+                                    <ComboBox Grid.Column="3" SelectedValue="{Binding SelectedJob.Mode, Mode=TwoWay}" SelectedValuePath="Tag">
+                                        <ComboBoxItem Content="Listing Only (Fast)" Tag="{x:Static models:ComparisonMode.ListingOnly}" />
+                                        <ComboBoxItem Content="Full Data (Byte Stream)" Tag="{x:Static models:ComparisonMode.FullData}" />
                                     </ComboBox>
                                 </Grid>
 
@@ -554,11 +713,14 @@
                             <!-- Grace Period Mode -->
                             <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                 <TextBlock Text="Filter Mode:" FontWeight="Bold" Margin="0,0,8,0" VerticalAlignment="Center" />
-                                <RadioButton Content="Confirmed Disparities Only (Shielded)" IsChecked="{Binding GracePeriodFilterMode, Converter={x:Null}}" 
+                                <RadioButton Content="Confirmed Disparities Only (Shielded)" 
+                                             IsChecked="{Binding GracePeriodFilterMode, Mode=TwoWay, Converter={StaticResource IntToBoolConverter}, ConverterParameter=0}" 
                                              GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="#81C784" />
-                                <RadioButton Content="All Raw Differences" IsChecked="{Binding GracePeriodFilterMode, Converter={x:Null}}" 
+                                <RadioButton Content="All Raw Differences" 
+                                             IsChecked="{Binding GracePeriodFilterMode, Mode=TwoWay, Converter={StaticResource IntToBoolConverter}, ConverterParameter=1}" 
                                              GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="#CCCCCC" />
-                                <RadioButton Content="In-Flight Lag Only" IsChecked="{Binding GracePeriodFilterMode, Converter={x:Null}}" 
+                                <RadioButton Content="In-Flight Lag Only" 
+                                             IsChecked="{Binding GracePeriodFilterMode, Mode=TwoWay, Converter={StaticResource IntToBoolConverter}, ConverterParameter=2}" 
                                              GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,16,0" Foreground="#FFD166" />
                             </StackPanel>
 

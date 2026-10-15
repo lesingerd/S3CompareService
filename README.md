@@ -4,6 +4,8 @@
 
 It runs continuous comparisons on automated schedules (interval or cron), captures bucket metadata snapshots at scan time, shields against transient replication lag false alarms, persists full raw history into a portable SQLite database, and automatically recovers from unexpected crashes or system restarts.
 
+![S3CompareService Manager](Screenshot.png)
+
 ---
 
 ## Key Features
