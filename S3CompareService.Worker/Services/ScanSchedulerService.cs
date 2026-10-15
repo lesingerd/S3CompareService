@@ -66,6 +66,8 @@ public class ScanSchedulerService : BackgroundService
     {
         using var scope = _serviceProvider.CreateScope();
         var jobRepo = scope.ServiceProvider.GetRequiredService<IJobRepository>();
+        var scanRunRepo = scope.ServiceProvider.GetRequiredService<IScanRunRepository>();
+        var alertService = scope.ServiceProvider.GetRequiredService<S3CompareService.Core.Notifications.IAlertNotificationService>();
         var coordinator = scope.ServiceProvider.GetRequiredService<ScanExecutionCoordinator>();
 
         var jobs = await jobRepo.GetAllAsync(stoppingToken).ConfigureAwait(false);
@@ -74,6 +76,31 @@ public class ScanSchedulerService : BackgroundService
         foreach (var job in jobs)
         {
             if (!job.IsEnabled) continue;
+
+            // Check Daily Status Report / All-Clear condition
+            if (job.AlertConfig.IsEnabled && job.AlertConfig.SendDailyDigest)
+            {
+                try
+                {
+                    var (shouldSendDigest, _) = await alertService.EvaluateDailyDigestConditionAsync(job, now).ConfigureAwait(false);
+                    if (shouldSendDigest)
+                    {
+                        _logger.LogInformation("Job '{JobName}' is due for daily all-clear status report. Dispatching...", job.Name);
+                        var recentRuns = await scanRunRepo.GetRecentRunsAsync(100, job.Id, stoppingToken).ConfigureAwait(false);
+                        var runs24h = recentRuns.Where(r => r.StartTimeUtc >= now.AddHours(-24)).ToList();
+                        var latestRun = recentRuns.FirstOrDefault();
+
+                        await alertService.DispatchDailyDigestAsync(job, latestRun, runs24h, stoppingToken).ConfigureAwait(false);
+                        job.AlertConfig.LastDailyDigestSentUtc = now;
+                        await jobRepo.SaveAsync(job, stoppingToken).ConfigureAwait(false);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error evaluating daily digest for Job '{JobName}'", job.Name);
+                }
+            }
+
             if (coordinator.IsJobRunning(job.Id)) continue;
 
             bool isDue = false;

@@ -200,6 +200,7 @@ public class MainViewModel : ViewModelBase
     public RelayCommand TestConnectionBCommand { get; }
     public RelayCommand TestSmtpCommand { get; }
     public RelayCommand TestAzureWebhookCommand { get; }
+    public RelayCommand TestDailyDigestCommand { get; }
 
     public RelayCommand RefreshRunsCommand { get; }
     public RelayCommand RefreshDifferencesCommand { get; }
@@ -246,6 +247,7 @@ public class MainViewModel : ViewModelBase
         TestConnectionBCommand = new RelayCommand(async () => await TestConnectionAsync(false));
         TestSmtpCommand = new RelayCommand(async () => await TestSmtpAsync());
         TestAzureWebhookCommand = new RelayCommand(async () => await TestAzureWebhookAsync());
+        TestDailyDigestCommand = new RelayCommand(async () => await TestDailyDigestAsync());
 
         RefreshRunsCommand = new RelayCommand(async () => await LoadRunsAsync());
         RefreshDifferencesCommand = new RelayCommand(async () => await LoadDifferencesAsync());
@@ -437,6 +439,23 @@ public class MainViewModel : ViewModelBase
         {
             MessageBox.Show($"[FAILED] Azure alert test failed:\n{msg}", "Azure Webhook Test", MessageBoxButton.OK, MessageBoxImage.Error);
             StatusMessage = "Azure webhook test failed.";
+        }
+    }
+
+    public async Task TestDailyDigestAsync()
+    {
+        if (SelectedJob == null) return;
+        StatusMessage = "Sending test daily all-clear digest report...";
+        var (ok, msg) = await _client.TestDailyDigestAsync(SelectedJob.AlertConfig, SelectedJob);
+        if (ok)
+        {
+            MessageBox.Show($"[SUCCESS] Daily all-clear digest report sent:\n{msg}", "Daily Digest Test", MessageBoxButton.OK, MessageBoxImage.Information);
+            StatusMessage = "Daily digest test successful.";
+        }
+        else
+        {
+            MessageBox.Show($"[FAILED] Daily all-clear digest report failed:\n{msg}", "Daily Digest Test", MessageBoxButton.OK, MessageBoxImage.Error);
+            StatusMessage = "Daily digest test failed.";
         }
     }
 

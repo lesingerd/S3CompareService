@@ -26,6 +26,32 @@ public class JobAlertConfig
     /// </summary>
     public bool NotifyOnSuccess { get; set; } = false;
 
+    // Daily Status Report / All-Clear Confirmation
+    /// <summary>
+    /// If enabled, sends a daily status report ("all-clear") with metrics confirmation that the service is running.
+    /// </summary>
+    public bool SendDailyDigest { get; set; } = false;
+
+    /// <summary>
+    /// The hour of the day (0-23 UTC) when the daily status report should be dispatched. Default is 8 (08:00 UTC).
+    /// </summary>
+    public int DailyDigestHourUtc { get; set; } = 8;
+
+    /// <summary>
+    /// If true, the daily status report is ONLY sent if no disparity or failure alerts have triggered recently (last 24 hours).
+    /// </summary>
+    public bool OnlyIfNoRecentAlerts { get; set; } = true;
+
+    /// <summary>
+    /// Timestamp (UTC) when an alert (threshold breach or failure) was last sent.
+    /// </summary>
+    public DateTime? LastAlertSentUtc { get; set; }
+
+    /// <summary>
+    /// Timestamp (UTC) when a daily status digest was last sent.
+    /// </summary>
+    public DateTime? LastDailyDigestSentUtc { get; set; }
+
     // SMTP Settings
     public string SmtpHost { get; set; } = string.Empty;
     public int SmtpPort { get; set; } = 587;

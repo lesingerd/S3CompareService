@@ -285,4 +285,15 @@ app.MapPost("/api/alerts/test-azure-webhook", async ([FromBody] JobAlertConfig c
     return Results.Ok(new { Success = success, Message = message });
 });
 
+app.MapPost("/api/alerts/test-daily-digest", async ([FromBody] JobAlertConfig config, IAlertNotificationService alertService) =>
+{
+    var sampleJob = new ComparisonJob
+    {
+        Name = "Test Daily Digest Job",
+        AlertConfig = config
+    };
+    var (success, message) = await alertService.SendTestDailyDigestAsync(config, sampleJob);
+    return Results.Ok(new { Success = success, Message = message });
+});
+
 app.Run();

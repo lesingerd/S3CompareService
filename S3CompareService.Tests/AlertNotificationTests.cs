@@ -211,4 +211,143 @@ public class AlertNotificationTests
         Assert.IsTrue(shouldAlert);
         Assert.IsTrue(reasons.Any(r => r.Contains("Periodic status digest")));
     }
+
+    [TestMethod]
+    public async Task EvaluateDailyDigest_WhenDisabled_DoesNotTrigger()
+    {
+        var service = new AlertNotificationService();
+        var job = new ComparisonJob
+        {
+            Name = "Digest Test Job",
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                SendDailyDigest = false
+            }
+        };
+
+        var (shouldSend, _) = await service.EvaluateDailyDigestConditionAsync(job, new DateTime(2026, 10, 15, 12, 0, 0, DateTimeKind.Utc));
+        Assert.IsFalse(shouldSend);
+    }
+
+    [TestMethod]
+    public async Task EvaluateDailyDigest_WhenDueAndClean_Triggers()
+    {
+        var service = new AlertNotificationService();
+        var job = new ComparisonJob
+        {
+            Name = "Digest Due Job",
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                SendDailyDigest = true,
+                DailyDigestHourUtc = 8,
+                OnlyIfNoRecentAlerts = true,
+                LastAlertSentUtc = null,
+                LastDailyDigestSentUtc = null
+            }
+        };
+
+        // Scheduled for 8:00 UTC, current time is 9:00 UTC
+        var now = new DateTime(2026, 10, 15, 9, 0, 0, DateTimeKind.Utc);
+        var (shouldSend, reason) = await service.EvaluateDailyDigestConditionAsync(job, now);
+
+        Assert.IsTrue(shouldSend);
+        Assert.IsTrue(reason.Contains("Daily status report is due"));
+    }
+
+    [TestMethod]
+    public async Task EvaluateDailyDigest_WhenAlreadySentToday_Suppressed()
+    {
+        var service = new AlertNotificationService();
+        var job = new ComparisonJob
+        {
+            Name = "Already Sent Job",
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                SendDailyDigest = true,
+                DailyDigestHourUtc = 8,
+                LastDailyDigestSentUtc = new DateTime(2026, 10, 15, 8, 5, 0, DateTimeKind.Utc)
+            }
+        };
+
+        // Same day, 10:00 UTC
+        var now = new DateTime(2026, 10, 15, 10, 0, 0, DateTimeKind.Utc);
+        var (shouldSend, reason) = await service.EvaluateDailyDigestConditionAsync(job, now);
+
+        Assert.IsFalse(shouldSend);
+        Assert.IsTrue(reason.Contains("already sent today"));
+    }
+
+    [TestMethod]
+    public async Task EvaluateDailyDigest_WhenBeforeScheduledHour_Suppressed()
+    {
+        var service = new AlertNotificationService();
+        var job = new ComparisonJob
+        {
+            Name = "Before Hour Job",
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                SendDailyDigest = true,
+                DailyDigestHourUtc = 14 // 2pm UTC
+            }
+        };
+
+        // Currently 9am UTC
+        var now = new DateTime(2026, 10, 15, 9, 0, 0, DateTimeKind.Utc);
+        var (shouldSend, reason) = await service.EvaluateDailyDigestConditionAsync(job, now);
+
+        Assert.IsFalse(shouldSend);
+        Assert.IsTrue(reason.Contains("has not reached scheduled digest hour"));
+    }
+
+    [TestMethod]
+    public async Task EvaluateDailyDigest_WhenRecentAlertFired_Suppressed()
+    {
+        var service = new AlertNotificationService();
+        var job = new ComparisonJob
+        {
+            Name = "Recent Alert Job",
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                SendDailyDigest = true,
+                DailyDigestHourUtc = 8,
+                OnlyIfNoRecentAlerts = true,
+                // Alert fired 3 hours ago
+                LastAlertSentUtc = new DateTime(2026, 10, 15, 7, 0, 0, DateTimeKind.Utc)
+            }
+        };
+
+        var now = new DateTime(2026, 10, 15, 10, 0, 0, DateTimeKind.Utc);
+        var (shouldSend, reason) = await service.EvaluateDailyDigestConditionAsync(job, now);
+
+        Assert.IsFalse(shouldSend, "All-clear digest should be suppressed if an alert fired within the last 24 hours!");
+        Assert.IsTrue(reason.Contains("Suppressed: An alert was triggered"));
+    }
+
+    [TestMethod]
+    public async Task EvaluateDailyDigest_WhenRecentAlertFired_ButOnlyIfNoRecentAlertsIsFalse_Triggers()
+    {
+        var service = new AlertNotificationService();
+        var job = new ComparisonJob
+        {
+            Name = "Digest Regardless Of Alert Job",
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                SendDailyDigest = true,
+                DailyDigestHourUtc = 8,
+                OnlyIfNoRecentAlerts = false, // Always send
+                LastAlertSentUtc = new DateTime(2026, 10, 15, 7, 0, 0, DateTimeKind.Utc)
+            }
+        };
+
+        var now = new DateTime(2026, 10, 15, 10, 0, 0, DateTimeKind.Utc);
+        var (shouldSend, _) = await service.EvaluateDailyDigestConditionAsync(job, now);
+
+        Assert.IsTrue(shouldSend);
+    }
 }

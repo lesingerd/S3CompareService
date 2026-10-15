@@ -324,6 +324,26 @@ public class ServiceClient
         var directService = new S3CompareService.Core.Notifications.AlertNotificationService();
         return await directService.TestAzureWebhookAsync(config);
     }
+
+    public async Task<(bool Success, string Message)> TestDailyDigestAsync(JobAlertConfig config, ComparisonJob job)
+    {
+        try
+        {
+            var resp = await _http.PostAsJsonAsync("/api/alerts/test-daily-digest", config);
+            if (resp.IsSuccessStatusCode)
+            {
+                var result = await resp.Content.ReadFromJsonAsync<AlertTestResponse>();
+                if (result != null) return (result.Success, result.Message);
+            }
+        }
+        catch
+        {
+            // Worker service may be offline - fallback to direct test
+        }
+
+        var directService = new S3CompareService.Core.Notifications.AlertNotificationService();
+        return await directService.SendTestDailyDigestAsync(config, job);
+    }
 }
 
 public class AlertTestResponse

@@ -21,7 +21,10 @@ It runs continuous comparisons on automated schedules (interval or cron), captur
   - Configurable alert thresholds per job: Max Confirmed Disparities, Max Missing in Bucket B (Target), Max Missing in Bucket A (Source), Max Size Mismatches, Max ETag/Hash Mismatches, and Max Sequence Gaps.
   - **Lag-Aware Alerting**: Disparity thresholds evaluate against confirmed differences only, automatically preventing false alarm pages when objects are within the active replication grace period.
   - Failure alerting immediately triggers on network drops, S3 permission errors, or service interruptions.
-  - Optional clean scan digests for automated audit logging.
+  - **Daily "All-Clear" Status Report & Heartbeat**:
+    - Optional once-a-day digest with 24-hour activity metrics (completed scans, match rate %, zero confirmed disparities).
+    - Can be scheduled for a specific hour of the day (e.g. 08:00 UTC).
+    - Configurable to **only send if no alerts were triggered recently** (last 24 hours), confirming that the service is running normally and guarding buckets even when quiet.
 - **Enterprise Notification Dispatchers**:
   - **SMTP / Email**: Rich HTML alert emails featuring job status, metrics summary, and confirmed disparity samples with host, port, SSL, authentication, sender, and recipient configuration.
   - **Azure-Based Alerting**:

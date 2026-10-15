@@ -784,6 +784,46 @@
                                                 </StackPanel>
                                             </Border>
                                         </Grid>
+
+                                        <!-- DAILY 'ALL-CLEAR' STATUS REPORT & HEARTBEAT -->
+                                        <Border Background="#1E1E1E" BorderBrush="#333337" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,12,0,0">
+                                            <StackPanel>
+                                                <Grid Margin="0,0,0,8">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                                        <TextBlock Text="🛡️ DAILY 'ALL-CLEAR' STATUS REPORT &amp; CONFIRMATION" FontWeight="SemiBold" Foreground="#81C784" VerticalAlignment="Center" />
+                                                    </StackPanel>
+                                                    <Button Grid.Column="1" Content="Send Test Daily Report Now" Command="{Binding TestDailyDigestCommand}" Style="{StaticResource SecondaryButton}" Padding="8,3" FontSize="11" />
+                                                </Grid>
+
+                                                <Grid Margin="0,0,0,8">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="20" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="8" />
+                                                        <ColumnDefinition Width="70" />
+                                                        <ColumnDefinition Width="20" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+
+                                                    <CheckBox Grid.Column="0" Content="Send Daily Status Report / All-Clear" IsChecked="{Binding SelectedJob.AlertConfig.SendDailyDigest}" FontWeight="Bold" Foreground="#FFFFFF" VerticalAlignment="Center" />
+
+                                                    <TextBlock Grid.Column="2" Text="Digest Hour (UTC, 0-23):" VerticalAlignment="Center" FontSize="11" Foreground="#CCCCCC" />
+                                                    <TextBox Grid.Column="4" Text="{Binding SelectedJob.AlertConfig.DailyDigestHourUtc, UpdateSourceTrigger=PropertyChanged}" VerticalAlignment="Center" />
+
+                                                    <CheckBox Grid.Column="6" Content="Only send if no alert was triggered recently (past 24h)" IsChecked="{Binding SelectedJob.AlertConfig.OnlyIfNoRecentAlerts}" VerticalAlignment="Center" Foreground="#FFD166" />
+                                                </Grid>
+
+                                                <Border Background="#17281D" BorderBrush="#2E6930" BorderThickness="1" CornerRadius="3" Padding="8">
+                                                    <TextBlock Text="💡 PEACE OF MIND HEARTBEAT: Sends a once-a-day status digest with 24-hour activity metrics (scans completed, match rate, zero confirmed disparities) confirming the service is actively running and guarding your buckets even when no alerts have fired." 
+                                                               FontSize="11" Foreground="#81C784" TextWrapping="Wrap" />
+                                                </Border>
+                                            </StackPanel>
+                                        </Border>
                                     </StackPanel>
                                 </Border>
                             </StackPanel>

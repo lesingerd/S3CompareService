@@ -126,6 +126,7 @@ public class ScanExecutionCoordinator
                 if (shouldAlert)
                 {
                     await _alertService.DispatchAlertsAsync(job, run, reasons);
+                    await _jobRepo.SaveAsync(job);
                 }
             }
             catch (OperationCanceledException)
@@ -143,6 +144,7 @@ public class ScanExecutionCoordinator
                 if (shouldAlert)
                 {
                     await _alertService.DispatchAlertsAsync(job, run, reasons);
+                    await _jobRepo.SaveAsync(job);
                 }
             }
             finally
