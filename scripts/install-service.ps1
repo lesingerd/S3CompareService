@@ -72,27 +72,45 @@ $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($existingService) {
     Write-Host "       Stopping existing service '$ServiceName'..." -ForegroundColor Gray
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    sc.exe delete $ServiceName | Out-Null
+    try { Remove-Service -Name $ServiceName -ErrorAction Stop } catch { & sc.exe delete $ServiceName | Out-Null }
     Start-Sleep -Seconds 1
 }
 
 # 4. Create Windows Service
 Write-Host "[4/6] Registering Windows Service '$ServiceName'..." -ForegroundColor Yellow
-$binPathArg = "`"$ExePath`" --urls http://localhost:$Port"
-$createResult = sc.exe create $ServiceName binPath= "$binPathArg" start= auto DisplayName= "$DisplayName"
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to create Windows Service: $createResult"
-    exit 1
-}
+$binPathWithArgs = "`"$ExePath`" --urls http://localhost:$Port"
 
-sc.exe description $ServiceName "$Description" | Out-Null
+$createdSuccessfully = $false
+try {
+    # Use native PowerShell New-Service cmdlet (uses Win32 CreateService API directly)
+    New-Service -Name $ServiceName `
+                -BinaryPathName $binPathWithArgs `
+                -DisplayName $DisplayName `
+                -Description $Description `
+                -StartupType Automatic `
+                -ErrorAction Stop | Out-Null
+    $createdSuccessfully = $true
+} catch {
+    Write-Warning "New-Service cmdlet encountered: $($_.Exception.Message). Falling back to sc.exe..."
+    # Fallback to sc.exe with exact quoted parameters
+    $scBinArg = "binPath= `"$binPathWithArgs`""
+    $scStartArg = "start= auto"
+    $scNameArg = "DisplayName= $DisplayName"
+    & sc.exe create $ServiceName "$scBinArg" "$scStartArg" "$scNameArg"
+    if ($LASTEXITCODE -eq 0) {
+        & sc.exe description $ServiceName "$Description" | Out-Null
+        $createdSuccessfully = $true
+    } else {
+        Write-Error "Failed to create service using sc.exe (Exit Code: $LASTEXITCODE)."
+        exit 1
+    }
+}
 
 # 5. Configure failure recovery (auto-restart on crash)
 Write-Host "[5/6] Configuring crash recovery actions (restart after 60s)..." -ForegroundColor Yellow
 # Reset fail count after 1 day (86400s), restart after 60s on 1st, 2nd, and subsequent crashes
-sc.exe failure $ServiceName reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
-sc.exe failureflag $ServiceName 1 | Out-Null
+& sc.exe failure $ServiceName "reset= 86400" "actions= restart/60000/restart/60000/restart/60000" | Out-Null
+& sc.exe failureflag $ServiceName 1 | Out-Null
 
 # 6. Start the service
 Write-Host "[6/6] Starting '$ServiceName'..." -ForegroundColor Yellow

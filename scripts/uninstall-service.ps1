@@ -38,7 +38,11 @@ if ($service) {
 
     # 2. Delete service registration
     Write-Host "[2/3] Removing service registration..." -ForegroundColor Yellow
-    sc.exe delete $ServiceName | Out-Null
+    try {
+        Remove-Service -Name $ServiceName -ErrorAction Stop
+    } catch {
+        & sc.exe delete $ServiceName | Out-Null
+    }
     Start-Sleep -Seconds 1
 } else {
     Write-Host "Service '$ServiceName' is not installed." -ForegroundColor Yellow
