@@ -1,0 +1,17 @@
+## Visual Studio / .NET .gitignore
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.db-shm
+*.db-wal
+# Keep template or sample db if any, but ignore runtime sqlite files
+*.db
+!sample.db
+*.tmp
+TestResults/
