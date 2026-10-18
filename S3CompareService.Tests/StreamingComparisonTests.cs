@@ -164,4 +164,93 @@ public class StreamingComparisonTests
         Assert.IsNotNull(gapDiff);
         Assert.AreEqual("logs/chunk_002.log", gapDiff.Key);
     }
+
+    [TestMethod]
+    public async Task Compare_AsymmetricBucketPrefixes_MatchesRelativeKeysAndRecordsRelativeDifferenceKey()
+    {
+        var itemsA = new List<S3ObjectSummary>
+        {
+            new() { Key = "prod/tenant1/doc/a.txt", Size = 100, ETag = "etag1", LastModified = DateTime.UtcNow.AddHours(-5), StorageClass = "STANDARD" },
+            new() { Key = "prod/tenant1/doc/only_in_a.txt", Size = 250, ETag = "etag2", LastModified = DateTime.UtcNow.AddHours(-5), StorageClass = "GLACIER" }
+        };
+
+        var itemsB = new List<S3ObjectSummary>
+        {
+            new() { Key = "backup/tenant1/doc/a.txt", Size = 100, ETag = "etag1", LastModified = DateTime.UtcNow.AddHours(-5), StorageClass = "STANDARD_IA" }
+        };
+
+        var job = new ComparisonJob
+        {
+            Name = "Asymmetric Prefix Job",
+            ReplicationGracePeriodMinutes = 0,
+            BucketA = new S3BucketConfig { BucketName = "bucket-a", Prefix = "prod/tenant1/" },
+            BucketB = new S3BucketConfig { BucketName = "bucket-b", Prefix = "backup/tenant1/" }
+        };
+        var run = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = job.Id, JobName = job.Name };
+        await _runRepo.CreateAsync(run);
+
+        var streamA = new MockS3ObjectStream(itemsA);
+        var streamB = new MockS3ObjectStream(itemsB);
+
+        var engine = new ServiceComparisonEngine(job, run, _runRepo, _diffRepo, streamA: streamA, streamB: streamB);
+        var completedRun = await engine.RunAsync();
+
+        Assert.AreEqual(RunStatus.Completed, completedRun.Status);
+        Assert.AreEqual(2, completedRun.ObjectsCompared);
+        Assert.AreEqual(1, completedRun.MatchedCount);
+        Assert.AreEqual(1, completedRun.MissingInBucketBCount);
+
+        var diffs = await _diffRepo.GetAllForRunAsync(completedRun.Id);
+        Assert.AreEqual(1, diffs.Count);
+        Assert.AreEqual("doc/only_in_a.txt", diffs[0].Key);
+
+        // Verify metadata snapshots captured date ranges and storage classes
+        var snapshots = await _runRepo.GetMetadataSnapshotsAsync(completedRun.Id);
+        Assert.AreEqual(2, snapshots.Count);
+        var snapA = snapshots.First(s => s.BucketSide == "A");
+        Assert.IsNotNull(snapA.OldestLastModifiedUtc);
+        Assert.IsNotNull(snapA.NewestLastModifiedUtc);
+        Assert.IsTrue(snapA.StorageClassesJson.Contains("STANDARD"));
+        Assert.IsTrue(snapA.StorageClassesJson.Contains("GLACIER"));
+    }
+
+    [TestMethod]
+    public async Task Compare_GracefulServiceShutdown_MarksRunAsInterrupted()
+    {
+        var itemsA = new List<S3ObjectSummary>
+        {
+            new() { Key = "doc/a.txt", Size = 100, ETag = "etag1", LastModified = DateTime.UtcNow.AddHours(-5) }
+        };
+        var itemsB = new List<S3ObjectSummary>
+        {
+            new() { Key = "doc/a.txt", Size = 100, ETag = "etag1", LastModified = DateTime.UtcNow.AddHours(-5) }
+        };
+
+        var job = new ComparisonJob { Name = "Shutdown Test Job", ReplicationGracePeriodMinutes = 0 };
+        var run = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = job.Id, JobName = job.Name };
+        await _runRepo.CreateAsync(run);
+
+        var streamA = new MockS3ObjectStream(itemsA);
+        var streamB = new MockS3ObjectStream(itemsB);
+
+        var engine = new ServiceComparisonEngine(job, run, _runRepo, _diffRepo, streamA: streamA, streamB: streamB);
+        using var cts = new CancellationTokenSource();
+        engine.MarkServiceShutdown();
+        cts.Cancel();
+
+        try
+        {
+            await engine.RunAsync(cts.Token);
+            Assert.Fail("Expected OperationCanceledException");
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on shutdown cancellation
+        }
+
+        var savedRun = await _runRepo.GetByIdAsync(run.Id);
+        Assert.IsNotNull(savedRun);
+        Assert.AreEqual(RunStatus.Interrupted, savedRun.Status);
+        Assert.IsTrue(savedRun.ErrorMessage!.Contains("service shutdown", StringComparison.OrdinalIgnoreCase));
+    }
 }

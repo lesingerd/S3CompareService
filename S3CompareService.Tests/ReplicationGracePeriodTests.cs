@@ -109,4 +109,57 @@ public class ReplicationGracePeriodTests
         Assert.AreEqual(1, inFlightOnly.Count);
         Assert.AreEqual("recent_replication.dat", inFlightOnly[0].Key);
     }
+
+    [TestMethod]
+    public async Task GracePeriod_InFlightDifferences_DoNotIncrementConfirmedPerTypeCounters_OrTriggerPerTypeAlerts()
+    {
+        var now = DateTime.UtcNow;
+
+        // All 3 differences are modified within the 15-minute replication grace window
+        var itemsA = new List<S3ObjectSummary>
+        {
+            new() { Key = "inflight_1.dat", Size = 1000, ETag = "tag1", LastModified = now.AddMinutes(-2) },
+            new() { Key = "inflight_2.dat", Size = 2000, ETag = "tag2", LastModified = now.AddMinutes(-4) },
+            new() { Key = "inflight_size.dat", Size = 3000, ETag = "tag3", LastModified = now.AddMinutes(-1) }
+        };
+
+        var itemsB = new List<S3ObjectSummary>
+        {
+            new() { Key = "inflight_size.dat", Size = 1500, ETag = "tag3_old", LastModified = now.AddMinutes(-3) }
+        };
+
+        var job = new ComparisonJob
+        {
+            Name = "In-Flight Shield Alert Test",
+            ReplicationGracePeriodMinutes = 15,
+            Mode = ComparisonMode.ListingOnly,
+            AlertConfig = new JobAlertConfig
+            {
+                IsEnabled = true,
+                AlertOnDisparities = true,
+                MaxDisparitiesThreshold = 0,
+                MaxMissingInBThreshold = 0,
+                MaxSizeMismatchThreshold = 0
+            }
+        };
+
+        var run = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = job.Id, JobName = job.Name };
+        await _runRepo.CreateAsync(run);
+
+        var streamA = new MockS3ObjectStream(itemsA);
+        var streamB = new MockS3ObjectStream(itemsB);
+
+        var engine = new ServiceComparisonEngine(job, run, _runRepo, _diffRepo, streamA: streamA, streamB: streamB);
+        var completedRun = await engine.RunAsync();
+
+        Assert.AreEqual(3, completedRun.TotalDifferences);
+        Assert.AreEqual(3, completedRun.InFlightDifferencesCount);
+        Assert.AreEqual(0, completedRun.FilteredDifferencesCount);
+        Assert.AreEqual(0, completedRun.MissingInBucketBCount, "Confirmed MissingInBucketBCount must remain 0 for in-flight items");
+        Assert.AreEqual(0, completedRun.SizeMismatchCount, "Confirmed SizeMismatchCount must remain 0 for in-flight items");
+
+        var alertService = new S3CompareService.Core.Notifications.AlertNotificationService();
+        var (shouldAlert, _) = await alertService.EvaluateAlertConditionAsync(job, completedRun);
+        Assert.IsFalse(shouldAlert, "In-flight differences must not trigger per-type disparity threshold alerts");
+    }
 }

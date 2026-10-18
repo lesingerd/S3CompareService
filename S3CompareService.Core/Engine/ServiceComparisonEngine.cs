@@ -169,12 +169,6 @@ public class ServiceComparisonEngine
             _scanRun.ScanWindowNotes = "Full scan window (no grace period exclusion).";
         }
 
-        await _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken).ConfigureAwait(false);
-        if (_auditLogRepo != null)
-        {
-            await _auditLogRepo.LogAsync("INFO", "ScanEngine", $"Starting scan run '{_scanRun.Id}' for job '{_job.Name}' (Grace Period: {_job.ReplicationGracePeriodMinutes}m)", scanRunId: _scanRun.Id, jobId: _job.Id, cancellationToken: cancellationToken).ConfigureAwait(false);
-        }
-
         IAmazonS3? clientA = null;
         IAmazonS3? clientB = null;
         IS3ObjectStream? enumA = null;
@@ -185,6 +179,12 @@ public class ServiceComparisonEngine
 
         try
         {
+            await _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken).ConfigureAwait(false);
+            if (_auditLogRepo != null)
+            {
+                await _auditLogRepo.LogAsync("INFO", "ScanEngine", $"Starting scan run '{_scanRun.Id}' for job '{_job.Name}' (Grace Period: {_job.ReplicationGracePeriodMinutes}m)", scanRunId: _scanRun.Id, jobId: _job.Id, cancellationToken: cancellationToken).ConfigureAwait(false);
+            }
+
             if (_providedStreamA != null && _providedStreamB != null)
             {
                 enumA = _providedStreamA;
