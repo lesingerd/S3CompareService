@@ -25,6 +25,7 @@ public class ActiveScanDto
     public string JobId { get; set; } = string.Empty;
     public string JobName { get; set; } = string.Empty;
     public DateTime StartTimeUtc { get; set; }
+    public bool IsPaused { get; set; }
     public string Duration { get; set; } = string.Empty;
     public long ObjectsCompared { get; set; }
     public long MatchedCount { get; set; }
@@ -49,21 +50,31 @@ public class ServiceClient
     private readonly HttpClient _http;
     private readonly string _baseUrl;
     private readonly SqliteConnectionFactory _directDbFactory;
+    private readonly DatabaseMigrator _directMigrator;
     private readonly JobRepository _directJobRepo;
     private readonly ScanRunRepository _directScanRunRepo;
     private readonly DifferenceRepository _directDiffRepo;
     private readonly AuditLogRepository _directAuditRepo;
+    private bool _directDbInitialized;
 
     public ServiceClient(string baseUrl = "http://localhost:5088")
     {
         _baseUrl = baseUrl.TrimEnd('/');
-        _http = new HttpClient { BaseAddress = new Uri(_baseUrl), Timeout = TimeSpan.FromSeconds(10) };
+        _http = new HttpClient { BaseAddress = new Uri(_baseUrl), Timeout = TimeSpan.FromSeconds(5) };
 
         _directDbFactory = new SqliteConnectionFactory();
+        _directMigrator = new DatabaseMigrator(_directDbFactory);
         _directJobRepo = new JobRepository(_directDbFactory);
         _directScanRunRepo = new ScanRunRepository(_directDbFactory);
         _directDiffRepo = new DifferenceRepository(_directDbFactory);
         _directAuditRepo = new AuditLogRepository(_directDbFactory);
+    }
+
+    private async Task EnsureDirectDbInitializedAsync()
+    {
+        if (_directDbInitialized) return;
+        await _directMigrator.MigrateAsync().ConfigureAwait(false);
+        _directDbInitialized = true;
     }
 
     public async Task<ServiceStatusDto> GetStatusAsync()
@@ -130,6 +141,7 @@ public class ServiceClient
         {
         }
         // Direct DB fallback
+        await EnsureDirectDbInitializedAsync();
         return await _directJobRepo.GetAllAsync();
     }
 
@@ -147,6 +159,7 @@ public class ServiceClient
 
         if (!apiSuccess)
         {
+            await EnsureDirectDbInitializedAsync();
             await _directJobRepo.SaveAsync(job);
         }
     }
@@ -155,12 +168,14 @@ public class ServiceClient
     {
         try
         {
-            await _http.DeleteAsync($"/api/jobs/{id}");
+            var resp = await _http.DeleteAsync($"/api/jobs/{id}");
+            if (resp.IsSuccessStatusCode) return;
         }
         catch
         {
-            await _directJobRepo.DeleteAsync(id);
         }
+        await EnsureDirectDbInitializedAsync();
+        await _directJobRepo.DeleteAsync(id);
     }
 
     public async Task<(bool Success, string Message)> TriggerJobAsync(string jobId)
@@ -189,6 +204,7 @@ public class ServiceClient
         catch
         {
         }
+        await EnsureDirectDbInitializedAsync();
         return await _directScanRunRepo.GetRecentRunsAsync(count, jobId);
     }
 
@@ -202,6 +218,7 @@ public class ServiceClient
         catch
         {
         }
+        await EnsureDirectDbInitializedAsync();
         return await _directScanRunRepo.GetMetadataSnapshotsAsync(runId);
     }
 
@@ -228,6 +245,7 @@ public class ServiceClient
         }
 
         // Direct DB fallback
+        await EnsureDirectDbInitializedAsync();
         var items = await _directDiffRepo.GetDifferencesAsync(runId, type, withinGracePeriod, searchKey, skip, take);
         int total = await _directDiffRepo.GetDifferenceCountAsync(runId, type, withinGracePeriod, searchKey);
         return new DifferencePageResult { TotalCount = total, Skip = skip, Take = take, Items = items };
@@ -243,6 +261,7 @@ public class ServiceClient
         catch
         {
         }
+        await EnsureDirectDbInitializedAsync();
         return await _directAuditRepo.GetRecentLogsAsync(count);
     }
 

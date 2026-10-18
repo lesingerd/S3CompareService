@@ -91,3 +91,35 @@ public class IntToBooleanConverter : IValueConverter
     }
 }
 
+public class ServiceStatusToBrushConverter : IValueConverter
+{
+    private static readonly SolidColorBrush RunningBrush = new(Color.FromRgb(129, 199, 132)); // Green #81C784
+    private static readonly SolidColorBrush StoppedBrush = new(Color.FromRgb(244, 135, 113)); // Coral Red #F48771
+
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        string status = value?.ToString() ?? string.Empty;
+        return status.Equals("Running", StringComparison.OrdinalIgnoreCase) ? RunningBrush : StoppedBrush;
+    }
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotSupportedException();
+}
+
+public class EnabledStateConverter : IValueConverter
+{
+    private static readonly SolidColorBrush EnabledBgBrush = new(Color.FromRgb(46, 125, 50));   // #2E7D32
+    private static readonly SolidColorBrush DisabledBgBrush = new(Color.FromRgb(62, 62, 66));  // #3E3E42
+
+    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
+    {
+        bool isEnabled = value is bool b && b;
+        if (parameter?.ToString() == "Text")
+        {
+            return isEnabled ? "ENABLED" : "DISABLED";
+        }
+        return isEnabled ? EnabledBgBrush : DisabledBgBrush;
+    }
+
+    public object ConvertBack(object? value, Type targetType, object? parameter, CultureInfo culture) => throw new NotSupportedException();
+}
+

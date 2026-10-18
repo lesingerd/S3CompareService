@@ -139,9 +139,22 @@ public class MainViewModel : ViewModelBase
         {
             if (SetField(ref _filterType, value))
             {
+                OnPropertyChanged(nameof(FilterTypeTag));
                 _diffPageIndex = 0;
                 _ = LoadDifferencesAsync();
             }
+        }
+    }
+
+    public string FilterTypeTag
+    {
+        get => _filterType?.ToString() ?? "All";
+        set
+        {
+            if (string.IsNullOrEmpty(value) || value == "All")
+                FilterType = null;
+            else if (Enum.TryParse<DifferenceType>(value, out var parsed))
+                FilterType = parsed;
         }
     }
 
@@ -159,6 +172,7 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    private CancellationTokenSource? _searchDebounceCts;
     private string _filterSearchKey = string.Empty;
     public string FilterSearchKey
     {
@@ -168,14 +182,34 @@ public class MainViewModel : ViewModelBase
             if (SetField(ref _filterSearchKey, value))
             {
                 _diffPageIndex = 0;
-                _ = LoadDifferencesAsync();
+                _ = DebouncedLoadDifferencesAsync();
             }
+        }
+    }
+
+    private async Task DebouncedLoadDifferencesAsync()
+    {
+        _searchDebounceCts?.Cancel();
+        _searchDebounceCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _searchDebounceCts = cts;
+
+        try
+        {
+            await Task.Delay(200, cts.Token);
+            await LoadDifferencesAsync();
+        }
+        catch (OperationCanceledException)
+        {
         }
     }
 
     private int _diffPageIndex = 0;
     private int _diffPageSize = 50;
     private int _diffTotalCount = 0;
+    private long _diffRequestVersion = 0;
+    private bool _isPolling = false;
+    private bool _wasScanActive = false;
 
     public string PaginationDisplay => _diffTotalCount == 0 ? "0 / 0" : $"{_diffPageIndex * _diffPageSize + 1} - {Math.Min((_diffPageIndex + 1) * _diffPageSize, _diffTotalCount)} of {_diffTotalCount:N0}";
 
@@ -218,24 +252,31 @@ public class MainViewModel : ViewModelBase
         RefreshStatusCommand = new RelayCommand(async () => await RefreshStatusAsync());
         StartServiceCommand = new RelayCommand(() => RunServiceControl("start"));
         StopServiceCommand = new RelayCommand(() => RunServiceControl("stop"));
-        RestartServiceCommand = new RelayCommand(() =>
-        {
-            RunServiceControl("stop");
-            Thread.Sleep(1500);
-            RunServiceControl("start");
-        });
+        RestartServiceCommand = new RelayCommand(() => RunServiceControl("restart"));
 
         PauseActiveScanCommand = new RelayCommand(async () =>
         {
-            if (CurrentActiveScan != null) await _client.PauseRunAsync(CurrentActiveScan.ScanRunId);
+            if (CurrentActiveScan != null)
+            {
+                await _client.PauseRunAsync(CurrentActiveScan.ScanRunId);
+                await RefreshStatusAsync();
+            }
         });
         ResumeActiveScanCommand = new RelayCommand(async () =>
         {
-            if (CurrentActiveScan != null) await _client.ResumeRunAsync(CurrentActiveScan.ScanRunId);
+            if (CurrentActiveScan != null)
+            {
+                await _client.ResumeRunAsync(CurrentActiveScan.ScanRunId);
+                await RefreshStatusAsync();
+            }
         });
         CancelActiveScanCommand = new RelayCommand(async () =>
         {
-            if (CurrentActiveScan != null) await _client.CancelRunAsync(CurrentActiveScan.ScanRunId);
+            if (CurrentActiveScan != null)
+            {
+                await _client.CancelRunAsync(CurrentActiveScan.ScanRunId);
+                await RefreshStatusAsync();
+            }
         });
 
         NewJobCommand = new RelayCommand(CreateNewJob);
@@ -298,14 +339,33 @@ public class MainViewModel : ViewModelBase
 
     private async Task OnTimerTickAsync()
     {
-        await RefreshStatusAsync();
-        if (CurrentActiveScan != null)
+        if (_isPolling) return;
+        _isPolling = true;
+        try
         {
-            // If viewing differences of the currently active scan, auto-refresh
-            if (SelectedRun != null && SelectedRun.Id == CurrentActiveScan.ScanRunId)
+            await RefreshStatusAsync();
+            bool isScanActiveNow = CurrentActiveScan != null;
+
+            if (isScanActiveNow)
             {
-                await LoadDifferencesAsync();
+                // If viewing differences of the currently active scan, auto-refresh
+                if (SelectedRun != null && SelectedRun.Id == CurrentActiveScan!.ScanRunId)
+                {
+                    await LoadDifferencesAsync();
+                }
             }
+            else if (_wasScanActive)
+            {
+                // Active scan just finished: auto-refresh runs and audit logs
+                await LoadRunsAsync();
+                await LoadLogsAsync();
+            }
+
+            _wasScanActive = isScanActiveNow;
+        }
+        finally
+        {
+            _isPolling = false;
         }
     }
 
@@ -318,11 +378,16 @@ public class MainViewModel : ViewModelBase
 
     public async Task LoadJobsAsync()
     {
+        string? prevSelectedId = SelectedJob?.Id;
         var jobs = await _client.GetJobsAsync();
         Jobs.Clear();
         foreach (var j in jobs) Jobs.Add(j);
 
-        if (SelectedJob == null && Jobs.Count > 0)
+        if (prevSelectedId != null)
+        {
+            SelectedJob = Jobs.FirstOrDefault(j => j.Id == prevSelectedId) ?? Jobs.FirstOrDefault();
+        }
+        else if (SelectedJob == null && Jobs.Count > 0)
         {
             SelectedJob = Jobs[0];
         }
@@ -368,6 +433,7 @@ public class MainViewModel : ViewModelBase
         {
             await _client.DeleteJobAsync(SelectedJob.Id);
             StatusMessage = $"Deleted job '{SelectedJob.Name}'.";
+            SelectedJob = null;
             await LoadJobsAsync();
         }
     }
@@ -380,6 +446,7 @@ public class MainViewModel : ViewModelBase
         {
             StatusMessage = $"Triggered scan for '{SelectedJob.Name}'.";
             await RefreshStatusAsync();
+            await LoadRunsAsync();
         }
         else
         {
@@ -461,11 +528,16 @@ public class MainViewModel : ViewModelBase
 
     public async Task LoadRunsAsync()
     {
+        string? prevSelectedRunId = SelectedRun?.Id;
         var runs = await _client.GetRunsAsync();
         Runs.Clear();
         foreach (var r in runs) Runs.Add(r);
 
-        if (SelectedRun == null && Runs.Count > 0)
+        if (prevSelectedRunId != null)
+        {
+            SelectedRun = Runs.FirstOrDefault(r => r.Id == prevSelectedRunId) ?? Runs.FirstOrDefault();
+        }
+        else if (SelectedRun == null && Runs.Count > 0)
         {
             SelectedRun = Runs[0];
         }
@@ -495,6 +567,8 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
+        long version = ++_diffRequestVersion;
+
         bool? withinGrace = GracePeriodFilterMode switch
         {
             0 => false, // Confirmed disparities only (exclude grace period)
@@ -511,6 +585,9 @@ public class MainViewModel : ViewModelBase
             _diffPageIndex * _diffPageSize,
             _diffPageSize);
 
+        if (version != _diffRequestVersion)
+            return;
+
         _diffTotalCount = page.TotalCount;
         Differences.Clear();
         foreach (var item in page.Items) Differences.Add(item);
@@ -525,6 +602,13 @@ public class MainViewModel : ViewModelBase
         foreach (var l in logs) AuditLogs.Add(l);
     }
 
+    private static string SanitizeFileName(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return "job";
+        var invalid = Path.GetInvalidFileNameChars();
+        return new string(input.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+    }
+
     private async Task ExportReportAsync(bool isJson)
     {
         if (SelectedRun == null)
@@ -533,11 +617,14 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
+        string safeJobName = SanitizeFileName(SelectedRun.JobName);
+        string shortId = SelectedRun.Id.Length >= 8 ? SelectedRun.Id[..8] : SelectedRun.Id;
+
         var dlg = new SaveFileDialog
         {
             FileName = isJson
-                ? $"s3compare_audit_{SelectedRun.JobName}_{SelectedRun.Id[..8]}.json"
-                : $"s3compare_audit_{SelectedRun.JobName}_{SelectedRun.Id[..8]}.csv",
+                ? $"s3compare_audit_{safeJobName}_{shortId}.json"
+                : $"s3compare_audit_{safeJobName}_{shortId}.csv",
             Filter = isJson ? "JSON Files (*.json)|*.json" : "CSV Files (*.csv)|*.csv"
         };
 
@@ -565,10 +652,19 @@ public class MainViewModel : ViewModelBase
     {
         try
         {
+            string psCommand = action.ToLowerInvariant() switch
+            {
+                "start" => "Start-Service -Name 'S3CompareService'",
+                "stop" => "Stop-Service -Name 'S3CompareService' -Force",
+                "restart" => "Restart-Service -Name 'S3CompareService' -Force",
+                _ => $"sc.exe {action} S3CompareService"
+            };
+
             var psi = new ProcessStartInfo
             {
                 FileName = "powershell.exe",
-                Arguments = $"-Command \"Start-Process sc.exe -ArgumentList '{action} S3CompareService' -Verb RunAs\"",
+                Arguments = $"-NoProfile -WindowStyle Hidden -Command \"{psCommand}\"",
+                Verb = "runas",
                 UseShellExecute = true
             };
             Process.Start(psi);

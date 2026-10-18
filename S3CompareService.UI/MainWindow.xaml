@@ -21,6 +21,8 @@
     <Window.Resources>
         <converters:DifferenceTypeToBrushConverter x:Key="DiffBrushConverter" />
         <converters:GracePeriodTagConverter x:Key="GraceTagConverter" />
+        <converters:ServiceStatusToBrushConverter x:Key="StatusBrushConverter" />
+        <converters:EnabledStateConverter x:Key="EnabledStateConverter" />
         <converters:InverseBooleanConverter x:Key="InverseBoolConverter" />
         <converters:IntToBooleanConverter x:Key="IntToBoolConverter" />
         <BooleanToVisibilityConverter x:Key="BoolToVisConverter" />
@@ -365,7 +367,7 @@
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="SERVICE: " FontWeight="Bold" Foreground="#AAAAAA" />
                             <TextBlock Text="{Binding ServiceStatus.Status}" FontWeight="Bold" 
-                                       Foreground="{Binding ServiceStatus.Status, Converter={x:Null}}" Margin="0,0,12,0" />
+                                       Foreground="{Binding ServiceStatus.Status, Converter={StaticResource StatusBrushConverter}}" Margin="0,0,12,0" />
                             <TextBlock Text="Uptime: " Foreground="#888888" />
                             <TextBlock Text="{Binding ServiceStatus.Uptime}" Foreground="#CCCCCC" Margin="0,0,12,0" />
                             <TextBlock Text="RAM: " Foreground="#888888" />
@@ -463,8 +465,8 @@
                                                         <TextBlock Text="{Binding ReplicationGracePeriodMinutes, StringFormat={}{0}m}" FontSize="11" Foreground="#DCDCAA" />
                                                     </StackPanel>
                                                 </StackPanel>
-                                                <Border Grid.Column="1" Background="{Binding IsEnabled, Converter={x:Null}}" CornerRadius="3" Padding="6,2" VerticalAlignment="Center">
-                                                    <TextBlock Text="{Binding IsEnabled, Converter={x:Null}}" FontSize="10" FontWeight="Bold" />
+                                                <Border Grid.Column="1" Background="{Binding IsEnabled, Converter={StaticResource EnabledStateConverter}}" CornerRadius="3" Padding="6,2" VerticalAlignment="Center">
+                                                    <TextBlock Text="{Binding IsEnabled, Converter={StaticResource EnabledStateConverter}, ConverterParameter=Text}" FontSize="10" FontWeight="Bold" Foreground="#1E1E1E" />
                                                 </Border>
                                             </Grid>
                                         </Border>
@@ -525,12 +527,32 @@
                                 <!-- Schedule & Replication Lag Shield -->
                                 <Border Background="#2D2D30" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
                                     <StackPanel>
-                                        <TextBlock Text="SCHEDULE &amp; REPLICATION LAG PROTECTION" FontWeight="Bold" Foreground="#DCDCAA" Margin="0,0,0,8" />
-                                        
+                                        <TextBlock Text="SCHEDULE, SEQUENCE GAPS &amp; REPLICATION LAG PROTECTION" FontWeight="Bold" Foreground="#DCDCAA" Margin="0,0,0,8" />
+
                                         <Grid Margin="0,0,0,8">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="160" />
-                                                <ColumnDefinition Width="140" />
+                                                <ColumnDefinition Width="160" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="160" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <TextBlock Text="Schedule Type:" VerticalAlignment="Center" />
+                                            <ComboBox Grid.Column="1" SelectedValue="{Binding SelectedJob.ScheduleType, Mode=TwoWay}" SelectedValuePath="Tag">
+                                                <ComboBoxItem Content="Interval (Minutes)" Tag="{x:Static models:JobScheduleType.IntervalMinutes}" />
+                                                <ComboBoxItem Content="Cron Expression" Tag="{x:Static models:JobScheduleType.CronExpression}" />
+                                                <ComboBoxItem Content="Manual Only" Tag="{x:Static models:JobScheduleType.Manual}" />
+                                            </ComboBox>
+
+                                            <TextBlock Grid.Column="3" Text="Cron Expression (UTC):" VerticalAlignment="Center" />
+                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.CronExpression, UpdateSourceTrigger=PropertyChanged}" Width="160" HorizontalAlignment="Left" />
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="160" />
+                                                <ColumnDefinition Width="160" />
                                                 <ColumnDefinition Width="20" />
                                                 <ColumnDefinition Width="220" />
                                                 <ColumnDefinition Width="*" />
@@ -541,6 +563,19 @@
 
                                             <TextBlock Grid.Column="3" Text="Replication Grace Period (Minutes):" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="#FFD166" />
                                             <TextBox Grid.Column="4" Text="{Binding SelectedJob.ReplicationGracePeriodMinutes, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" />
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="320" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="220" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+
+                                            <CheckBox Grid.Column="0" Content="Detect Numerical Sequence Gaps" IsChecked="{Binding SelectedJob.DetectSequenceGaps}" VerticalAlignment="Center" Foreground="#9CDCFE" />
+                                            <TextBlock Grid.Column="2" Text="Max Sequence Gap Threshold:" VerticalAlignment="Center" />
+                                            <TextBox Grid.Column="3" Text="{Binding SelectedJob.MaxSequenceGapThreshold, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" />
                                         </Grid>
 
                                         <Border Background="#22272B" BorderBrush="#4A3F28" BorderThickness="1" CornerRadius="3" Padding="8" Margin="0,4,0,0">
@@ -633,8 +668,9 @@
                                                 <TextBlock Text="🔔 ALERTS &amp; NOTIFICATIONS (PER-JOB THRESHOLDS, SMTP &amp; AZURE)" FontWeight="Bold" Foreground="#4EC9B0" FontSize="13" />
                                             </StackPanel>
                                             <StackPanel Grid.Column="1" Orientation="Horizontal">
-                                                <CheckBox Content="Enable Alerting for this Job" IsChecked="{Binding SelectedJob.AlertConfig.IsEnabled}" FontWeight="Bold" Foreground="#81C784" VerticalAlignment="Center" Margin="0,0,16,0" />
-                                                <CheckBox Content="Alert on Scan Failure" IsChecked="{Binding SelectedJob.AlertConfig.AlertOnScanFailure}" Foreground="#FF6B6B" VerticalAlignment="Center" Margin="0,0,16,0" />
+                                                <CheckBox Content="Enable Alerting" IsChecked="{Binding SelectedJob.AlertConfig.IsEnabled}" FontWeight="Bold" Foreground="#81C784" VerticalAlignment="Center" Margin="0,0,12,0" />
+                                                <CheckBox Content="Alert on Disparities" IsChecked="{Binding SelectedJob.AlertConfig.AlertOnDisparities}" Foreground="#FFD166" VerticalAlignment="Center" Margin="0,0,12,0" />
+                                                <CheckBox Content="Alert on Scan Failure" IsChecked="{Binding SelectedJob.AlertConfig.AlertOnScanFailure}" Foreground="#FF6B6B" VerticalAlignment="Center" Margin="0,0,12,0" />
                                                 <CheckBox Content="Notify on Clean Scan" IsChecked="{Binding SelectedJob.AlertConfig.NotifyOnCleanScan}" Foreground="#9CDCFE" VerticalAlignment="Center" />
                                             </StackPanel>
                                         </Grid>
@@ -645,6 +681,8 @@
                                                 <TextBlock Text="DISPARITY ALERT THRESHOLDS (CONFIRMED DIFFERENCES)" FontWeight="SemiBold" Foreground="#DCDCAA" Margin="0,0,0,8" />
                                                 <Grid>
                                                     <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="10" />
                                                         <ColumnDefinition Width="*" />
                                                         <ColumnDefinition Width="10" />
                                                         <ColumnDefinition Width="*" />
@@ -683,6 +721,12 @@
                                                         <TextBox Text="{Binding SelectedJob.AlertConfig.MaxEtagMismatchThreshold, UpdateSourceTrigger=PropertyChanged}" />
                                                     </StackPanel>
                                                     <StackPanel Grid.Column="4" Grid.Row="2">
+                                                        <TextBlock Text="Max Content Mismatches:" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxContentMismatchThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
+
+                                                    <!-- Col 4 -->
+                                                    <StackPanel Grid.Column="6" Grid.Row="0">
                                                         <TextBlock Text="Max Sequence / Numerical Gaps:" Margin="0,0,0,2" FontSize="11" />
                                                         <TextBox Text="{Binding SelectedJob.AlertConfig.MaxSequenceGapsThreshold, UpdateSourceTrigger=PropertyChanged}" />
                                                     </StackPanel>
@@ -928,6 +972,20 @@
                                 <RadioButton Content="In-Flight Lag Only" 
                                              IsChecked="{Binding GracePeriodFilterMode, Mode=TwoWay, Converter={StaticResource IntToBoolConverter}, ConverterParameter=2}" 
                                              GroupName="GraceMode" VerticalAlignment="Center" Margin="0,0,16,0" Foreground="#FFD166" />
+                            </StackPanel>
+
+                            <!-- Difference Type Filter -->
+                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,16,0">
+                                <TextBlock Text="Type:" FontWeight="Bold" VerticalAlignment="Center" Margin="0,0,8,0" />
+                                <ComboBox Width="175" SelectedValue="{Binding FilterTypeTag, Mode=TwoWay}" SelectedValuePath="Tag">
+                                    <ComboBoxItem Content="All Difference Types" Tag="All" />
+                                    <ComboBoxItem Content="Missing in Bucket B" Tag="MissingInBucketB" />
+                                    <ComboBoxItem Content="Missing in Bucket A" Tag="MissingInBucketA" />
+                                    <ComboBoxItem Content="Size Mismatch" Tag="SizeMismatch" />
+                                    <ComboBoxItem Content="ETag / Hash Mismatch" Tag="ETagMismatch" />
+                                    <ComboBoxItem Content="Content Mismatch" Tag="ContentMismatch" />
+                                    <ComboBoxItem Content="Sequence Gap" Tag="SequenceGap" />
+                                </ComboBox>
                             </StackPanel>
 
                             <!-- Search Key -->
