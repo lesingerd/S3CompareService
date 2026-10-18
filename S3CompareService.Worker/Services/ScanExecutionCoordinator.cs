@@ -63,99 +63,120 @@ public class ScanExecutionCoordinator
             return (false, string.Empty, $"Job '{jobId}' not found.");
         }
 
-        if (_activeRunIdByJobId.TryGetValue(jobId, out var existingRunId))
+        string runId = Guid.NewGuid().ToString("N");
+        if (!_activeRunIdByJobId.TryAdd(job.Id, runId))
         {
-            return (false, existingRunId, $"Job '{job.Name}' is already actively running (Run ID: {existingRunId}).");
+            _activeRunIdByJobId.TryGetValue(job.Id, out var existingRunId);
+            return (false, existingRunId ?? string.Empty, $"Job '{job.Name}' is already actively running (Run ID: {existingRunId}).");
         }
 
-        var run = new ScanRun
+        try
         {
-            Id = Guid.NewGuid().ToString("N"),
-            JobId = job.Id,
-            JobName = job.Name,
-            StartTimeUtc = DateTime.UtcNow,
-            Status = RunStatus.Running,
-            Mode = job.Mode,
-            ReplicationGracePeriodMinutes = job.ReplicationGracePeriodMinutes,
-            IsResumedFromCheckpoint = resumeCheckpoint != null,
-            ResumedFromKey = resumeCheckpoint?.LastEvaluatedKey
-        };
-
-        await _scanRunRepo.CreateAsync(run);
-
-        var cts = new CancellationTokenSource();
-        var engine = new ServiceComparisonEngine(
-            job,
-            run,
-            _scanRunRepo,
-            _diffRepo,
-            _auditLogRepo,
-            resumeCheckpoint);
-
-        var context = new ActiveScanContext
-        {
-            ScanRunId = run.Id,
-            JobId = job.Id,
-            JobName = job.Name,
-            StartTimeUtc = run.StartTimeUtc,
-            Engine = engine,
-            Cts = cts,
-            LatestStats = new ComparisonStatistics()
-        };
-
-        engine.ProgressUpdated += stats =>
-        {
-            context.LatestStats = stats;
-        };
-
-        _activeScansByRunId[run.Id] = context;
-        _activeRunIdByJobId[job.Id] = run.Id;
-
-        // Launch execution task
-        context.ExecutionTask = Task.Run(async () =>
-        {
-            try
+            var run = new ScanRun
             {
-                _logger.LogInformation("Starting scan execution for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
-                await engine.RunAsync(cts.Token);
-                await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Completed);
-                _logger.LogInformation("Scan execution finished for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
+                Id = runId,
+                JobId = job.Id,
+                JobName = job.Name,
+                StartTimeUtc = DateTime.UtcNow,
+                Status = RunStatus.Running,
+                Mode = job.Mode,
+                ReplicationGracePeriodMinutes = job.ReplicationGracePeriodMinutes,
+                IsResumedFromCheckpoint = resumeCheckpoint != null,
+                ResumedFromKey = resumeCheckpoint?.LastEvaluatedKey
+            };
 
-                // Evaluate Alert Thresholds & Dispatch Notifications
-                var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(job, run);
-                if (shouldAlert)
+            await _scanRunRepo.CreateAsync(run);
+
+            var cts = new CancellationTokenSource();
+            var engine = new ServiceComparisonEngine(
+                job,
+                run,
+                _scanRunRepo,
+                _diffRepo,
+                _auditLogRepo,
+                resumeCheckpoint);
+
+            var context = new ActiveScanContext
+            {
+                ScanRunId = run.Id,
+                JobId = job.Id,
+                JobName = job.Name,
+                StartTimeUtc = run.StartTimeUtc,
+                Engine = engine,
+                Cts = cts,
+                LatestStats = new ComparisonStatistics()
+            };
+
+            engine.ProgressUpdated += stats =>
+            {
+                context.LatestStats = stats;
+            };
+
+            _activeScansByRunId[run.Id] = context;
+
+            // Launch execution task
+            context.ExecutionTask = Task.Run(async () =>
+            {
+                try
                 {
-                    await _alertService.DispatchAlertsAsync(job, run, reasons);
-                    await _jobRepo.SaveAsync(job);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning("Scan execution cancelled for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
-                await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Cancelled);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Scan execution failed for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
-                await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Failed);
+                    _logger.LogInformation("Starting scan execution for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
+                    await engine.RunAsync(cts.Token);
+                    var completedAt = DateTime.UtcNow;
+                    await _jobRepo.UpdateRunScheduleStateAsync(job.Id, completedAt, null, RunStatus.Completed);
+                    _logger.LogInformation("Scan execution finished for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
 
-                // Dispatch failure alert if configured
-                var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(job, run);
-                if (shouldAlert)
+                    // Reload latest job state so user edits and schedule timestamps are preserved when saving AlertConfig
+                    var currentJob = await _jobRepo.GetByIdAsync(job.Id) ?? job;
+                    currentJob.LastRunTimeUtc = completedAt;
+                    currentJob.LastRunStatus = RunStatus.Completed;
+
+                    // Evaluate Alert Thresholds & Dispatch Notifications
+                    var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(currentJob, run);
+                    if (shouldAlert)
+                    {
+                        await _alertService.DispatchAlertsAsync(currentJob, run, reasons);
+                        await _jobRepo.SaveAsync(currentJob);
+                    }
+                }
+                catch (OperationCanceledException)
                 {
-                    await _alertService.DispatchAlertsAsync(job, run, reasons);
-                    await _jobRepo.SaveAsync(job);
+                    var finalStatus = run.Status == RunStatus.Interrupted ? RunStatus.Interrupted : RunStatus.Cancelled;
+                    _logger.LogWarning("Scan execution {Status} for Job '{JobName}' (RunId: {RunId})", finalStatus, job.Name, run.Id);
+                    await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, finalStatus);
                 }
-            }
-            finally
-            {
-                _activeScansByRunId.TryRemove(run.Id, out _);
-                _activeRunIdByJobId.TryRemove(job.Id, out _);
-                cts.Dispose();
-            }
-        });
+                catch (Exception ex)
+                {
+                    var failedAt = DateTime.UtcNow;
+                    _logger.LogError(ex, "Scan execution failed for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
+                    await _jobRepo.UpdateRunScheduleStateAsync(job.Id, failedAt, null, RunStatus.Failed);
 
-        return (true, run.Id, $"Scan started for job '{job.Name}'.");
+                    var currentJob = await _jobRepo.GetByIdAsync(job.Id) ?? job;
+                    currentJob.LastRunTimeUtc = failedAt;
+                    currentJob.LastRunStatus = RunStatus.Failed;
+
+                    // Dispatch failure alert if configured
+                    var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(currentJob, run);
+                    if (shouldAlert)
+                    {
+                        await _alertService.DispatchAlertsAsync(currentJob, run, reasons);
+                        await _jobRepo.SaveAsync(currentJob);
+                    }
+                }
+                finally
+                {
+                    _activeScansByRunId.TryRemove(run.Id, out _);
+                    _activeRunIdByJobId.TryRemove(job.Id, out _);
+                    cts.Dispose();
+                }
+            });
+
+            return (true, run.Id, $"Scan started for job '{job.Name}'.");
+        }
+        catch
+        {
+            _activeRunIdByJobId.TryRemove(job.Id, out _);
+            throw;
+        }
     }
 
     public bool PauseScan(string runId)
@@ -182,9 +203,42 @@ public class ScanExecutionCoordinator
     {
         if (_activeScansByRunId.TryGetValue(runId, out var ctx))
         {
+            ctx.Engine.Resume();
             ctx.Cts.Cancel();
             return true;
         }
         return false;
+    }
+
+    public async Task StopAllActiveScansAsync(CancellationToken cancellationToken = default)
+    {
+        var activeContexts = _activeScansByRunId.Values.ToList();
+        if (activeContexts.Count == 0) return;
+
+        _logger.LogInformation("Service shutting down: saving checkpoints and interrupting {Count} active scan(s)...", activeContexts.Count);
+        foreach (var ctx in activeContexts)
+        {
+            try
+            {
+                ctx.Engine.MarkServiceShutdown();
+                ctx.Cts.Cancel();
+            }
+            catch
+            {
+            }
+        }
+
+        var tasks = activeContexts.Where(c => c.ExecutionTask != null).Select(c => c.ExecutionTask).ToArray();
+        if (tasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Ignore cancellation/timeout exceptions on shutdown
+            }
+        }
     }
 }

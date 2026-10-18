@@ -49,7 +49,7 @@ public class AlertNotificationService : IAlertNotificationService
         }
 
         // 2. Disparity Thresholds (Evaluated against CONFIRMED disparities to shield replication lag)
-        if (cfg.AlertOnDisparities)
+        if (cfg.AlertOnDisparities && run.FilteredDifferencesCount > 0)
         {
             if (run.FilteredDifferencesCount > cfg.MaxDisparitiesThreshold)
             {
@@ -98,7 +98,7 @@ public class AlertNotificationService : IAlertNotificationService
         if (!cfg.IsEnabled) return;
 
         bool isFailure = run.Status == RunStatus.Failed || (reasons.Count > 0 && !reasons[0].StartsWith("Periodic status"));
-        if (isFailure || (reasons.Count > 0 && !reasons[0].StartsWith("Periodic status")))
+        if (isFailure)
         {
             cfg.LastAlertSentUtc = DateTime.UtcNow;
         }

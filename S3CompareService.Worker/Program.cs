@@ -69,13 +69,13 @@ var startTime = DateTime.UtcNow;
 // 1. Status & Health
 app.MapGet("/api/status", (ScanExecutionCoordinator coordinator) =>
 {
-    var proc = Process.GetCurrentProcess();
     var activeScans = coordinator.GetActiveScans().Select(s => new
     {
         s.ScanRunId,
         s.JobId,
         s.JobName,
         s.StartTimeUtc,
+        IsPaused = s.Engine.IsPaused,
         Duration = (DateTime.UtcNow - s.StartTimeUtc).ToString(@"hh\:mm\:ss"),
         s.LatestStats.ObjectsCompared,
         s.LatestStats.MatchedCount,
@@ -85,7 +85,7 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator) =>
         s.LatestStats.ItemsPerSecond,
         s.LatestStats.CurrentKeyA,
         s.LatestStats.CurrentKeyB
-    });
+    }).ToList();
 
     return Results.Ok(new
     {
@@ -93,9 +93,9 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator) =>
         Version = "1.0.0",
         Status = "Running",
         Uptime = (DateTime.UtcNow - startTime).ToString(@"d\.hh\:mm\:ss"),
-        MemoryMB = proc.WorkingSet64 / (1024.0 * 1024.0),
+        MemoryMB = Environment.WorkingSet / (1024.0 * 1024.0),
         DatabasePath = DatabaseConfig.GetDefaultDatabasePath(),
-        ActiveScanCount = coordinator.GetActiveScans().Count(),
+        ActiveScanCount = activeScans.Count,
         ActiveScans = activeScans
     });
 });
@@ -205,6 +205,13 @@ app.MapGet("/api/runs/{id}/differences", async (
     });
 });
 
+static string SanitizeFileNamePart(string input)
+{
+    if (string.IsNullOrWhiteSpace(input)) return "job";
+    var invalid = Path.GetInvalidFileNameChars();
+    return new string(input.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+}
+
 // 9. Export CSV
 app.MapGet("/api/runs/{id}/export/csv", async (
     string id,
@@ -217,11 +224,14 @@ app.MapGet("/api/runs/{id}/export/csv", async (
 
     var diffs = await diffRepo.GetAllForRunAsync(id, includeGracePeriod ? null : false);
     var memStream = new MemoryStream();
-    var writer = new StreamWriter(memStream, leaveOpen: true);
-    await ReportExporter.ExportToCsvAsync(writer, run, diffs, includeGracePeriod);
+    await using (var writer = new StreamWriter(memStream, leaveOpen: true))
+    {
+        await ReportExporter.ExportToCsvAsync(writer, run, diffs, includeGracePeriod);
+    }
     memStream.Position = 0;
 
-    string filename = $"s3compare_report_{run.JobName}_{run.Id[..8]}.csv";
+    string shortId = run.Id.Length >= 8 ? run.Id[..8] : run.Id;
+    string filename = $"s3compare_report_{SanitizeFileNamePart(run.JobName)}_{shortId}.csv";
     return Results.File(memStream, "text/csv", filename);
 });
 
@@ -242,7 +252,8 @@ app.MapGet("/api/runs/{id}/export/json", async (
     await ReportExporter.ExportToJsonAsync(memStream, run, diffs, snapshots, includeGracePeriod);
     memStream.Position = 0;
 
-    string filename = $"s3compare_report_{run.JobName}_{run.Id[..8]}.json";
+    string shortId = run.Id.Length >= 8 ? run.Id[..8] : run.Id;
+    string filename = $"s3compare_report_{SanitizeFileNamePart(run.JobName)}_{shortId}.json";
     return Results.File(memStream, "application/json", filename);
 });
 

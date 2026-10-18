@@ -63,6 +63,10 @@ public class ScanCheckpoint
     public long ETagMismatchCount { get; set; }
     public long ContentMismatchCount { get; set; }
     public long SequenceGapCount { get; set; }
+    public long BucketAObjectsRead { get; set; }
+    public long BucketBObjectsRead { get; set; }
+    public long BucketABytesRead { get; set; }
+    public long BucketBBytesRead { get; set; }
     public double ElapsedSeconds { get; set; }
 
     public bool DetectSequenceGaps { get; set; } = true;

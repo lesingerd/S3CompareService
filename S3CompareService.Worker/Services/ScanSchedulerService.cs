@@ -62,6 +62,22 @@ public class ScanSchedulerService : BackgroundService
         _logger.LogInformation("ScanSchedulerService background service shutting down.");
     }
 
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var scope = _serviceProvider.CreateScope();
+            var coordinator = scope.ServiceProvider.GetRequiredService<ScanExecutionCoordinator>();
+            await coordinator.StopAllActiveScansAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while stopping active scans during service shutdown.");
+        }
+
+        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task EvaluateSchedulesAsync(CancellationToken stoppingToken)
     {
         using var scope = _serviceProvider.CreateScope();
@@ -104,6 +120,7 @@ public class ScanSchedulerService : BackgroundService
             if (coordinator.IsJobRunning(job.Id)) continue;
 
             bool isDue = false;
+            DateTime? computedNextRunUtc = null;
 
             if (job.ScheduleType == JobScheduleType.IntervalMinutes)
             {
@@ -117,11 +134,11 @@ public class ScanSchedulerService : BackgroundService
                 else
                 {
                     var nextDue = job.LastRunTimeUtc.Value.AddMinutes(job.IntervalMinutes);
+                    computedNextRunUtc = nextDue;
                     if (now >= nextDue)
                     {
                         isDue = true;
                     }
-                    job.NextRunTimeUtc = nextDue;
                 }
             }
             else if (job.ScheduleType == JobScheduleType.CronExpression && !string.IsNullOrWhiteSpace(job.CronExpression))
@@ -129,10 +146,11 @@ public class ScanSchedulerService : BackgroundService
                 try
                 {
                     var expression = CronExpression.Parse(job.CronExpression);
-                    var nextUtc = expression.GetNextOccurrence(job.LastRunTimeUtc ?? now.AddMinutes(-1), TimeZoneInfo.Utc);
+                    var baseTime = job.LastRunTimeUtc ?? job.CreatedAtUtc;
+                    var nextUtc = expression.GetNextOccurrence(baseTime, TimeZoneInfo.Utc);
                     if (nextUtc.HasValue)
                     {
-                        job.NextRunTimeUtc = nextUtc.Value;
+                        computedNextRunUtc = nextUtc.Value;
                         if (now >= nextUtc.Value)
                         {
                             isDue = true;
@@ -143,6 +161,12 @@ public class ScanSchedulerService : BackgroundService
                 {
                     _logger.LogWarning("Invalid cron expression '{Cron}' for Job '{JobName}': {Error}", job.CronExpression, job.Name, ex.Message);
                 }
+            }
+
+            if (computedNextRunUtc.HasValue && job.NextRunTimeUtc != computedNextRunUtc)
+            {
+                job.NextRunTimeUtc = computedNextRunUtc;
+                await jobRepo.SaveAsync(job, stoppingToken).ConfigureAwait(false);
             }
 
             if (isDue)
