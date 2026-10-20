@@ -15,3 +15,6 @@
 !sample.db
 *.tmp
 TestResults/
+
+# Publish output
+publish/
