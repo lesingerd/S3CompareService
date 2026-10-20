@@ -560,7 +560,7 @@ public class MainViewModel : ViewModelBase
         string sideName = isBucketA ? "Bucket A" : "Bucket B";
 
         StatusMessage = $"Testing connection to {sideName} ({config.BucketName})...";
-        var (ok, msg) = await _client.TestConnectionAsync(config);
+        var (ok, msg) = await _client.TestConnectionAsync(config, SelectedJob.Id, isBucketA);
 
         if (ok)
         {
@@ -578,7 +578,7 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedJob == null) return;
         StatusMessage = "Sending test alert via SMTP...";
-        var (ok, msg) = await _client.TestSmtpAsync(SelectedJob.AlertConfig);
+        var (ok, msg) = await _client.TestSmtpAsync(SelectedJob.AlertConfig, SelectedJob.Id);
         if (ok)
         {
             MessageBox.Show($"[SUCCESS] SMTP alert test succeeded:\n{msg}", "SMTP Alert Test", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -595,7 +595,7 @@ public class MainViewModel : ViewModelBase
     {
         if (SelectedJob == null) return;
         StatusMessage = "Sending test payload to Azure webhook...";
-        var (ok, msg) = await _client.TestAzureWebhookAsync(SelectedJob.AlertConfig);
+        var (ok, msg) = await _client.TestAzureWebhookAsync(SelectedJob.AlertConfig, SelectedJob.Id);
         if (ok)
         {
             MessageBox.Show($"[SUCCESS] Azure alert test succeeded:\n{msg}", "Azure Webhook Test", MessageBoxButton.OK, MessageBoxImage.Information);

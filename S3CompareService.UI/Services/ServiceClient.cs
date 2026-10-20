@@ -300,11 +300,11 @@ public class ServiceClient
         catch (ServiceOfflineException) { return S3CompareService.Core.Engine.S3ClientFactory.GetWasabiEndpoints(); }
     }
 
-    public async Task<(bool Success, string Message)> TestConnectionAsync(S3BucketConfig config)
+    public async Task<(bool Success, string Message)> TestConnectionAsync(S3BucketConfig config, string? jobId = null, bool isBucketA = true)
     {
         try
         {
-            using var resp = await SendJsonAsync(HttpMethod.Post, "/api/test-connection", config).ConfigureAwait(false);
+            using var resp = await SendJsonAsync(HttpMethod.Post, BucketTestUrl(jobId, isBucketA), config).ConfigureAwait(false);
             var doc = await resp.Content.ReadFromJsonAsync<JsonElement>().ConfigureAwait(false);
             bool ok = doc.TryGetProperty("success", out var s) && s.ValueKind == JsonValueKind.True;
             return (ok, MessageFromJson(doc));
@@ -483,14 +483,25 @@ public class ServiceClient
     private static bool AlertHasMaskedSecrets(JobAlertConfig c) =>
         HasMask(c.SmtpPassword) || HasMask(c.AzureWebhookUrl) || HasMask(c.AzureAppInsightsConnectionString);
 
+    private static string BucketTestUrl(string? jobId, bool isBucketA)
+    {
+        string query = JobQuery(jobId);
+        return query.Length == 0 ? "/api/test-connection" : $"/api/test-connection{query}&bucket={(isBucketA ? "A" : "B")}";
+    }
+
+    // Lets the service resolve masked secrets from the stored job.
+    private static string JobQuery(string? jobId) =>
+        string.IsNullOrWhiteSpace(jobId) ? "" : "?jobId=" + Uri.EscapeDataString(jobId);
+
     private async Task<(bool Success, string Message)> TestAlertAsync(
         string endpoint,
+        string? jobId,
         JobAlertConfig config,
         Func<S3CompareService.Core.Notifications.AlertNotificationService, Task<(bool Success, string Message)>> direct)
     {
         try
         {
-            using var resp = await SendJsonAsync(HttpMethod.Post, endpoint, config).ConfigureAwait(false);
+            using var resp = await SendJsonAsync(HttpMethod.Post, endpoint + JobQuery(jobId), config).ConfigureAwait(false);
             var result = await resp.Content.ReadFromJsonAsync<AlertTestResponse>().ConfigureAwait(false);
             return result != null ? (result.Success, result.Message) : (false, "The service returned an empty response.");
         }
@@ -506,14 +517,14 @@ public class ServiceClient
         }
     }
 
-    public Task<(bool Success, string Message)> TestSmtpAsync(JobAlertConfig config) =>
-        TestAlertAsync("/api/alerts/test-smtp", config, s => s.TestSmtpConnectionAsync(config));
+    public Task<(bool Success, string Message)> TestSmtpAsync(JobAlertConfig config, string? jobId = null) =>
+        TestAlertAsync("/api/alerts/test-smtp", jobId, config, s => s.TestSmtpConnectionAsync(config));
 
-    public Task<(bool Success, string Message)> TestAzureWebhookAsync(JobAlertConfig config) =>
-        TestAlertAsync("/api/alerts/test-azure-webhook", config, s => s.TestAzureWebhookAsync(config));
+    public Task<(bool Success, string Message)> TestAzureWebhookAsync(JobAlertConfig config, string? jobId = null) =>
+        TestAlertAsync("/api/alerts/test-azure-webhook", jobId, config, s => s.TestAzureWebhookAsync(config));
 
     public Task<(bool Success, string Message)> TestDailyDigestAsync(JobAlertConfig config, ComparisonJob job) =>
-        TestAlertAsync("/api/alerts/test-daily-digest", config, s => s.SendTestDailyDigestAsync(config, job));
+        TestAlertAsync("/api/alerts/test-daily-digest", job.Id, config, s => s.SendTestDailyDigestAsync(config, job));
 }
 
 public class AlertTestResponse
