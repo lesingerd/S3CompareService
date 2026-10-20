@@ -47,14 +47,17 @@ public class SequenceGapDetector
         string suffix = fileName.Substring(lastMatch.Index + lastMatch.Length);
         string seriesSignature = dir + prefix + "|" + suffix;
 
-        if (seriesSignature == _currentSeriesSignature)
+        // Gaps are only meaningful when every numeric group in the series has the same width, i.e. when
+        // lexicographic (S3 listing) order equals numeric order. Unpadded names (file1, file10, file2, ...)
+        // change width mid-series, so a width change restarts the series instead of reporting phantom gaps.
+        if (seriesSignature == _currentSeriesSignature && digits.Length == _currentSeriesPadding)
         {
             if (currNumber > _currentSeriesLastNumber + 1)
             {
                 long gapCount = currNumber - (_currentSeriesLastNumber + 1);
                 if (gapCount > 0 && gapCount <= _maxGapThreshold)
                 {
-                    int padLength = Math.Max(digits.Length, _currentSeriesPadding);
+                    int padLength = digits.Length;
                     for (long missing = _currentSeriesLastNumber + 1; missing < currNumber; missing++)
                     {
                         string missingStr = missing.ToString().PadLeft(padLength, '0');

@@ -35,7 +35,7 @@ public class S3PagingEnumerator : IS3ObjectStream
         _s3Client = s3Client ?? throw new ArgumentNullException(nameof(s3Client));
         _bucketName = bucketName ?? throw new ArgumentNullException(nameof(bucketName));
         _prefix = prefix ?? string.Empty;
-        _startAfter = string.IsNullOrWhiteSpace(startAfter) ? null : startAfter.Trim();
+        _startAfter = string.IsNullOrEmpty(startAfter) ? null : startAfter;
         _onPageLoaded = onPageLoaded;
         _totalObjectsRead = initialObjectsRead;
         _totalBytesRead = initialBytesRead;
@@ -56,7 +56,7 @@ public class S3PagingEnumerator : IS3ObjectStream
             var request = new ListObjectsV2Request
             {
                 BucketName = _bucketName,
-                Prefix = string.IsNullOrWhiteSpace(_prefix) ? null : _prefix,
+                Prefix = string.IsNullOrEmpty(_prefix) ? null : _prefix,
                 ContinuationToken = _continuationToken,
                 StartAfter = _isFirstRequest ? _startAfter : null,
                 MaxKeys = 1000
@@ -66,6 +66,12 @@ public class S3PagingEnumerator : IS3ObjectStream
             var response = await _s3Client.ListObjectsV2Async(request, cancellationToken).ConfigureAwait(false);
             _continuationToken = response.NextContinuationToken;
             _isTruncated = response.IsTruncated ?? false;
+
+            if (_isTruncated && string.IsNullOrEmpty(_continuationToken))
+            {
+                throw new InvalidOperationException(
+                    $"S3 listing of bucket '{_bucketName}' reported IsTruncated=true but returned no NextContinuationToken; refusing to loop. The endpoint may not fully support ListObjectsV2 pagination.");
+            }
 
             var objects = response.S3Objects ?? new List<S3Object>();
             var pageItems = new List<S3ObjectSummary>(objects.Count);
@@ -81,19 +87,6 @@ public class S3PagingEnumerator : IS3ObjectStream
                 };
                 pageItems.Add(summary);
                 _currentBuffer.Enqueue(summary);
-                _totalObjectsRead++;
-                _totalBytesRead += summary.Size;
-
-                if (summary.LastModified > DateTime.MinValue)
-                {
-                    if (!_oldestLastModifiedUtc.HasValue || summary.LastModified < _oldestLastModifiedUtc.Value)
-                        _oldestLastModifiedUtc = summary.LastModified;
-                    if (!_newestLastModifiedUtc.HasValue || summary.LastModified > _newestLastModifiedUtc.Value)
-                        _newestLastModifiedUtc = summary.LastModified;
-                }
-
-                _storageClassCounts.TryGetValue(summary.StorageClass, out long scCount);
-                _storageClassCounts[summary.StorageClass] = scCount + 1;
             }
 
             _onPageLoaded?.Invoke(pageItems, _continuationToken);
@@ -102,6 +95,23 @@ public class S3PagingEnumerator : IS3ObjectStream
         if (_currentBuffer.Count > 0)
         {
             _current = _currentBuffer.Dequeue();
+
+            // Statistics are counted on consumption (not on page load) so checkpoints never include
+            // objects that were fetched but not yet handed to the comparison loop.
+            _totalObjectsRead++;
+            _totalBytesRead += _current.Size;
+
+            if (_current.LastModified > DateTime.MinValue)
+            {
+                if (!_oldestLastModifiedUtc.HasValue || _current.LastModified < _oldestLastModifiedUtc.Value)
+                    _oldestLastModifiedUtc = _current.LastModified;
+                if (!_newestLastModifiedUtc.HasValue || _current.LastModified > _newestLastModifiedUtc.Value)
+                    _newestLastModifiedUtc = _current.LastModified;
+            }
+
+            _storageClassCounts.TryGetValue(_current.StorageClass, out long scCount);
+            _storageClassCounts[_current.StorageClass] = scCount + 1;
+
             return true;
         }
 
