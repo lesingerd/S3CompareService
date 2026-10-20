@@ -30,7 +30,7 @@ public class AuditLogRepository : IAuditLogRepository
 
             var p = new
             {
-                TimestampUtc = DateTime.UtcNow.ToString("O"),
+                TimestampUtc = DbDateTime.ToDb(DateTime.UtcNow),
                 Level = level.ToUpperInvariant(),
                 Category = category,
                 Message = message,
@@ -62,7 +62,7 @@ public class AuditLogRepository : IAuditLogRepository
             list.Add(new ServiceAuditLog
             {
                 Id = (long)r.Id,
-                TimestampUtc = DateTime.Parse((string)r.TimestampUtc),
+                TimestampUtc = DbDateTime.Parse((object?)r.TimestampUtc),
                 Level = (string)r.Level,
                 Category = (string)r.Category,
                 Message = (string)r.Message,

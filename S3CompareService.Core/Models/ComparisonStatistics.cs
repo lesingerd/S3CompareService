@@ -51,6 +51,16 @@ public class ScanCheckpoint
     public ComparisonMode Mode { get; set; }
     public string LastEvaluatedKey { get; set; } = string.Empty;
 
+    /// <summary>
+    /// True once at least one key has been fully processed. Needed because the relative key can legitimately be empty
+    /// (an object whose key equals the prefix). Legacy checkpoints without this flag are treated as "has key" when
+    /// LastEvaluatedKey is non-empty (see <see cref="HasKey"/>).
+    /// </summary>
+    public bool HasLastEvaluatedKey { get; set; }
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool HasKey => HasLastEvaluatedKey || !string.IsNullOrEmpty(LastEvaluatedKey);
+
     public long ObjectsCompared { get; set; }
     public long MatchedCount { get; set; }
     public long TotalDifferences { get; set; }

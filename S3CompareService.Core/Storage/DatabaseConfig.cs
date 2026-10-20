@@ -48,6 +48,6 @@ public static class DatabaseConfig
     public static string GetConnectionString(string? dbPath = null)
     {
         string path = dbPath ?? GetDefaultDatabasePath();
-        return $"Data Source={path};Mode=ReadWriteCreate;Cache=Shared;";
+        return $"Data Source={path};Mode=ReadWriteCreate;Default Timeout=30;";
     }
 }

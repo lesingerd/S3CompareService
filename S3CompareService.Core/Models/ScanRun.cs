@@ -22,6 +22,12 @@ public class ScanRun
     public bool IsResumedFromCheckpoint { get; set; }
     public string? ResumedFromKey { get; set; }
 
+    /// <summary>Number of times this run was re-opened to resume from its checkpoint (resume-into-same-run).</summary>
+    public int ResumeCount { get; set; }
+
+    /// <summary>If set, a newer run took over this run's checkpoint and differences; it must not be recovered again.</summary>
+    public string? SupersededByRunId { get; set; }
+
     // Summary counts
     public long ObjectsCompared { get; set; }
     public long MatchedCount { get; set; }

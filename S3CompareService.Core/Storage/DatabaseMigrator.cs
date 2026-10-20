@@ -11,11 +11,67 @@ public class DatabaseMigrator
         _factory = factory;
     }
 
+    /// <summary>Latest schema version. Bump and add a step in <see cref="ApplyStepAsync"/> for every schema change.</summary>
+    public const int LatestVersion = 2;
+
     public async Task MigrateAsync(CancellationToken cancellationToken = default)
     {
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
 
-        string sql = @"
+        // Serializable => BEGIN IMMEDIATE: concurrent migrators (UI + service) queue on the write lock
+        // (busy_timeout) and the second one re-reads user_version inside the lock, so no ALTER TABLE races.
+        await using var trans = await conn.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
+
+        int version = await conn.ExecuteScalarAsync<int>(new CommandDefinition("PRAGMA user_version;", transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+
+        for (int target = version + 1; target <= LatestVersion; target++)
+        {
+            await ApplyStepAsync(conn, trans, target, cancellationToken).ConfigureAwait(false);
+        }
+
+        if (version < LatestVersion)
+        {
+            await conn.ExecuteAsync(new CommandDefinition($"PRAGMA user_version = {LatestVersion};", transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        }
+
+        await trans.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ApplyStepAsync(System.Data.IDbConnection conn, System.Data.IDbTransaction trans, int version, CancellationToken ct)
+    {
+        switch (version)
+        {
+            case 1:
+                // Baseline. Every statement is idempotent, so pre-versioning databases (user_version 0 with
+                // existing tables) simply pass through it.
+                await conn.ExecuteAsync(new CommandDefinition(BaselineSql, transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
+                await AddColumnIfMissingAsync(conn, trans, "Jobs", "AlertConfig_Json", "TEXT", ct).ConfigureAwait(false);
+                break;
+            case 2:
+                await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "SupersededByRunId", "TEXT", ct).ConfigureAwait(false);
+                await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "ResumeCount", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
+                await conn.ExecuteAsync(new CommandDefinition("CREATE INDEX IF NOT EXISTS IX_Differences_ScanRun_Key ON RecordedDifferences (ScanRunId, Key);", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
+                break;
+            default:
+                throw new InvalidOperationException($"No migration defined for schema version {version}.");
+        }
+    }
+
+    private static async Task AddColumnIfMissingAsync(System.Data.IDbConnection conn, System.Data.IDbTransaction trans, string table, string column, string definition, CancellationToken ct)
+    {
+        var columns = (await conn.QueryAsync<string>(
+            new CommandDefinition($"SELECT name FROM pragma_table_info('{table}')", transaction: trans, cancellationToken: ct)
+        ).ConfigureAwait(false)).ToList();
+
+        if (!columns.Contains(column, StringComparer.OrdinalIgnoreCase))
+        {
+            await conn.ExecuteAsync(
+                new CommandDefinition($"ALTER TABLE {table} ADD COLUMN {column} {definition};", transaction: trans, cancellationToken: ct)
+            ).ConfigureAwait(false);
+        }
+    }
+
+    private const string BaselineSql = @"
             -- Jobs Table
             CREATE TABLE IF NOT EXISTS Jobs (
                 Id TEXT PRIMARY KEY,
@@ -146,19 +202,4 @@ public class DatabaseMigrator
             CREATE INDEX IF NOT EXISTS IX_AuditLogs_Timestamp ON ServiceAuditLogs (TimestampUtc DESC);
             CREATE INDEX IF NOT EXISTS IX_AuditLogs_Level ON ServiceAuditLogs (Level);
         ";
-
-        await conn.ExecuteAsync(new CommandDefinition(sql, cancellationToken: cancellationToken)).ConfigureAwait(false);
-
-        // Incremental column migration for existing databases
-        var columns = (await conn.QueryAsync<string>(
-            new CommandDefinition("SELECT name FROM pragma_table_info('Jobs')", cancellationToken: cancellationToken)
-        ).ConfigureAwait(false)).ToList();
-
-        if (!columns.Contains("AlertConfig_Json", StringComparer.OrdinalIgnoreCase))
-        {
-            await conn.ExecuteAsync(
-                new CommandDefinition("ALTER TABLE Jobs ADD COLUMN AlertConfig_Json TEXT;", cancellationToken: cancellationToken)
-            ).ConfigureAwait(false);
-        }
-    }
 }

@@ -6,11 +6,19 @@ namespace S3CompareService.Tests;
 public class MockS3ObjectStream : IS3ObjectStream
 {
     private readonly List<S3ObjectSummary> _items;
+    private readonly Action<long>? _onMoveNext;
     private int _index = -1;
 
-    public MockS3ObjectStream(IEnumerable<S3ObjectSummary> items)
+    /// <param name="items">Items; sorted in UTF-8 (S3) key order.</param>
+    /// <param name="startAfter">If set, only keys after it are returned (simulates S3 StartAfter on resume).</param>
+    /// <param name="onMoveNext">Invoked with the 1-based count of items handed out so far, before each item is returned.</param>
+    public MockS3ObjectStream(IEnumerable<S3ObjectSummary> items, string? startAfter = null, Action<long>? onMoveNext = null)
     {
-        _items = items.OrderBy(x => x.Key, StringComparer.Ordinal).ToList();
+        _items = items
+            .Where(x => startAfter == null || Utf8OrdinalComparer.CompareStatic(x.Key, startAfter) > 0)
+            .OrderBy(x => x.Key, Utf8OrdinalComparer.Instance)
+            .ToList();
+        _onMoveNext = onMoveNext;
     }
 
     private readonly Dictionary<string, long> _storageClassCounts = new(StringComparer.OrdinalIgnoreCase);
@@ -45,6 +53,7 @@ public class MockS3ObjectStream : IS3ObjectStream
             _storageClassCounts.TryGetValue(sc, out long count);
             _storageClassCounts[sc] = count + 1;
 
+            _onMoveNext?.Invoke(TotalObjectsRead);
             return Task.FromResult(true);
         }
         return Task.FromResult(false);
