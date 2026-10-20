@@ -19,20 +19,8 @@ public class ScanSchedulerService : BackgroundService
     {
         _logger.LogInformation("ScanSchedulerService background service started.");
 
-        // Wait a few seconds for HTTP server to settle
+        // Crash recovery runs in Program.cs before the server accepts requests; the scheduler only evaluates schedules.
         await Task.Delay(2000, stoppingToken).ConfigureAwait(false);
-
-        // Run crash recovery first
-        try
-        {
-            using var scope = _serviceProvider.CreateScope();
-            var recovery = scope.ServiceProvider.GetRequiredService<CrashRecoveryManager>();
-            await recovery.RunStartupRecoveryAsync(stoppingToken).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error occurred during crash recovery startup sequence.");
-        }
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -64,18 +52,78 @@ public class ScanSchedulerService : BackgroundService
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        var coordinator = _serviceProvider.GetRequiredService<ScanExecutionCoordinator>();
+
+        // 1. Refuse new scans (scheduler, API, recovery) before touching the active ones.
+        coordinator.BeginShutdown();
+
+        // 2. Stop the scheduler loop so it cannot race the shutdown.
         try
         {
-            using var scope = _serviceProvider.CreateScope();
-            var coordinator = scope.ServiceProvider.GetRequiredService<ScanExecutionCoordinator>();
-            await coordinator.StopAllActiveScansAsync(cancellationToken).ConfigureAwait(false);
+            await base.StopAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error while stopping the scheduler loop.");
+        }
+
+        // 3. Interrupt active scans and give them time to write their checkpoints (host ShutdownTimeout is 60s).
+        try
+        {
+            await coordinator.StopAllActiveScansAsync(cancellationToken, TimeSpan.FromSeconds(45)).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error while stopping active scans during service shutdown.");
         }
+    }
 
-        await base.StopAsync(cancellationToken).ConfigureAwait(false);
+    /// <summary>
+    /// Pure due-time computation. <paramref name="lastStartUtc"/> is the start of the most recent run (interval anchor);
+    /// when null the job's LastRunTimeUtc is used. All inputs are treated as UTC.
+    /// </summary>
+    public static (bool IsDue, DateTime? NextRunUtc) ComputeSchedule(ComparisonJob job, DateTime nowUtc, DateTime? lastStartUtc = null)
+    {
+        if (job.ScheduleType == JobScheduleType.IntervalMinutes)
+        {
+            if (job.IntervalMinutes <= 0) return (false, null);
+
+            // Anchor on when the previous run started, not when it finished, so the cadence does not drift by run duration.
+            var anchor = lastStartUtc ?? job.LastRunTimeUtc;
+            if (anchor == null) return (true, null); // never run before: initial run
+
+            var nextDue = AsUtc(anchor.Value).AddMinutes(job.IntervalMinutes);
+            return (nowUtc >= nextDue, nextDue);
+        }
+
+        if (job.ScheduleType == JobScheduleType.CronExpression && !string.IsNullOrWhiteSpace(job.CronExpression))
+        {
+            var expression = CronExpression.Parse(job.CronExpression);
+            var baseTime = AsUtc(job.LastRunTimeUtc ?? job.CreatedAtUtc);
+            var nextUtc = expression.GetNextOccurrence(baseTime, TimeZoneInfo.Utc);
+            if (nextUtc.HasValue)
+                return (nowUtc >= nextUtc.Value, nextUtc.Value);
+        }
+
+        return (false, null);
+    }
+
+    private static DateTime AsUtc(DateTime value) => value.Kind switch
+    {
+        DateTimeKind.Utc => value,
+        DateTimeKind.Local => value.ToUniversalTime(),
+        _ => DateTime.SpecifyKind(value, DateTimeKind.Utc)
+    };
+
+    private async Task<(bool IsDue, DateTime? NextRunUtc)> ComputeForJobAsync(ComparisonJob job, DateTime now, IScanRunRepository scanRunRepo, CancellationToken ct)
+    {
+        DateTime? lastStart = null;
+        if (job.ScheduleType == JobScheduleType.IntervalMinutes)
+        {
+            var latest = await scanRunRepo.GetRecentRunsAsync(1, job.Id, ct).ConfigureAwait(false);
+            lastStart = latest.FirstOrDefault()?.StartTimeUtc;
+        }
+        return ComputeSchedule(job, now, lastStart);
     }
 
     private async Task EvaluateSchedulesAsync(CancellationToken stoppingToken)
@@ -86,14 +134,18 @@ public class ScanSchedulerService : BackgroundService
         var alertService = scope.ServiceProvider.GetRequiredService<S3CompareService.Core.Notifications.IAlertNotificationService>();
         var coordinator = scope.ServiceProvider.GetRequiredService<ScanExecutionCoordinator>();
 
-        var jobs = await jobRepo.GetAllAsync(stoppingToken).ConfigureAwait(false);
-        var now = DateTime.UtcNow;
+        var jobIds = (await jobRepo.GetAllAsync(stoppingToken).ConfigureAwait(false)).Select(j => j.Id).ToList();
 
-        foreach (var job in jobs)
+        foreach (var jobId in jobIds)
         {
-            if (!job.IsEnabled) continue;
+            if (stoppingToken.IsCancellationRequested || coordinator.IsStopping) break;
 
-            // Check Daily Status Report / All-Clear condition
+            // Always evaluate against current database state, never the list snapshot.
+            var job = await jobRepo.GetByIdAsync(jobId, stoppingToken).ConfigureAwait(false);
+            if (job == null || !job.IsEnabled) continue;
+            var now = DateTime.UtcNow;
+
+            // Daily status report / all-clear
             if (job.AlertConfig.IsEnabled && job.AlertConfig.SendDailyDigest)
             {
                 try
@@ -106,10 +158,16 @@ public class ScanSchedulerService : BackgroundService
                         var runs24h = recentRuns.Where(r => r.StartTimeUtc >= now.AddHours(-24)).ToList();
                         var latestRun = recentRuns.FirstOrDefault();
 
-                        await alertService.DispatchDailyDigestAsync(job, latestRun, runs24h, stoppingToken).ConfigureAwait(false);
-                        job.AlertConfig.LastDailyDigestSentUtc = now;
-                        await jobRepo.SaveAsync(job, stoppingToken).ConfigureAwait(false);
+                        bool delivered = await alertService.DispatchDailyDigestAsync(job, latestRun, runs24h, stoppingToken).ConfigureAwait(false);
+                        if (delivered)
+                        {
+                            await jobRepo.UpdateAlertTimestampsAsync(job.Id, null, DateTime.UtcNow, stoppingToken).ConfigureAwait(false);
+                        }
                     }
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -119,60 +177,39 @@ public class ScanSchedulerService : BackgroundService
 
             if (coordinator.IsJobRunning(job.Id)) continue;
 
-            bool isDue = false;
-            DateTime? computedNextRunUtc = null;
-
-            if (job.ScheduleType == JobScheduleType.IntervalMinutes)
+            (bool isDue, DateTime? nextRun) schedule;
+            try
             {
-                if (job.IntervalMinutes <= 0) continue;
-
-                if (job.LastRunTimeUtc == null)
-                {
-                    // Never run before: trigger initial run
-                    isDue = true;
-                }
-                else
-                {
-                    var nextDue = job.LastRunTimeUtc.Value.AddMinutes(job.IntervalMinutes);
-                    computedNextRunUtc = nextDue;
-                    if (now >= nextDue)
-                    {
-                        isDue = true;
-                    }
-                }
+                schedule = await ComputeForJobAsync(job, now, scanRunRepo, stoppingToken).ConfigureAwait(false);
             }
-            else if (job.ScheduleType == JobScheduleType.CronExpression && !string.IsNullOrWhiteSpace(job.CronExpression))
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
-                try
-                {
-                    var expression = CronExpression.Parse(job.CronExpression);
-                    var baseTime = job.LastRunTimeUtc ?? job.CreatedAtUtc;
-                    var nextUtc = expression.GetNextOccurrence(baseTime, TimeZoneInfo.Utc);
-                    if (nextUtc.HasValue)
-                    {
-                        computedNextRunUtc = nextUtc.Value;
-                        if (now >= nextUtc.Value)
-                        {
-                            isDue = true;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning("Invalid cron expression '{Cron}' for Job '{JobName}': {Error}", job.CronExpression, job.Name, ex.Message);
-                }
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Invalid schedule for Job '{JobName}' (cron '{Cron}'): {Error}", job.Name, job.CronExpression, ex.Message);
+                continue;
             }
 
-            if (computedNextRunUtc.HasValue && job.NextRunTimeUtc != computedNextRunUtc)
+            if (schedule.nextRun.HasValue && job.NextRunTimeUtc != schedule.nextRun)
             {
-                job.NextRunTimeUtc = computedNextRunUtc;
-                await jobRepo.SaveAsync(job, stoppingToken).ConfigureAwait(false);
+                await jobRepo.UpdateNextRunTimeAsync(job.Id, schedule.nextRun, stoppingToken).ConfigureAwait(false);
             }
 
-            if (isDue)
+            if (!schedule.isDue || coordinator.IsStopping) continue;
+
+            // Re-read right before triggering: the job may have been edited, disabled, deleted or just run.
+            var fresh = await jobRepo.GetByIdAsync(job.Id, stoppingToken).ConfigureAwait(false);
+            if (fresh == null || !fresh.IsEnabled || coordinator.IsJobRunning(fresh.Id)) continue;
+            var recheck = await ComputeForJobAsync(fresh, DateTime.UtcNow, scanRunRepo, stoppingToken).ConfigureAwait(false);
+            if (!recheck.IsDue) continue;
+
+            _logger.LogInformation("Job '{JobName}' is due for execution. Triggering scan...", fresh.Name);
+            var result = await coordinator.TriggerScanAsync(fresh.Id).ConfigureAwait(false);
+            if (!result.Success && result.Failure != TriggerFailure.AlreadyRunning)
             {
-                _logger.LogInformation("Job '{JobName}' is due for execution. Triggering scan...", job.Name);
-                await coordinator.TriggerScanAsync(job.Id).ConfigureAwait(false);
+                _logger.LogWarning("Scheduled trigger for Job '{JobName}' was not started: {Message}", fresh.Name, result.Message);
             }
         }
     }
