@@ -741,7 +741,7 @@
                                                         <TextBox Text="{Binding SelectedJob.AlertConfig.MaxSequenceGapsThreshold, UpdateSourceTrigger=PropertyChanged}" />
                                                     </StackPanel>
                                                 </Grid>
-                                                <TextBlock Text="ℹ️ Thresholds trigger when confirmed disparities exceed the set limit. In-flight objects within the Replication Grace Period are automatically excluded to prevent false alerts." 
+                                                <TextBlock Text="ℹ️ Thresholds trigger when confirmed disparities exceed the set limit. The overall limit of 0 alerts on any disparity; per-type limits of 0 are disabled. In-flight objects within the Replication Grace Period are automatically excluded to prevent false alerts." 
                                                            Foreground="#888888" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap" />
                                             </StackPanel>
                                         </Border>
