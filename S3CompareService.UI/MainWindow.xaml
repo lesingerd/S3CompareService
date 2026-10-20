@@ -4,6 +4,7 @@
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:converters="clr-namespace:S3CompareService.UI.Converters"
+        xmlns:common="clr-namespace:S3CompareService.UI.Common"
         xmlns:models="clr-namespace:S3CompareService.Core.Models;assembly=S3CompareService.Core"
         xmlns:vm="clr-namespace:S3CompareService.UI.ViewModels"
         mc:Ignorable="d"
@@ -39,6 +40,15 @@
         </Style>
 
         <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#2D2D30" />
+            <Setter Property="Foreground" Value="#FFFFFF" />
+            <Setter Property="BorderBrush" Value="#3F3F46" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="6,4" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+
+        <Style TargetType="PasswordBox">
             <Setter Property="Background" Value="#2D2D30" />
             <Setter Property="Foreground" Value="#FFFFFF" />
             <Setter Property="BorderBrush" Value="#3F3F46" />
@@ -385,7 +395,7 @@
 
         <!-- LIVE ACTIVE SCAN BANNER -->
         <Border Grid.Row="1" Background="#1B3828" BorderBrush="#2E7D32" BorderThickness="0,0,0,2" Padding="14,8"
-                Visibility="{Binding CurrentActiveScan, Converter={StaticResource BoolToVisConverter}}">
+                Visibility="{Binding HasActiveScan, Converter={StaticResource BoolToVisConverter}}">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
@@ -620,7 +630,7 @@
                                             <TextBox Text="{Binding SelectedJob.BucketA.AccessKey, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
 
                                             <TextBlock Text="Secret Access Key:" Margin="0,0,0,2" />
-                                            <TextBox Text="{Binding SelectedJob.BucketA.SecretKey, UpdateSourceTrigger=PropertyChanged}" />
+                                            <PasswordBox common:PasswordBoxAssist.BoundPassword="{Binding SelectedJob.BucketA.SecretKey, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                         </StackPanel>
                                     </Border>
 
@@ -651,7 +661,7 @@
                                             <TextBox Text="{Binding SelectedJob.BucketB.AccessKey, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
 
                                             <TextBlock Text="Secret Access Key:" Margin="0,0,0,2" />
-                                            <TextBox Text="{Binding SelectedJob.BucketB.SecretKey, UpdateSourceTrigger=PropertyChanged}" />
+                                            <PasswordBox common:PasswordBoxAssist.BoundPassword="{Binding SelectedJob.BucketB.SecretKey, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                         </StackPanel>
                                     </Border>
                                 </Grid>
@@ -785,7 +795,7 @@
                                                         </StackPanel>
                                                         <StackPanel Grid.Column="2">
                                                             <TextBlock Text="Password / Secret:" Margin="0,0,0,2" FontSize="11" />
-                                                            <TextBox Text="{Binding SelectedJob.AlertConfig.SmtpPassword, UpdateSourceTrigger=PropertyChanged}" />
+                                                            <PasswordBox common:PasswordBoxAssist.BoundPassword="{Binding SelectedJob.AlertConfig.SmtpPassword, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
                                                         </StackPanel>
                                                     </Grid>
 
@@ -816,10 +826,10 @@
                                                     </Grid>
 
                                                     <TextBlock Text="Azure Webhook URL (Logic App / Azure Function / Action Group):" Margin="0,0,0,2" FontSize="11" />
-                                                    <TextBox Text="{Binding SelectedJob.AlertConfig.AzureWebhookUrl, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+                                                    <PasswordBox common:PasswordBoxAssist.BoundPassword="{Binding SelectedJob.AlertConfig.AzureWebhookUrl, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
 
                                                     <TextBlock Text="Azure App Insights Connection String (Optional Telemetry):" Margin="0,0,0,2" FontSize="11" />
-                                                    <TextBox Text="{Binding SelectedJob.AlertConfig.AzureAppInsightsConnectionString, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
+                                                    <PasswordBox common:PasswordBoxAssist.BoundPassword="{Binding SelectedJob.AlertConfig.AzureAppInsightsConnectionString, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,0,8" />
 
                                                     <Border Background="#1A2634" BorderBrush="#2D4A6E" BorderThickness="1" CornerRadius="3" Padding="8" Margin="0,4,0,0">
                                                         <TextBlock Text="☁️ Azure Logic Apps allow instant webhook alerts directly to Microsoft Teams channels, SMS, or PagerDuty without writing code. Simply paste the HTTP Trigger URL here." 

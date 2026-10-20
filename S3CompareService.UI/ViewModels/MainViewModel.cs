@@ -29,8 +29,34 @@ public class MainViewModel : ViewModelBase
     public ActiveScanDto? CurrentActiveScan
     {
         get => _currentActiveScan;
-        set => SetField(ref _currentActiveScan, value);
+        set
+        {
+            if (SetField(ref _currentActiveScan, value))
+            {
+                OnPropertyChanged(nameof(HasActiveScan));
+                RaiseScanCommandsChanged();
+            }
+        }
     }
+    public bool HasActiveScan => _currentActiveScan != null;
+
+    private void RaiseScanCommandsChanged()
+    {
+        PauseActiveScanCommand?.RaiseCanExecuteChanged();
+        ResumeActiveScanCommand?.RaiseCanExecuteChanged();
+        CancelActiveScanCommand?.RaiseCanExecuteChanged();
+    }
+
+    private void RaiseJobCommandsChanged()
+    {
+        DeleteJobCommand?.RaiseCanExecuteChanged();
+        RunJobNowCommand?.RaiseCanExecuteChanged();
+        SaveJobCommand?.RaiseCanExecuteChanged();
+    }
+
+    // Jobs created in the UI that the service has not stored yet
+    private readonly HashSet<string> _unsavedJobIds = new();
+    private bool IsSelectedJobUnsaved => SelectedJob != null && _unsavedJobIds.Contains(SelectedJob.Id);
 
     private string _statusMessage = "Ready";
     public string StatusMessage
@@ -56,6 +82,8 @@ public class MainViewModel : ViewModelBase
             {
                 OnPropertyChanged(nameof(HasSelectedJob));
                 SyncPresetSelection();
+                RaiseJobCommandsChanged();
+                UpdateCurrentActiveScan();
             }
         }
     }
@@ -71,14 +99,12 @@ public class MainViewModel : ViewModelBase
         get => _selectedPresetA;
         set
         {
-            if (SetField(ref _selectedPresetA, value) && value != null && SelectedJob != null)
+            // Only a user pick (not a display sync) may change the job's endpoint/region.
+            if (SetField(ref _selectedPresetA, value) && !_syncingPresets && value != null && SelectedJob != null
+                && !string.IsNullOrWhiteSpace(value.Url))
             {
-                if (!string.IsNullOrWhiteSpace(value.Url))
-                {
-                    SelectedJob.BucketA.EndpointUrl = value.Url;
-                    SelectedJob.BucketA.Region = value.Region;
-                    OnPropertyChanged(nameof(SelectedJob));
-                }
+                SelectedJob.BucketA.EndpointUrl = value.Url;
+                SelectedJob.BucketA.Region = value.Region;
             }
         }
     }
@@ -89,14 +115,11 @@ public class MainViewModel : ViewModelBase
         get => _selectedPresetB;
         set
         {
-            if (SetField(ref _selectedPresetB, value) && value != null && SelectedJob != null)
+            if (SetField(ref _selectedPresetB, value) && !_syncingPresets && value != null && SelectedJob != null
+                && !string.IsNullOrWhiteSpace(value.Url))
             {
-                if (!string.IsNullOrWhiteSpace(value.Url))
-                {
-                    SelectedJob.BucketB.EndpointUrl = value.Url;
-                    SelectedJob.BucketB.Region = value.Region;
-                    OnPropertyChanged(nameof(SelectedJob));
-                }
+                SelectedJob.BucketB.EndpointUrl = value.Url;
+                SelectedJob.BucketB.Region = value.Region;
             }
         }
     }
@@ -113,10 +136,12 @@ public class MainViewModel : ViewModelBase
             if (SetField(ref _selectedRun, value))
             {
                 OnPropertyChanged(nameof(HasSelectedRun));
-                _ = LoadRunDetailsAsync(value);
+                if (!_suppressRunReload) _ = SafeAsync(() => LoadRunDetailsAsync(value), "load run details");
+                UpdateCurrentActiveScan();
             }
         }
     }
+    private bool _suppressRunReload;
     public bool HasSelectedRun => SelectedRun != null;
 
     public ObservableCollection<BucketMetadataSnapshot> SelectedRunSnapshots { get; } = new();
@@ -128,8 +153,14 @@ public class MainViewModel : ViewModelBase
     public RecordedDifference? SelectedDifference
     {
         get => _selectedDifference;
-        set => SetField(ref _selectedDifference, value);
+        set
+        {
+            // Ignore the transient null the grid reports while items are replaced.
+            if (value == null && _isUpdatingDifferences) return;
+            SetField(ref _selectedDifference, value);
+        }
     }
+    private bool _isUpdatingDifferences;
 
     private DifferenceType? _filterType = null;
     public DifferenceType? FilterType
@@ -141,7 +172,7 @@ public class MainViewModel : ViewModelBase
             {
                 OnPropertyChanged(nameof(FilterTypeTag));
                 _diffPageIndex = 0;
-                _ = LoadDifferencesAsync();
+                _ = SafeAsync(LoadDifferencesAsync, "load differences");
             }
         }
     }
@@ -167,7 +198,7 @@ public class MainViewModel : ViewModelBase
             if (SetField(ref _gracePeriodFilterMode, value))
             {
                 _diffPageIndex = 0;
-                _ = LoadDifferencesAsync();
+                _ = SafeAsync(LoadDifferencesAsync, "load differences");
             }
         }
     }
@@ -197,7 +228,7 @@ public class MainViewModel : ViewModelBase
         try
         {
             await Task.Delay(200, cts.Token);
-            await LoadDifferencesAsync();
+            await SafeAsync(LoadDifferencesAsync, "load differences");
         }
         catch (OperationCanceledException)
         {
@@ -254,35 +285,20 @@ public class MainViewModel : ViewModelBase
         StopServiceCommand = new RelayCommand(() => RunServiceControl("stop"));
         RestartServiceCommand = new RelayCommand(() => RunServiceControl("restart"));
 
-        PauseActiveScanCommand = new RelayCommand(async () =>
-        {
-            if (CurrentActiveScan != null)
-            {
-                await _client.PauseRunAsync(CurrentActiveScan.ScanRunId);
-                await RefreshStatusAsync();
-            }
-        });
-        ResumeActiveScanCommand = new RelayCommand(async () =>
-        {
-            if (CurrentActiveScan != null)
-            {
-                await _client.ResumeRunAsync(CurrentActiveScan.ScanRunId);
-                await RefreshStatusAsync();
-            }
-        });
-        CancelActiveScanCommand = new RelayCommand(async () =>
-        {
-            if (CurrentActiveScan != null)
-            {
-                await _client.CancelRunAsync(CurrentActiveScan.ScanRunId);
-                await RefreshStatusAsync();
-            }
-        });
+        PauseActiveScanCommand = new RelayCommand(
+            async () => await RunScanActionAsync(_client.PauseRunAsync, "pause"),
+            () => CurrentActiveScan != null && !CurrentActiveScan.IsPaused);
+        ResumeActiveScanCommand = new RelayCommand(
+            async () => await RunScanActionAsync(_client.ResumeRunAsync, "resume"),
+            () => CurrentActiveScan != null && CurrentActiveScan.IsPaused);
+        CancelActiveScanCommand = new RelayCommand(
+            async () => await RunScanActionAsync(_client.CancelRunAsync, "cancel"),
+            () => CurrentActiveScan != null);
 
         NewJobCommand = new RelayCommand(CreateNewJob);
-        SaveJobCommand = new RelayCommand(async () => await SaveJobAsync());
-        DeleteJobCommand = new RelayCommand(async () => await DeleteJobAsync());
-        RunJobNowCommand = new RelayCommand(async () => await TriggerSelectedJobAsync());
+        SaveJobCommand = new RelayCommand(async () => await SaveJobAsync(), () => SelectedJob != null);
+        DeleteJobCommand = new RelayCommand(async () => await DeleteJobAsync(), () => SelectedJob != null);
+        RunJobNowCommand = new RelayCommand(async () => await TriggerSelectedJobAsync(), () => SelectedJob != null && !IsSelectedJobUnsaved);
 
         TestConnectionACommand = new RelayCommand(async () => await TestConnectionAsync(true));
         TestConnectionBCommand = new RelayCommand(async () => await TestConnectionAsync(false));
@@ -290,14 +306,14 @@ public class MainViewModel : ViewModelBase
         TestAzureWebhookCommand = new RelayCommand(async () => await TestAzureWebhookAsync());
         TestDailyDigestCommand = new RelayCommand(async () => await TestDailyDigestAsync());
 
-        RefreshRunsCommand = new RelayCommand(async () => await LoadRunsAsync());
-        RefreshDifferencesCommand = new RelayCommand(async () => await LoadDifferencesAsync());
+        RefreshRunsCommand = new RelayCommand(async () => await SafeAsync(LoadRunsAsync, "load runs"));
+        RefreshDifferencesCommand = new RelayCommand(async () => await SafeAsync(LoadDifferencesAsync, "load differences"));
         NextDiffPageCommand = new RelayCommand(async () =>
         {
             if ((_diffPageIndex + 1) * _diffPageSize < _diffTotalCount)
             {
                 _diffPageIndex++;
-                await LoadDifferencesAsync();
+                await SafeAsync(LoadDifferencesAsync, "load differences");
             }
         });
         PrevDiffPageCommand = new RelayCommand(async () =>
@@ -305,13 +321,13 @@ public class MainViewModel : ViewModelBase
             if (_diffPageIndex > 0)
             {
                 _diffPageIndex--;
-                await LoadDifferencesAsync();
+                await SafeAsync(LoadDifferencesAsync, "load differences");
             }
         });
 
         ExportCsvCommand = new RelayCommand(async () => await ExportReportAsync(false));
         ExportJsonCommand = new RelayCommand(async () => await ExportReportAsync(true));
-        RefreshLogsCommand = new RelayCommand(async () => await LoadLogsAsync());
+        RefreshLogsCommand = new RelayCommand(async () => await SafeAsync(LoadLogsAsync, "load logs"));
 
         // Initialize presets
         var presets = S3ClientFactory.GetWasabiEndpoints();
@@ -332,10 +348,33 @@ public class MainViewModel : ViewModelBase
     private async Task InitializeAsync()
     {
         await RefreshStatusAsync();
-        await LoadJobsAsync();
-        await LoadRunsAsync();
-        await LoadLogsAsync();
+        await SafeAsync(LoadJobsAsync, "load jobs");
+        await SafeAsync(LoadRunsAsync, "load runs");
+        await SafeAsync(LoadLogsAsync, "load logs");
     }
+
+    /// <summary>Runs a load operation, reporting failures in the status bar instead of crashing the UI thread.</summary>
+    private async Task SafeAsync(Func<Task> action, string what)
+    {
+        try { await action(); }
+        catch (Exception ex) { StatusMessage = $"Failed to {what}: {ex.Message}"; }
+    }
+
+    private async Task RunScanActionAsync(Func<string, Task<(bool Success, string Message)>> call, string verb)
+    {
+        var scan = CurrentActiveScan;
+        if (scan == null) return;
+        var (ok, msg) = await call(scan.ScanRunId);
+        if (!ok)
+        {
+            MessageBox.Show($"Could not {verb} the scan:\n{msg}", "Scan Control", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        await RefreshStatusAsync();
+    }
+
+    // Last seen counters of the active scan whose differences are displayed; used to skip no-op refreshes.
+    private string? _lastPolledScanId;
+    private long _lastPolledTotal = -1, _lastPolledFiltered = -1, _lastPolledInFlight = -1;
 
     private async Task OnTimerTickAsync()
     {
@@ -344,21 +383,35 @@ public class MainViewModel : ViewModelBase
         try
         {
             await RefreshStatusAsync();
-            bool isScanActiveNow = CurrentActiveScan != null;
+            var active = CurrentActiveScan;
+            bool isScanActiveNow = active != null;
 
-            if (isScanActiveNow)
+            if (active != null)
             {
-                // If viewing differences of the currently active scan, auto-refresh
-                if (SelectedRun != null && SelectedRun.Id == CurrentActiveScan!.ScanRunId)
+                // Viewing differences of an active scan: refresh only when its counters actually changed
+                if (SelectedRun != null && SelectedRun.Id == active.ScanRunId)
                 {
-                    await LoadDifferencesAsync();
+                    bool changed = _lastPolledScanId != active.ScanRunId
+                        || _lastPolledTotal != active.TotalDifferences
+                        || _lastPolledFiltered != active.FilteredDifferencesCount
+                        || _lastPolledInFlight != active.InFlightDifferencesCount;
+                    if (changed)
+                    {
+                        _lastPolledScanId = active.ScanRunId;
+                        _lastPolledTotal = active.TotalDifferences;
+                        _lastPolledFiltered = active.FilteredDifferencesCount;
+                        _lastPolledInFlight = active.InFlightDifferencesCount;
+                        await SafeAsync(LoadDifferencesAsync, "refresh differences");
+                    }
                 }
             }
             else if (_wasScanActive)
             {
-                // Active scan just finished: auto-refresh runs and audit logs
-                await LoadRunsAsync();
-                await LoadLogsAsync();
+                // Active scan just finished: auto-refresh runs (and its differences) and audit logs
+                _lastPolledScanId = null;
+                await SafeAsync(LoadRunsAsync, "refresh runs");
+                await SafeAsync(LoadDifferencesAsync, "refresh differences");
+                await SafeAsync(LoadLogsAsync, "refresh logs");
             }
 
             _wasScanActive = isScanActiveNow;
@@ -369,18 +422,42 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    private ServiceStatusDto? _lastStatusForScan;
+
     public async Task RefreshStatusAsync()
     {
         var status = await _client.GetStatusAsync();
         ServiceStatus = status;
-        CurrentActiveScan = status.ActiveScans.FirstOrDefault();
+        _lastStatusForScan = status;
+        UpdateCurrentActiveScan();
+    }
+
+    /// <summary>Prefers the scan for the selected run, then the selected job, then the first active scan.</summary>
+    private void UpdateCurrentActiveScan()
+    {
+        var scans = _lastStatusForScan?.ActiveScans;
+        ActiveScanDto? pick = null;
+        if (scans != null && scans.Count > 0)
+        {
+            if (SelectedRun != null) pick = scans.FirstOrDefault(s => s.ScanRunId == SelectedRun.Id);
+            if (pick == null && SelectedJob != null) pick = scans.FirstOrDefault(s => s.JobId == SelectedJob.Id);
+            pick ??= scans[0];
+        }
+        CurrentActiveScan = pick;
+        RaiseScanCommandsChanged();
     }
 
     public async Task LoadJobsAsync()
     {
         string? prevSelectedId = SelectedJob?.Id;
         var jobs = await _client.GetJobsAsync();
+
+        // Keep jobs created in the UI that have not been saved yet
+        var unsaved = Jobs.Where(j => _unsavedJobIds.Contains(j.Id) && jobs.All(s => s.Id != j.Id)).ToList();
+        _unsavedJobIds.IntersectWith(unsaved.Select(j => j.Id));
+
         Jobs.Clear();
+        foreach (var j in unsaved) Jobs.Add(j);
         foreach (var j in jobs) Jobs.Add(j);
 
         if (prevSelectedId != null)
@@ -391,6 +468,7 @@ public class MainViewModel : ViewModelBase
         {
             SelectedJob = Jobs[0];
         }
+        RaiseJobCommandsChanged();
     }
 
     private void CreateNewJob()
@@ -406,47 +484,68 @@ public class MainViewModel : ViewModelBase
         };
         job.BucketA.EndpointUrl = "https://s3.wasabisys.com";
         job.BucketB.EndpointUrl = "https://s3.wasabisys.com";
+        _unsavedJobIds.Add(job.Id);
         Jobs.Insert(0, job);
         SelectedJob = job;
+        RaiseJobCommandsChanged();
     }
 
     public async Task SaveJobAsync()
     {
-        if (SelectedJob == null) return;
+        var job = SelectedJob;
+        if (job == null) return;
         try
         {
-            await _client.SaveJobAsync(SelectedJob);
-            StatusMessage = $"Saved job '{SelectedJob.Name}'.";
+            await _client.SaveJobAsync(job);
+            _unsavedJobIds.Remove(job.Id);
+            StatusMessage = $"Saved job '{job.Name}'.";
+            // Reload so the UI shows fresh server-owned values (next run, last status, masked secrets, ...)
             await LoadJobsAsync();
         }
         catch (Exception ex)
         {
-            MessageBox.Show($"Failed to save job: {ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show($"Failed to save job:\n{ex.Message}", "Save Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
     public async Task DeleteJobAsync()
     {
-        if (SelectedJob == null) return;
-        var res = MessageBox.Show($"Are you sure you want to delete job '{SelectedJob.Name}'?", "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-        if (res == MessageBoxResult.Yes)
+        var job = SelectedJob;
+        if (job == null) return;
+        var res = MessageBox.Show($"Are you sure you want to delete job '{job.Name}'?", "Confirm Delete", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (res != MessageBoxResult.Yes) return;
+
+        try
         {
-            await _client.DeleteJobAsync(SelectedJob.Id);
-            StatusMessage = $"Deleted job '{SelectedJob.Name}'.";
+            if (_unsavedJobIds.Contains(job.Id))
+            {
+                // Never stored: just discard locally
+                _unsavedJobIds.Remove(job.Id);
+            }
+            else
+            {
+                await _client.DeleteJobAsync(job.Id);
+            }
+            StatusMessage = $"Deleted job '{job.Name}'.";
+            Jobs.Remove(job);
             SelectedJob = null;
             await LoadJobsAsync();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to delete job:\n{ex.Message}", "Delete Error", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
 
     public async Task TriggerSelectedJobAsync()
     {
-        if (SelectedJob == null) return;
+        if (SelectedJob == null || IsSelectedJobUnsaved) return;
         var (success, msg) = await _client.TriggerJobAsync(SelectedJob.Id);
         if (success)
         {
             StatusMessage = $"Triggered scan for '{SelectedJob.Name}'.";
             await RefreshStatusAsync();
-            await LoadRunsAsync();
+            await SafeAsync(LoadRunsAsync, "refresh runs");
         }
         else
         {
@@ -530,16 +629,52 @@ public class MainViewModel : ViewModelBase
     {
         string? prevSelectedRunId = SelectedRun?.Id;
         var runs = await _client.GetRunsAsync();
-        Runs.Clear();
-        foreach (var r in runs) Runs.Add(r);
 
-        if (prevSelectedRunId != null)
+        // Update in place (keyed by Id) so the grid keeps its scroll position and selection.
+        _suppressRunReload = true;
+        try
         {
-            SelectedRun = Runs.FirstOrDefault(r => r.Id == prevSelectedRunId) ?? Runs.FirstOrDefault();
+            for (int i = 0; i < runs.Count; i++)
+            {
+                var fresh = runs[i];
+                if (i < Runs.Count && Runs[i].Id == fresh.Id)
+                {
+                    Runs[i] = fresh;
+                    continue;
+                }
+                int existing = -1;
+                for (int j = i + 1; j < Runs.Count; j++) if (Runs[j].Id == fresh.Id) { existing = j; break; }
+                if (existing >= 0)
+                {
+                    Runs.Move(existing, i);
+                    Runs[i] = fresh;
+                }
+                else
+                {
+                    Runs.Insert(i, fresh);
+                }
+            }
+            while (Runs.Count > runs.Count) Runs.RemoveAt(Runs.Count - 1);
+
+            // Replacing items clears the grid selection; restore the same run (new instance) without reloading details.
+            if (prevSelectedRunId != null)
+            {
+                var again = Runs.FirstOrDefault(r => r.Id == prevSelectedRunId);
+                if (again != null)
+                {
+                    if (!ReferenceEquals(_selectedRun, again)) { _selectedRun = again; OnPropertyChanged(nameof(SelectedRun)); }
+                }
+            }
         }
-        else if (SelectedRun == null && Runs.Count > 0)
+        finally
         {
-            SelectedRun = Runs[0];
+            _suppressRunReload = false;
+        }
+
+        if (prevSelectedRunId == null || Runs.All(r => r.Id != prevSelectedRunId))
+        {
+            // Selected run vanished (or none selected yet): fall back to the newest run and load it
+            SelectedRun = Runs.FirstOrDefault();
         }
     }
 
@@ -556,7 +691,7 @@ public class MainViewModel : ViewModelBase
         foreach (var s in snapshots) SelectedRunSnapshots.Add(s);
 
         _diffPageIndex = 0;
-        await LoadDifferencesAsync();
+        await SafeAsync(LoadDifferencesAsync, "load differences");
     }
 
     public async Task LoadDifferencesAsync()
@@ -589,8 +724,32 @@ public class MainViewModel : ViewModelBase
             return;
 
         _diffTotalCount = page.TotalCount;
-        Differences.Clear();
-        foreach (var item in page.Items) Differences.Add(item);
+
+        // Merge in place keyed by Id so selection and scroll position survive auto-refresh.
+        var selectedId = SelectedDifference?.Id;
+        _isUpdatingDifferences = true;
+        try
+        {
+            var items = page.Items;
+            for (int i = 0; i < items.Count; i++)
+            {
+                if (i < Differences.Count && Differences[i].Id == items[i].Id) continue;
+                int existing = -1;
+                for (int j = i + 1; j < Differences.Count; j++) if (Differences[j].Id == items[i].Id) { existing = j; break; }
+                if (existing >= 0) Differences.Move(existing, i);
+                else Differences.Insert(i, items[i]);
+            }
+            while (Differences.Count > items.Count) Differences.RemoveAt(Differences.Count - 1);
+
+        }
+        finally
+        {
+            _isUpdatingDifferences = false;
+        }
+
+        // Items with an unchanged Id keep their instance (and so their selection); drop selection if it left the page.
+        if (selectedId.HasValue && Differences.All(d => d.Id != selectedId.Value))
+            SelectedDifference = null;
 
         OnPropertyChanged(nameof(PaginationDisplay));
     }
@@ -631,20 +790,19 @@ public class MainViewModel : ViewModelBase
         if (dlg.ShowDialog() == true)
         {
             bool includeGrace = GracePeriodFilterMode != 0;
-            var diffs = await _client.GetDifferencesAsync(SelectedRun.Id, null, includeGrace ? null : false, null, 0, 100000);
-
-            if (isJson)
+            try
             {
-                await using var fs = File.Create(dlg.FileName);
-                await ReportExporter.ExportToJsonAsync(fs, SelectedRun, diffs.Items, SelectedRunSnapshots, includeGrace);
+                StatusMessage = "Exporting report from service...";
+                // Use the service's streaming export endpoint (all rows, long timeout) instead of paging.
+                await _client.ExportRunAsync(SelectedRun.Id, isJson, includeGrace, dlg.FileName);
+                StatusMessage = $"Exported report to {dlg.FileName}";
+                MessageBox.Show($"Exported report to {dlg.FileName}", "Export Completed", MessageBoxButton.OK, MessageBoxImage.Information);
             }
-            else
+            catch (Exception ex)
             {
-                await using var writer = new StreamWriter(dlg.FileName);
-                await ReportExporter.ExportToCsvAsync(writer, SelectedRun, diffs.Items, includeGrace);
+                StatusMessage = "Export failed.";
+                MessageBox.Show($"Export failed:\n{ex.Message}", "Export", MessageBoxButton.OK, MessageBoxImage.Error);
             }
-
-            MessageBox.Show($"Exported {diffs.Items.Count:N0} differences to {dlg.FileName}", "Export Completed", MessageBoxButton.OK, MessageBoxImage.Information);
         }
     }
 
@@ -679,7 +837,18 @@ public class MainViewModel : ViewModelBase
     private void SyncPresetSelection()
     {
         if (SelectedJob == null) return;
-        SelectedPresetA = PresetsA.FirstOrDefault(p => !string.IsNullOrEmpty(p.Url) && string.Equals(p.Url, SelectedJob.BucketA.EndpointUrl, StringComparison.OrdinalIgnoreCase));
-        SelectedPresetB = PresetsB.FirstOrDefault(p => !string.IsNullOrEmpty(p.Url) && string.Equals(p.Url, SelectedJob.BucketB.EndpointUrl, StringComparison.OrdinalIgnoreCase));
+        // Display-only sync: must never write back into the job.
+        _syncingPresets = true;
+        try
+        {
+            SelectedPresetA = PresetsA.FirstOrDefault(p => !string.IsNullOrEmpty(p.Url) && string.Equals(p.Url, SelectedJob.BucketA.EndpointUrl, StringComparison.OrdinalIgnoreCase));
+            SelectedPresetB = PresetsB.FirstOrDefault(p => !string.IsNullOrEmpty(p.Url) && string.Equals(p.Url, SelectedJob.BucketB.EndpointUrl, StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            _syncingPresets = false;
+        }
     }
+
+    private bool _syncingPresets;
 }

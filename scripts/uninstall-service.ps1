@@ -3,7 +3,7 @@
     Uninstalls S3CompareService Windows Service.
 .PARAMETER KeepData
     If $true (default), leaves database and logs in C:\ProgramData\S3CompareService.
-    If $false, removes the data directory as well.
+    Pass -KeepData:$false to remove the data directory as well.
 .PARAMETER InstallDir
     Target directory for binaries. Defaults to "C:\Program Files\S3CompareService".
 .PARAMETER DataDir
@@ -15,12 +15,13 @@ param(
     [string]$DataDir = "C:\ProgramData\S3CompareService"
 )
 
+$ErrorActionPreference = 'Stop'
+
 $ServiceName = "S3CompareService"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Error "Administrator privileges are required to uninstall Windows Services. Please run this script in an elevated PowerShell session."
-    exit 1
+    throw "Administrator privileges are required to uninstall Windows Services. Please run this script in an elevated PowerShell session."
 }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
@@ -31,32 +32,35 @@ Write-Host "==========================================================" -Foregro
 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if ($service) {
     Write-Host "[1/3] Stopping '$ServiceName'..." -ForegroundColor Yellow
-    if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+    if ($service.Status -ne 'Stopped') {
         Stop-Service -Name $ServiceName -Force
-        Start-Sleep -Seconds 2
+        (Get-Service -Name $ServiceName).WaitForStatus('Stopped', '00:01:00')
     }
 
     # 2. Delete service registration
     Write-Host "[2/3] Removing service registration..." -ForegroundColor Yellow
-    try {
-        Remove-Service -Name $ServiceName -ErrorAction Stop
-    } catch {
-        & sc.exe delete $ServiceName | Out-Null
+    & sc.exe delete $ServiceName | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe delete failed with exit code $LASTEXITCODE." }
+    $deadline = (Get-Date).AddSeconds(60)
+    while (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -gt $deadline) { throw "Timed out waiting for service '$ServiceName' to be deleted." }
+        Start-Sleep -Milliseconds 500
     }
-    Start-Sleep -Seconds 1
 } else {
     Write-Host "Service '$ServiceName' is not installed." -ForegroundColor Yellow
 }
 
 # 3. Clean files
 Write-Host "[3/3] Cleaning installation files..." -ForegroundColor Yellow
-if (Test-Path $InstallDir) {
-    Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $InstallDir) {
+    try { Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction Stop }
+    catch { Write-Warning "Could not fully remove '$InstallDir': $($_.Exception.Message)" }
 }
 
-if (-not $KeepData -and (Test-Path $DataDir)) {
+if (-not $KeepData -and (Test-Path -LiteralPath $DataDir)) {
     Write-Host "       Removing data directory '$DataDir'..." -ForegroundColor Red
-    Remove-Item -Path $DataDir -Recurse -Force -ErrorAction SilentlyContinue
+    try { Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction Stop }
+    catch { Write-Warning "Could not fully remove '$DataDir': $($_.Exception.Message)" }
 } else {
     Write-Host "       Preserved database & historical data at '$DataDir'." -ForegroundColor Green
 }

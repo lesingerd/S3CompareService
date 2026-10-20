@@ -14,12 +14,13 @@ param(
     [string]$PublishSource = ""
 )
 
+$ErrorActionPreference = 'Stop'
+
 $ServiceName = "S3CompareService"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Error "Administrator privileges are required to update Windows Services. Please run this script in an elevated PowerShell session."
-    exit 1
+    throw "Administrator privileges are required to update Windows Services. Please run this script in an elevated PowerShell session."
 }
 
 Write-Host "==========================================================" -ForegroundColor Cyan
@@ -29,43 +30,49 @@ Write-Host "==========================================================" -Foregro
 # 1. Stop service
 Write-Host "[1/5] Stopping '$ServiceName'..." -ForegroundColor Yellow
 $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
+if (-not $service) {
+    throw "Service '$ServiceName' is not installed. Run install-service.ps1 first."
+}
+if ($service.Status -ne 'Stopped') {
     Stop-Service -Name $ServiceName -Force
-    Start-Sleep -Seconds 2
+    (Get-Service -Name $ServiceName).WaitForStatus('Stopped', '00:01:00')
 }
 
-# 2. Backup SQLite database
+# 2. Backup SQLite database (service is stopped, so the DB and its WAL/SHM files are consistent)
 Write-Host "[2/5] Creating database snapshot backup..." -ForegroundColor Yellow
 $dbPath = Join-Path $DataDir "s3compareservice.db"
-if (Test-Path $dbPath) {
+if (Test-Path -LiteralPath $dbPath) {
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $backupPath = Join-Path $DataDir "s3compareservice.db.bak_$timestamp"
-    Copy-Item $dbPath $backupPath -Force
-    Write-Host "       Database backed up to: $backupPath" -ForegroundColor Green
+    foreach ($suffix in @('', '-wal', '-shm')) {
+        $src = "$dbPath$suffix"
+        if (Test-Path -LiteralPath $src) {
+            Copy-Item -LiteralPath $src -Destination "$dbPath.bak_$timestamp$suffix" -Force
+        }
+    }
+    Write-Host "       Database backed up to: $dbPath.bak_$timestamp" -ForegroundColor Green
 }
 
 # 3. Publish or copy new binaries
 Write-Host "[3/5] Updating binaries..." -ForegroundColor Yellow
 if ([string]::IsNullOrWhiteSpace($PublishSource)) {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-    $projectDir = Join-Path $scriptDir "..\S3CompareService.Worker"
-    if (Test-Path (Join-Path $projectDir "S3CompareService.Worker.csproj")) {
-        $publishTemp = Join-Path $env:TEMP "S3CompareService_Update"
-        dotnet publish (Join-Path $projectDir "S3CompareService.Worker.csproj") -c Release -r win-x64 --self-contained false -o $publishTemp | Out-Null
-        Copy-Item -Path "$publishTemp\*" -Destination $InstallDir -Recurse -Force
-        Remove-Item -Path $publishTemp -Recurse -Force -ErrorAction SilentlyContinue
-    } else {
-        Write-Error "Could not locate S3CompareService.Worker.csproj."
-        exit 1
+    $projectFile = Join-Path (Join-Path $scriptDir "..\S3CompareService.Worker") "S3CompareService.Worker.csproj"
+    if (-not (Test-Path -LiteralPath $projectFile)) {
+        throw "Could not locate S3CompareService.Worker.csproj."
     }
+    $publishTemp = Join-Path $env:TEMP "S3CompareService_Update"
+    dotnet publish $projectFile -c Release -r win-x64 --self-contained false -o $publishTemp
+    if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
+    Copy-Item -Path (Join-Path $publishTemp "*") -Destination $InstallDir -Recurse -Force
+    Remove-Item -Path $publishTemp -Recurse -Force -ErrorAction SilentlyContinue
 } else {
-    Copy-Item -Path "$PublishSource\*" -Destination $InstallDir -Recurse -Force
+    Copy-Item -Path (Join-Path $PublishSource "*") -Destination $InstallDir -Recurse -Force
 }
 
 # 4. Start service
 Write-Host "[4/5] Starting updated service..." -ForegroundColor Yellow
 Start-Service -Name $ServiceName
-Start-Sleep -Seconds 2
+(Get-Service -Name $ServiceName).WaitForStatus('Running', '00:00:30')
 
 # 5. Check health
 Write-Host "[5/5] Verifying service status..." -ForegroundColor Yellow
