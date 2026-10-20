@@ -10,10 +10,13 @@ public class JobAlertConfig
 
     /// <summary>
     /// Alert if confirmed disparities (excluding replication lag) exceed this threshold.
-    /// Default is 0 (alert on any confirmed disparity).
+    /// Default is 0 (alert on any confirmed disparity). Unlike the per-type thresholds below, 0 here is NOT "disabled".
     /// </summary>
     public int MaxDisparitiesThreshold { get; set; } = 0;
 
+    // Per-type thresholds: 0 (or less) = DISABLED for that type; otherwise alert when the confirmed count for the
+    // type is strictly greater than the threshold. An alert fires if the overall threshold above OR any enabled
+    // per-type threshold is exceeded.
     public int MaxMissingInBThreshold { get; set; } = 0;
     public int MaxMissingInAThreshold { get; set; } = 0;
     public int MaxSizeMismatchThreshold { get; set; } = 0;

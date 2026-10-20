@@ -12,9 +12,9 @@ namespace S3CompareService.Core.Notifications;
 public interface IAlertNotificationService
 {
     Task<(bool ShouldAlert, List<string> Reasons)> EvaluateAlertConditionAsync(ComparisonJob job, ScanRun run);
-    Task DispatchAlertsAsync(ComparisonJob job, ScanRun run, List<string> reasons, CancellationToken cancellationToken = default);
+    Task<bool> DispatchAlertsAsync(ComparisonJob job, ScanRun run, List<string> reasons, CancellationToken cancellationToken = default);
     Task<(bool ShouldSend, string Reason)> EvaluateDailyDigestConditionAsync(ComparisonJob job, DateTime nowUtc);
-    Task DispatchDailyDigestAsync(ComparisonJob job, ScanRun? latestRun, List<ScanRun> recentRuns24h, CancellationToken cancellationToken = default);
+    Task<bool> DispatchDailyDigestAsync(ComparisonJob job, ScanRun? latestRun, List<ScanRun> recentRuns24h, CancellationToken cancellationToken = default);
     Task<(bool Success, string Message)> SendTestEmailAsync(JobAlertConfig config, CancellationToken cancellationToken = default);
     Task<(bool Success, string Message)> SendTestAzureWebhookAsync(JobAlertConfig config, CancellationToken cancellationToken = default);
     Task<(bool Success, string Message)> SendTestDailyDigestAsync(JobAlertConfig config, ComparisonJob job, ScanRun? sampleRun = null, CancellationToken cancellationToken = default);
@@ -49,36 +49,21 @@ public class AlertNotificationService : IAlertNotificationService
         }
 
         // 2. Disparity Thresholds (Evaluated against CONFIRMED disparities to shield replication lag)
-        if (cfg.AlertOnDisparities && run.FilteredDifferencesCount > 0)
+        // Overall threshold: confirmed disparities strictly above it alert (0 = alert on any confirmed disparity).
+        // Per-type thresholds: 0 (or less) = disabled; an enabled threshold alerts when its count is strictly above it.
+        // An alert fires if the overall threshold OR any enabled per-type threshold is exceeded.
+        if (cfg.AlertOnDisparities)
         {
-            if (run.FilteredDifferencesCount > cfg.MaxDisparitiesThreshold)
+            if (run.FilteredDifferencesCount > cfg.MaxDisparitiesThreshold && run.FilteredDifferencesCount > 0)
             {
                 reasons.Add($"Confirmed Disparities: {run.FilteredDifferencesCount:N0} (Exceeds threshold of {cfg.MaxDisparitiesThreshold:N0})");
             }
-            if (run.MissingInBucketBCount > cfg.MaxMissingInBThreshold)
-            {
-                reasons.Add($"Missing in Bucket B: {run.MissingInBucketBCount:N0} (Exceeds threshold of {cfg.MaxMissingInBThreshold:N0})");
-            }
-            if (run.MissingInBucketACount > cfg.MaxMissingInAThreshold)
-            {
-                reasons.Add($"Missing in Bucket A: {run.MissingInBucketACount:N0} (Exceeds threshold of {cfg.MaxMissingInAThreshold:N0})");
-            }
-            if (run.SizeMismatchCount > cfg.MaxSizeMismatchThreshold)
-            {
-                reasons.Add($"Size Mismatches: {run.SizeMismatchCount:N0} (Exceeds threshold of {cfg.MaxSizeMismatchThreshold:N0})");
-            }
-            if (run.ETagMismatchCount > cfg.MaxETagMismatchThreshold)
-            {
-                reasons.Add($"ETag Mismatches: {run.ETagMismatchCount:N0} (Exceeds threshold of {cfg.MaxETagMismatchThreshold:N0})");
-            }
-            if (run.ContentMismatchCount > cfg.MaxContentMismatchThreshold)
-            {
-                reasons.Add($"Content Byte Mismatches: {run.ContentMismatchCount:N0} (Exceeds threshold of {cfg.MaxContentMismatchThreshold:N0})");
-            }
-            if (run.SequenceGapCount > cfg.MaxSequenceGapThreshold)
-            {
-                reasons.Add($"Sequence Gaps: {run.SequenceGapCount:N0} (Exceeds threshold of {cfg.MaxSequenceGapThreshold:N0})");
-            }
+            AddIfExceeded(reasons, "Missing in Bucket B", run.MissingInBucketBCount, cfg.MaxMissingInBThreshold);
+            AddIfExceeded(reasons, "Missing in Bucket A", run.MissingInBucketACount, cfg.MaxMissingInAThreshold);
+            AddIfExceeded(reasons, "Size Mismatches", run.SizeMismatchCount, cfg.MaxSizeMismatchThreshold);
+            AddIfExceeded(reasons, "ETag Mismatches", run.ETagMismatchCount, cfg.MaxETagMismatchThreshold);
+            AddIfExceeded(reasons, "Content Byte Mismatches", run.ContentMismatchCount, cfg.MaxContentMismatchThreshold);
+            AddIfExceeded(reasons, "Sequence Gaps", run.SequenceGapCount, cfg.MaxSequenceGapThreshold);
         }
 
         // 3. Digest on Success
@@ -92,23 +77,51 @@ public class AlertNotificationService : IAlertNotificationService
         return Task.FromResult((shouldAlert, reasons));
     }
 
-    public async Task DispatchAlertsAsync(ComparisonJob job, ScanRun run, List<string> reasons, CancellationToken cancellationToken = default)
+    private static void AddIfExceeded(List<string> reasons, string label, long count, int threshold)
+    {
+        if (threshold > 0 && count > threshold)
+        {
+            reasons.Add($"{label}: {count:N0} (Exceeds threshold of {threshold:N0})");
+        }
+    }
+
+    private static readonly TimeSpan DeliveryTimeout = TimeSpan.FromSeconds(30);
+
+    private static CancellationTokenSource CreateDeliveryCts(CancellationToken cancellationToken)
+    {
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(DeliveryTimeout);
+        return cts;
+    }
+
+    private static async Task PostJsonAsync(string url, object payload, CancellationToken cancellationToken)
+    {
+        using var cts = CreateDeliveryCts(cancellationToken);
+        using var resp = await HttpClient.PostAsJsonAsync(url, payload, cts.Token).ConfigureAwait(false);
+        resp.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// Dispatches threshold / failure alerts. Returns true when at least one channel (SMTP or webhook) delivered.
+    /// <c>AlertConfig.LastAlertSentUtc</c> is updated on the passed job only after a channel succeeded; callers
+    /// should persist it with <c>IJobRepository.UpdateAlertTimestampsAsync</c>.
+    /// </summary>
+    public async Task<bool> DispatchAlertsAsync(ComparisonJob job, ScanRun run, List<string> reasons, CancellationToken cancellationToken = default)
     {
         var cfg = job.AlertConfig;
-        if (!cfg.IsEnabled) return;
+        if (!cfg.IsEnabled) return false;
 
         bool isFailure = run.Status == RunStatus.Failed || (reasons.Count > 0 && !reasons[0].StartsWith("Periodic status"));
-        if (isFailure)
-        {
-            cfg.LastAlertSentUtc = DateTime.UtcNow;
-        }
+        bool anyDelivered = false;
 
         // 1. Dispatch Email via SMTP
         if (!string.IsNullOrWhiteSpace(cfg.SmtpHost) && !string.IsNullOrWhiteSpace(cfg.ToEmails))
         {
             try
             {
-                await SendEmailAlertAsync(job, run, reasons, isFailure, cancellationToken).ConfigureAwait(false);
+                using var cts = CreateDeliveryCts(cancellationToken);
+                await SendEmailAlertAsync(job, run, reasons, isFailure, cts.Token).ConfigureAwait(false);
+                anyDelivered = true;
                 if (_auditRepo != null)
                 {
                     await _auditRepo.LogAsync("INFO", "Alerts", $"SMTP alert sent successfully to {cfg.ToEmails} for job '{job.Name}'.", scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
@@ -118,7 +131,7 @@ public class AlertNotificationService : IAlertNotificationService
             {
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to send SMTP alert to {cfg.ToEmails}: {ex.Message}", details: ex.StackTrace, scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to send SMTP alert to {cfg.ToEmails}: {ex.Message}", details: ex.StackTrace, scanRunId: run.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
                 }
             }
         }
@@ -129,6 +142,7 @@ public class AlertNotificationService : IAlertNotificationService
             try
             {
                 await SendAzureWebhookAlertAsync(job, run, reasons, isFailure, cancellationToken).ConfigureAwait(false);
+                anyDelivered = true;
                 if (_auditRepo != null)
                 {
                     await _auditRepo.LogAsync("INFO", "Alerts", $"Azure Webhook alert dispatched successfully for job '{job.Name}'.", scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
@@ -138,12 +152,12 @@ public class AlertNotificationService : IAlertNotificationService
             {
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to dispatch Azure Webhook alert: {ex.Message}", details: ex.StackTrace, scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to dispatch Azure Webhook alert: {ex.Message}", details: ex.StackTrace, scanRunId: run.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
                 }
             }
         }
 
-        // 3. Dispatch to Azure Application Insights Telemetry
+        // 3. Dispatch to Azure Application Insights Telemetry (telemetry only: does not count as an alert delivery)
         if (!string.IsNullOrWhiteSpace(cfg.AzureAppInsightsConnectionString))
         {
             try
@@ -154,10 +168,17 @@ public class AlertNotificationService : IAlertNotificationService
             {
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("WARN", "Alerts", $"Failed to post App Insights telemetry: {ex.Message}", scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("WARN", "Alerts", $"Failed to post App Insights telemetry: {ex.Message}", scanRunId: run.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
                 }
             }
         }
+
+        if (isFailure && anyDelivered)
+        {
+            cfg.LastAlertSentUtc = DateTime.UtcNow;
+        }
+
+        return anyDelivered;
     }
 
     private async Task SendEmailAlertAsync(ComparisonJob job, ScanRun run, List<string> reasons, bool isFailure, CancellationToken cancellationToken)
@@ -303,8 +324,7 @@ public class AlertNotificationService : IAlertNotificationService
             bucketB = new { name = job.BucketB.BucketName, endpoint = job.BucketB.EndpointUrl, region = job.BucketB.Region }
         };
 
-        var resp = await HttpClient.PostAsJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, cancellationToken).ConfigureAwait(false);
-        resp.EnsureSuccessStatusCode();
+        await PostJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task TrackAppInsightsTelemetryAsync(ComparisonJob job, ScanRun run, bool isFailure, CancellationToken cancellationToken)
@@ -344,7 +364,7 @@ public class AlertNotificationService : IAlertNotificationService
             }
         };
 
-        await HttpClient.PostAsJsonAsync(endpoint, metricItem, cancellationToken).ConfigureAwait(false);
+        await PostJsonAsync(endpoint, metricItem, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<(bool Success, string Message)> SendTestEmailAsync(JobAlertConfig config, CancellationToken cancellationToken = default)
@@ -383,7 +403,8 @@ public class AlertNotificationService : IAlertNotificationService
                 message.To.Add(r.Trim());
             }
 
-            await client.SendMailAsync(message, cancellationToken).ConfigureAwait(false);
+            using var smtpCts = CreateDeliveryCts(cancellationToken);
+            await client.SendMailAsync(message, smtpCts.Token).ConfigureAwait(false);
             return (true, $"Test email sent successfully to {config.ToEmails} via {config.SmtpHost}:{config.SmtpPort}.");
         }
         catch (Exception ex)
@@ -406,7 +427,8 @@ public class AlertNotificationService : IAlertNotificationService
                 timestampUtc = DateTime.UtcNow.ToString("O")
             };
 
-            var resp = await HttpClient.PostAsJsonAsync(config.AzureWebhookUrl.Trim(), testPayload, cancellationToken).ConfigureAwait(false);
+            using var testCts = CreateDeliveryCts(cancellationToken);
+            using var resp = await HttpClient.PostAsJsonAsync(config.AzureWebhookUrl.Trim(), testPayload, testCts.Token).ConfigureAwait(false);
             if (resp.IsSuccessStatusCode)
             {
                 return (true, $"Azure Webhook responded with HTTP {(int)resp.StatusCode} {resp.StatusCode}. Connection verified!");
@@ -458,31 +480,100 @@ public class AlertNotificationService : IAlertNotificationService
         return Task.FromResult((true, "Daily status report is due."));
     }
 
-    public async Task DispatchDailyDigestAsync(ComparisonJob job, ScanRun? latestRun, List<ScanRun> recentRuns24h, CancellationToken cancellationToken = default)
+    /// <summary>Hours after which the latest scan is considered too old for an "all clear".</summary>
+    public const double DigestMaxScanAgeHours = 26.0;
+
+    public sealed record DigestAssessment(bool IsAllClear, string Headline, IReadOnlyList<string> Issues);
+
+    /// <summary>
+    /// Decides whether the daily digest may say "all clear": the latest run must be recent (within ~26h),
+    /// Completed, and have zero confirmed disparities, with no failed runs in the last 24h. Otherwise the
+    /// digest is still sent but describes the actual problem.
+    /// </summary>
+    public static DigestAssessment AssessDigest(ScanRun? latestRun, IReadOnlyCollection<ScanRun> recentRuns24h, DateTime nowUtc)
+    {
+        var issues = new List<string>();
+
+        if (latestRun == null)
+        {
+            issues.Add("No scan has been recorded for this job.");
+        }
+        else
+        {
+            var reference = latestRun.EndTimeUtc ?? latestRun.StartTimeUtc;
+            double ageHours = (nowUtc - reference).TotalHours;
+            if (ageHours > DigestMaxScanAgeHours)
+            {
+                issues.Add($"The latest scan finished {ageHours:F1} hours ago (more than {DigestMaxScanAgeHours:F0}h) - scans may have stopped running.");
+            }
+            if (latestRun.Status != RunStatus.Completed)
+            {
+                issues.Add($"The latest scan did not complete successfully (status: {latestRun.Status}).");
+            }
+            else if (latestRun.FilteredDifferencesCount > 0)
+            {
+                issues.Add($"The latest scan found {latestRun.FilteredDifferencesCount:N0} confirmed disparit{(latestRun.FilteredDifferencesCount == 1 ? "y" : "ies")}.");
+            }
+        }
+
+        int failed = recentRuns24h.Count(r => r.Status == RunStatus.Failed);
+        if (failed > 0)
+        {
+            issues.Add($"{failed} scan(s) failed in the past 24 hours.");
+        }
+
+        return issues.Count == 0
+            ? new DigestAssessment(true, "All systems operational", issues)
+            : new DigestAssessment(false, "Attention needed", issues);
+    }
+
+    /// <summary>
+    /// Sends the daily digest. Returns true when at least one channel delivered; only then is
+    /// <c>AlertConfig.LastDailyDigestSentUtc</c> set on the passed job (persist it with
+    /// <c>IJobRepository.UpdateAlertTimestampsAsync</c>).
+    /// </summary>
+    public async Task<bool> DispatchDailyDigestAsync(ComparisonJob job, ScanRun? latestRun, List<ScanRun> recentRuns24h, CancellationToken cancellationToken = default)
+    {
+        var result = await DispatchDailyDigestCoreAsync(job, latestRun, recentRuns24h, cancellationToken).ConfigureAwait(false);
+        return result.Success;
+    }
+
+    private async Task<(bool Success, List<string> Errors)> DispatchDailyDigestCoreAsync(ComparisonJob job, ScanRun? latestRun, List<ScanRun> recentRuns24h, CancellationToken cancellationToken)
     {
         var cfg = job.AlertConfig;
-        if (!cfg.IsEnabled || !cfg.SendDailyDigest) return;
+        var errors = new List<string>();
+        if (!cfg.IsEnabled || !cfg.SendDailyDigest)
+        {
+            errors.Add("Daily digest is disabled for this job.");
+            return (false, errors);
+        }
 
         int totalRuns24h = recentRuns24h.Count;
         int completedRuns24h = recentRuns24h.Count(r => r.Status == RunStatus.Completed);
         int failedRuns24h = recentRuns24h.Count(r => r.Status == RunStatus.Failed);
+        var assessment = AssessDigest(latestRun, recentRuns24h, DateTime.UtcNow);
+        bool anyDelivered = false;
+        string label = assessment.IsAllClear ? "all-clear" : "attention-needed";
 
         // 1. Send Email via SMTP
         if (!string.IsNullOrWhiteSpace(cfg.SmtpHost) && !string.IsNullOrWhiteSpace(cfg.ToEmails))
         {
             try
             {
-                await SendDailyDigestEmailAsync(job, latestRun, totalRuns24h, completedRuns24h, failedRuns24h, cancellationToken).ConfigureAwait(false);
+                using var cts = CreateDeliveryCts(cancellationToken);
+                await SendDailyDigestEmailAsync(job, latestRun, totalRuns24h, completedRuns24h, failedRuns24h, assessment, cts.Token).ConfigureAwait(false);
+                anyDelivered = true;
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("INFO", "Alerts", $"Daily all-clear digest sent to {cfg.ToEmails} for job '{job.Name}'.", scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("INFO", "Alerts", $"Daily {label} digest sent to {cfg.ToEmails} for job '{job.Name}'.", scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
                 }
             }
             catch (Exception ex)
             {
+                errors.Add($"Email: {ex.Message}");
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to send daily digest email to {cfg.ToEmails}: {ex.Message}", details: ex.StackTrace, scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to send daily digest email to {cfg.ToEmails}: {ex.Message}", details: ex.StackTrace, scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
                 }
             }
         }
@@ -494,12 +585,15 @@ public class AlertNotificationService : IAlertNotificationService
             {
                 var payload = new
                 {
-                    alertType = "DailyDigestAllClear",
+                    alertType = assessment.IsAllClear ? "DailyDigestAllClear" : "DailyDigestAttentionNeeded",
                     jobId = job.Id,
                     jobName = job.Name,
-                    isCritical = false,
-                    status = "AllClear",
-                    message = $"Daily all-clear status confirmation for '{job.Name}'. S3CompareService is actively running and healthy.",
+                    isCritical = !assessment.IsAllClear,
+                    status = assessment.IsAllClear ? "AllClear" : "AttentionNeeded",
+                    issues = assessment.Issues,
+                    message = assessment.IsAllClear
+                        ? $"Daily all-clear status confirmation for '{job.Name}'. S3CompareService is actively running and healthy."
+                        : $"Daily status for '{job.Name}': {string.Join(" ", assessment.Issues)}",
                     timestampUtc = DateTime.UtcNow.ToString("O"),
                     metrics = new
                     {
@@ -514,25 +608,37 @@ public class AlertNotificationService : IAlertNotificationService
                     }
                 };
 
-                await HttpClient.PostAsJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, cancellationToken).ConfigureAwait(false);
+                await PostJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, cancellationToken).ConfigureAwait(false);
+                anyDelivered = true;
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("INFO", "Alerts", $"Daily all-clear webhook dispatched to Azure for job '{job.Name}'.", scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("INFO", "Alerts", $"Daily {label} webhook dispatched to Azure for job '{job.Name}'.", scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
                 }
             }
             catch (Exception ex)
             {
+                errors.Add($"Webhook: {ex.Message}");
                 if (_auditRepo != null)
                 {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to dispatch daily digest to Azure Webhook: {ex.Message}", details: ex.StackTrace, scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
+                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to dispatch daily digest to Azure Webhook: {ex.Message}", details: ex.StackTrace, scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
                 }
             }
         }
 
-        cfg.LastDailyDigestSentUtc = DateTime.UtcNow;
+        if (!anyDelivered && errors.Count == 0)
+        {
+            errors.Add("No delivery channel (SMTP recipients or webhook URL) is configured.");
+        }
+
+        if (anyDelivered)
+        {
+            cfg.LastDailyDigestSentUtc = DateTime.UtcNow;
+        }
+
+        return (anyDelivered, errors);
     }
 
-    private async Task SendDailyDigestEmailAsync(ComparisonJob job, ScanRun? latestRun, int totalRuns24h, int completedRuns24h, int failedRuns24h, CancellationToken cancellationToken)
+    private async Task SendDailyDigestEmailAsync(ComparisonJob job, ScanRun? latestRun, int totalRuns24h, int completedRuns24h, int failedRuns24h, DigestAssessment assessment, CancellationToken cancellationToken)
     {
         var cfg = job.AlertConfig;
         using var client = new SmtpClient(cfg.SmtpHost.Trim(), cfg.SmtpPort)
@@ -548,14 +654,16 @@ public class AlertNotificationService : IAlertNotificationService
         }
 
         string from = string.IsNullOrWhiteSpace(cfg.FromEmail) ? "s3compareservice@localhost" : cfg.FromEmail.Trim();
-        string subject = $"{cfg.EmailSubjectPrefix} [DAILY ALL-CLEAR] - Job '{job.Name}' - All Systems Operational";
+        string subject = assessment.IsAllClear
+            ? $"{cfg.EmailSubjectPrefix} [DAILY ALL-CLEAR] - Job '{job.Name}' - All Systems Operational"
+            : $"{cfg.EmailSubjectPrefix} [DAILY STATUS - ATTENTION] - Job '{job.Name}'";
 
         using var message = new MailMessage
         {
             From = new MailAddress(from, "S3 Compare Service"),
             Subject = subject,
             IsBodyHtml = true,
-            Body = BuildDailyDigestHtmlEmailBody(job, latestRun, totalRuns24h, completedRuns24h, failedRuns24h)
+            Body = BuildDailyDigestHtmlEmailBody(job, latestRun, totalRuns24h, completedRuns24h, failedRuns24h, assessment)
         };
 
         var recipients = cfg.ToEmails.Split(new[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
@@ -567,7 +675,7 @@ public class AlertNotificationService : IAlertNotificationService
         await client.SendMailAsync(message, cancellationToken).ConfigureAwait(false);
     }
 
-    private static string BuildDailyDigestHtmlEmailBody(ComparisonJob job, ScanRun? latestRun, int totalRuns24h, int completedRuns24h, int failedRuns24h)
+    private static string BuildDailyDigestHtmlEmailBody(ComparisonJob job, ScanRun? latestRun, int totalRuns24h, int completedRuns24h, int failedRuns24h, DigestAssessment assessment)
     {
         long objects = latestRun?.ObjectsCompared ?? 0;
         long matched = latestRun?.MatchedCount ?? 0;
@@ -575,47 +683,61 @@ public class AlertNotificationService : IAlertNotificationService
         long inFlight = latestRun?.InFlightDifferencesCount ?? 0;
         double matchRate = objects > 0 ? (matched * 100.0 / objects) : 100.0;
 
+        bool ok = assessment.IsAllClear;
+        string headerBg = ok ? "#107C41" : "#B26A00";
+        string headerTitle = ok ? "✅ DAILY ALL-CLEAR STATUS CONFIRMATION" : "⚠️ DAILY STATUS: ATTENTION NEEDED";
+        string boxBg = ok ? "#e6f4ea" : "#fff3cd";
+        string boxBorder = ok ? "#137333" : "#ffc107";
+        string boxTitle = ok ? "🛡️ Service Operational &amp; Healthy" : "Attention needed";
+        string boxBody = ok
+            ? "This is your daily confirmation that <strong>S3CompareService</strong> is actively running and continuously monitoring bucket synchronization. The latest scan completed successfully with no confirmed disparities, and no scans failed in the past 24 hours."
+            : "<ul style='margin: 6px 0 0 18px; padding: 0;'>" + string.Concat(assessment.Issues.Select(i => $"<li>{WebUtility.HtmlEncode(i)}</li>")) + "</ul>";
+        string badgeText = ok ? "OPERATIONAL - ALL CLEAR" : "ATTENTION NEEDED";
+        string badgeBg = ok ? "#52c41a" : "#faad14";
+        string disparityColor = disparities > 0 ? "#dc3545" : "#28a745";
+        string disparityNote = disparities > 0 ? "(see latest scan)" : "(All buckets in sync)";
+        string latestScanTime = latestRun != null ? $"{latestRun.StartTimeUtc:yyyy-MM-dd HH:mm:ss} UTC" : "N/A";
+
         return $@"<!DOCTYPE html>
 <html>
 <head>
 <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; color: #333333; margin: 0; padding: 20px; }}
     .container {{ max-width: 650px; margin: 0 auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border: 1px solid #e1e4e8; }}
-    .header {{ background-color: #107C41; color: #ffffff; padding: 20px 24px; }}
+    .header {{ background-color: {headerBg}; color: #ffffff; padding: 20px 24px; }}
     .header h1 {{ margin: 0; font-size: 18px; letter-spacing: 0.5px; }}
     .content {{ padding: 24px; }}
-    .success-box {{ background-color: #e6f4ea; border-left: 4px solid #137333; padding: 14px 18px; margin-bottom: 20px; border-radius: 4px; }}
+    .success-box {{ background-color: {boxBg}; border-left: 4px solid {boxBorder}; padding: 14px 18px; margin-bottom: 20px; border-radius: 4px; }}
     .table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; }}
     .table th, .table td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid #e9ecef; font-size: 13px; }}
     .table th {{ background-color: #f8f9fa; font-weight: 600; color: #495057; }}
-    .badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background: #52c41a; color: #ffffff; }}
+    .badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; background: {badgeBg}; color: #ffffff; }}
     .footer {{ background: #f8f9fa; padding: 16px 24px; font-size: 11px; color: #6c757d; border-top: 1px solid #e9ecef; text-align: center; }}
 </style>
 </head>
 <body>
 <div class='container'>
     <div class='header'>
-        <h1>✅ DAILY ALL-CLEAR STATUS CONFIRMATION</h1>
+        <h1>{headerTitle}</h1>
         <div style='font-size: 13px; opacity: 0.9; margin-top: 4px;'>Job: <strong>{WebUtility.HtmlEncode(job.Name)}</strong> | Generated: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC</div>
     </div>
     <div class='content'>
         <div class='success-box'>
-            <strong style='font-size: 14px; color: #137333;'>🛡️ Service Operational &amp; Healthy</strong>
+            <strong style='font-size: 14px;'>{boxTitle}</strong>
             <p style='margin: 6px 0 0 0; font-size: 13px; color: #202124;'>
-                This is your daily confirmation that <strong>S3CompareService</strong> is actively running and continuously monitoring bucket synchronization.
-                No disparity thresholds or execution failures have triggered alerts in the past 24 hours.
+                {boxBody}
             </p>
         </div>
 
         <table class='table'>
             <tr><th colspan='2'>24-Hour Activity &amp; Health Metrics</th></tr>
-            <tr><td><strong>System Health Status</strong></td><td><span class='badge'>OPERATIONAL - ALL CLEAR</span></td></tr>
-            <tr><td><strong>Scans Completed (Past 24h)</strong></td><td><strong>{completedRuns24h}</strong> successful (Failed: {failedRuns24h})</td></tr>
-            <tr><td><strong>Confirmed Disparities</strong></td><td><strong style='color: #28a745;'>{disparities:N0}</strong> (All buckets in sync)</td></tr>
+            <tr><td><strong>System Health Status</strong></td><td><span class='badge'>{badgeText}</span></td></tr>
+            <tr><td><strong>Scans Completed (Past 24h)</strong></td><td><strong>{completedRuns24h}</strong> successful (Failed: {failedRuns24h}, Total: {totalRuns24h})</td></tr>
+            <tr><td><strong>Confirmed Disparities (latest scan)</strong></td><td><strong style='color: {disparityColor};'>{disparities:N0}</strong> {disparityNote}</td></tr>
             <tr><td><strong>In-Flight Replication Lag</strong></td><td>{inFlight:N0} <span style='font-size: 11px; color: #888888;'>(shielded by {job.ReplicationGracePeriodMinutes}m grace window)</span></td></tr>
             <tr><td><strong>Objects Evaluated</strong></td><td>{objects:N0}</td></tr>
             <tr><td><strong>Data Match Rate</strong></td><td>{matchRate:F2}%</td></tr>
-            <tr><td><strong>Latest Scan Time</strong></td><td>{latestRun?.StartTimeUtc:yyyy-MM-dd HH:mm:ss} UTC</td></tr>
+            <tr><td><strong>Latest Scan Time</strong></td><td>{latestScanTime}</td></tr>
             <tr><td><strong>Scan Duration</strong></td><td>{latestRun?.FormattedDuration ?? "N/A"}</td></tr>
         </table>
 
@@ -656,18 +778,27 @@ public class AlertNotificationService : IAlertNotificationService
         };
 
         var recentRuns = new List<ScanRun> { run };
+
+        // Work on a copy so a test never touches the caller's LastDailyDigestSentUtc, and force the digest on.
+        var configCopy = SecretMask.Clone(config);
+        configCopy.IsEnabled = true;
+        configCopy.SendDailyDigest = true;
         var tempJob = new ComparisonJob
         {
             Id = job.Id,
             Name = job.Name,
-            AlertConfig = config,
+            AlertConfig = configCopy,
             BucketA = job.BucketA,
             BucketB = job.BucketB,
             ReplicationGracePeriodMinutes = job.ReplicationGracePeriodMinutes
         };
 
-        await DispatchDailyDigestAsync(tempJob, run, recentRuns, cancellationToken).ConfigureAwait(false);
-        return (true, "Test daily all-clear digest dispatched successfully!");
+        var (success, errors) = await DispatchDailyDigestCoreAsync(tempJob, run, recentRuns, cancellationToken).ConfigureAwait(false);
+        return success
+            ? (true, errors.Count == 0
+                ? "Test daily digest dispatched successfully!"
+                : $"Test daily digest delivered on at least one channel, but some failed: {string.Join("; ", errors)}")
+            : (false, $"Test daily digest could not be delivered: {string.Join("; ", errors)}");
     }
 
     private static string ExtractAppInsightsKey(string connectionString)
