@@ -1,5 +1,6 @@
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Storage;
+using S3CompareService.Worker.IdleMon;
 
 namespace S3CompareService.Worker.Services;
 
@@ -10,19 +11,22 @@ public class CrashRecoveryManager
     private readonly IAuditLogRepository _auditLogRepo;
     private readonly ScanExecutionCoordinator _coordinator;
     private readonly ILogger<CrashRecoveryManager> _logger;
+    private readonly IIdleMonEvents _events;
 
     public CrashRecoveryManager(
         IScanRunRepository scanRunRepo,
         IJobRepository jobRepo,
         IAuditLogRepository auditLogRepo,
         ScanExecutionCoordinator coordinator,
-        ILogger<CrashRecoveryManager> logger)
+        ILogger<CrashRecoveryManager> logger,
+        IIdleMonEvents? events = null)
     {
         _scanRunRepo = scanRunRepo;
         _jobRepo = jobRepo;
         _auditLogRepo = auditLogRepo;
         _coordinator = coordinator;
         _logger = logger;
+        _events = events ?? NoOpIdleMonEvents.Instance;
     }
 
     /// <summary>
@@ -63,6 +67,7 @@ public class CrashRecoveryManager
                 if (result.Success)
                 {
                     _logger.LogInformation("Auto-resumed run {RunId} for Job '{JobName}' after key '{LastKey}'.", run.Id, run.JobName, checkpoint.LastEvaluatedKey);
+                    Notify(() => _events.RunRecovered(run, resumed: true));
                     continue;
                 }
                 if (result.Failure == TriggerFailure.AlreadyRunning || result.Failure == TriggerFailure.ShuttingDown)
@@ -78,7 +83,15 @@ public class CrashRecoveryManager
                 run.EndTimeUtc = DateTime.UtcNow;
                 run.ErrorMessage = "Scan interrupted by service restart / system reboot. Recovery checkpoint recorded.";
                 await _scanRunRepo.CompleteAsync(run, cancellationToken);
+                // One event per run, when it is marked now; a run left Interrupted earlier is not announced again at every start.
+                Notify(() => _events.RunRecovered(run, resumed: false));
             }
         }
+    }
+
+    private static void Notify(Action action)
+    {
+        try { action(); }
+        catch { }
     }
 }

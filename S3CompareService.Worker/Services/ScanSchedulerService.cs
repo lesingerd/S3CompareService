@@ -27,6 +27,7 @@ public class ScanSchedulerService : BackgroundService
             try
             {
                 await EvaluateSchedulesAsync(stoppingToken).ConfigureAwait(false);
+                _serviceProvider.GetService<SchedulerHeartbeat>()?.Record(); // read by the IdleMon heartbeat
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
