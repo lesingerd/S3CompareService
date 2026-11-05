@@ -348,6 +348,8 @@
             <RowDefinition Height="Auto" />
             <!-- Active Scan Monitor Banner -->
             <RowDefinition Height="Auto" />
+            <!-- IdleMon card -->
+            <RowDefinition Height="Auto" />
             <!-- Main Content Tabs -->
             <RowDefinition Height="*" />
             <!-- Status Bar -->
@@ -430,8 +432,52 @@
             </Grid>
         </Border>
 
+        <!-- IDLEMON STATUS CARD (read-only) -->
+        <Border Grid.Row="2" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="10,5" Margin="10,6,10,0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="IDLEMON" FontWeight="Bold" Foreground="#4EC9B0" VerticalAlignment="Center" Margin="0,0,10,0" />
+                <Border Grid.Row="0" Grid.Column="1" Background="{Binding IdleMon.BadgeBrush}" CornerRadius="3" Padding="8,2" VerticalAlignment="Center" Margin="0,0,10,0">
+                    <TextBlock Text="{Binding IdleMon.BadgeText}" FontSize="11" FontWeight="Bold" Foreground="{Binding IdleMon.BadgeForeground}" />
+                </Border>
+                <TextBlock Grid.Row="0" Grid.Column="2" Text="{Binding IdleMon.Notice}" ToolTip="{Binding IdleMon.Notice}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Foreground="#CCCCCC" FontSize="12" />
+                <TextBlock Grid.Row="1" Grid.ColumnSpan="3" Text="{Binding IdleMon.Details}" TextTrimming="CharacterEllipsis" Foreground="#CCCCCC" FontSize="12" Margin="0,3,0,0">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IdleMon.Details}" Value="">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+                <TextBlock Grid.Row="2" Grid.ColumnSpan="3" Text="{Binding IdleMon.Hint}" ToolTip="{Binding IdleMon.Hint}" TextTrimming="CharacterEllipsis" Foreground="#888888" FontSize="11" Margin="0,3,0,0">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding IdleMon.Hint}" Value="">
+                                    <Setter Property="Visibility" Value="Collapsed" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+            </Grid>
+        </Border>
+
         <!-- MAIN TABS -->
-        <TabControl Grid.Row="2" Background="#1E1E1E" BorderThickness="0" Margin="10,6">
+        <TabControl Grid.Row="3" Background="#1E1E1E" BorderThickness="0" Margin="10,6">
 
             <!-- TAB 1: JOBS & SCHEDULES -->
             <TabItem Header="Comparison Jobs">
@@ -1136,7 +1182,7 @@
         </TabControl>
 
         <!-- STATUS BAR -->
-        <Border Grid.Row="3" Background="#007ACC" Padding="12,4">
+        <Border Grid.Row="4" Background="#007ACC" Padding="12,4">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />

@@ -3,6 +3,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text.Json;
+using S3CompareService.Core.IdleMon;
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Storage;
 
@@ -291,6 +292,19 @@ public class ServiceClient
                 Status = ex is ServiceOfflineException ? "Stopped / Offline" : "Unreachable",
                 DatabasePath = DatabaseConfig.GetDefaultDatabasePath()
             };
+        }
+    }
+
+    /// <summary>Reads the IdleMon reporter status. Returns null when the service cannot be reached or has no such endpoint.</summary>
+    public async Task<IdleMonStatusDto?> GetIdleMonStatusAsync()
+    {
+        try
+        {
+            return await GetJsonAsync<IdleMonStatusDto>("/api/idlemon/status").ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is ServiceOfflineException or ServiceApiException or JsonException or NotSupportedException)
+        {
+            return null;
         }
     }
 
