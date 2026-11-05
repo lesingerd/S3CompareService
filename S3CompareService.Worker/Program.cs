@@ -4,6 +4,7 @@ using S3CompareService.Core.Engine;
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Notifications;
 using S3CompareService.Core.Storage;
+using S3CompareService.Worker.IdleMon;
 using S3CompareService.Worker.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -53,6 +54,8 @@ builder.Services.AddSingleton<IAlertNotificationService, AlertNotificationServic
 // Engine & Coordination
 builder.Services.AddSingleton<ScanExecutionCoordinator>();
 builder.Services.AddTransient<CrashRecoveryManager>();
+// IdleMon reporter (off by default). Registered before the scheduler so its sender is stopped last and can flush.
+builder.Services.AddIdleMon(builder.Configuration);
 builder.Services.AddHostedService<ScanSchedulerService>();
 
 var app = builder.Build();
@@ -152,9 +155,10 @@ static string? ValidateJob(ComparisonJob job)
 }
 
 // Persists a job from an API client: masked secrets keep their stored values, server-owned state is ignored.
-static async Task<ComparisonJob> SaveJobFromClientAsync(ComparisonJob job, IJobRepository repo)
+static async Task<ComparisonJob> SaveJobFromClientAsync(ComparisonJob job, IJobRepository repo, IIdleMonEvents events)
 {
     var existing = await repo.GetByIdAsync(job.Id);
+    bool wasEnabled = existing?.IsEnabled ?? false;
     SecretMask.MergeMaskedSecrets(job, existing);
     if (existing == null)
     {
@@ -166,7 +170,18 @@ static async Task<ComparisonJob> SaveJobFromClientAsync(ComparisonJob job, IJobR
         job.AlertConfig.LastDailyDigestSentUtc = null;
     }
     await repo.SaveAsync(job); // existing rows keep server-owned fields (see IJobRepository.SaveAsync)
-    return (await repo.GetByIdAsync(job.Id)) ?? job;
+    var saved = (await repo.GetByIdAsync(job.Id)) ?? job;
+
+    // IdleMon config event (names only, never credentials). Reporting can never fail the request.
+    try
+    {
+        string action = existing == null ? "created"
+            : wasEnabled != saved.IsEnabled ? (saved.IsEnabled ? "enabled" : "disabled")
+            : "updated";
+        events.JobChanged(action, saved);
+    }
+    catch { }
+    return saved;
 }
 
 // 1. Status & Health
@@ -202,6 +217,9 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator) =>
         ActiveScans = activeScans
     });
 });
+
+// 1b. IdleMon reporter status (enabled, last send, queue, spool, last error, counters). Never contains settings secrets.
+app.MapGet("/api/idlemon/status", (IdleMonStatus status) => Results.Ok(status.ToApiModel()));
 
 // 2. Presets
 app.MapGet("/api/presets", () => Results.Ok(S3ClientFactory.GetWasabiEndpoints()));
@@ -263,7 +281,7 @@ app.MapGet("/api/jobs/{id}", async (string id, IJobRepository repo) =>
     return job != null ? Results.Ok(SecretMask.MaskedCopy(job)) : Error(404, $"Job '{id}' not found.");
 });
 
-app.MapPost("/api/jobs", async ([FromBody] ComparisonJob job, IJobRepository repo) =>
+app.MapPost("/api/jobs", async ([FromBody] ComparisonJob job, IJobRepository repo, IIdleMonEvents events) =>
 {
     if (string.IsNullOrWhiteSpace(job.Id))
     {
@@ -272,26 +290,31 @@ app.MapPost("/api/jobs", async ([FromBody] ComparisonJob job, IJobRepository rep
     var error = ValidateJob(job);
     if (error != null) return Error(400, error);
 
-    var saved = await SaveJobFromClientAsync(job, repo);
+    var saved = await SaveJobFromClientAsync(job, repo, events);
     return Results.Created($"/api/jobs/{saved.Id}", SecretMask.MaskedCopy(saved));
 });
 
 // PUT is an upsert (the UI uses it for both create and update).
-app.MapPut("/api/jobs/{id}", async (string id, [FromBody] ComparisonJob job, IJobRepository repo) =>
+app.MapPut("/api/jobs/{id}", async (string id, [FromBody] ComparisonJob job, IJobRepository repo, IIdleMonEvents events) =>
 {
     job.Id = id;
     var error = ValidateJob(job);
     if (error != null) return Error(400, error);
 
-    var saved = await SaveJobFromClientAsync(job, repo);
+    var saved = await SaveJobFromClientAsync(job, repo, events);
     return Results.Ok(SecretMask.MaskedCopy(saved));
 });
 
-app.MapDelete("/api/jobs/{id}", async (string id, IJobRepository repo, ScanExecutionCoordinator coordinator) =>
+app.MapDelete("/api/jobs/{id}", async (string id, IJobRepository repo, ScanExecutionCoordinator coordinator, IIdleMonEvents events) =>
 {
     if (coordinator.IsJobRunning(id))
         return Error(409, "The job has an active scan; cancel it before deleting the job.");
+    var existing = await repo.GetByIdAsync(id);
     await repo.DeleteAsync(id);
+    if (existing != null)
+    {
+        try { events.JobChanged("deleted", existing); } catch { }
+    }
     return Results.NoContent();
 });
 

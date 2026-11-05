@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using S3CompareService.Core.Engine;
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Storage;
+using S3CompareService.Worker.IdleMon;
 
 namespace S3CompareService.Worker.Services;
 
@@ -37,6 +38,7 @@ public class ScanExecutionCoordinator
     private readonly IAuditLogRepository _auditLogRepo;
     private readonly S3CompareService.Core.Notifications.IAlertNotificationService _alertService;
     private readonly ILogger<ScanExecutionCoordinator> _logger;
+    private readonly IIdleMonEvents _events;
 
     private readonly ConcurrentDictionary<string, ActiveScanContext> _activeScansByRunId = new();
     private readonly ConcurrentDictionary<string, string> _activeRunIdByJobId = new();
@@ -48,7 +50,8 @@ public class ScanExecutionCoordinator
         IDifferenceRepository diffRepo,
         IAuditLogRepository auditLogRepo,
         S3CompareService.Core.Notifications.IAlertNotificationService alertService,
-        ILogger<ScanExecutionCoordinator> logger)
+        ILogger<ScanExecutionCoordinator> logger,
+        IIdleMonEvents? events = null)
     {
         _jobRepo = jobRepo;
         _scanRunRepo = scanRunRepo;
@@ -56,6 +59,7 @@ public class ScanExecutionCoordinator
         _auditLogRepo = auditLogRepo;
         _alertService = alertService;
         _logger = logger;
+        _events = events ?? NoOpIdleMonEvents.Instance;
     }
 
     /// <summary>True once host shutdown has begun; no new scans may be started.</summary>
@@ -206,6 +210,7 @@ public class ScanExecutionCoordinator
             completed = true;
             await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Completed);
             _logger.LogInformation("Scan execution finished for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
+            Notify(() => _events.RunCompleted(job, run));
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -220,6 +225,7 @@ public class ScanExecutionCoordinator
             {
                 _logger.LogWarning("Scan cancelled by user for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
                 await SafeAsync(() => _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Cancelled), "update job state");
+                Notify(() => _events.RunCancelled(job, run));
             }
         }
         catch (Exception ex)
@@ -227,6 +233,7 @@ public class ScanExecutionCoordinator
             failed = true;
             _logger.LogError(ex, "Scan execution failed for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
             await SafeAsync(() => _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Failed), "update job state");
+            Notify(() => _events.RunFailed(job, run, ex));
         }
 
         // Post-scan alerting must never change the outcome of the scan itself.
@@ -255,6 +262,13 @@ public class ScanExecutionCoordinator
         _activeRunIdByJobId.TryRemove(job.Id, out _);
         // Cancel/Stop callers tolerate ObjectDisposedException, so disposing here is safe.
         try { cts.Dispose(); } catch { }
+    }
+
+    // IdleMon events must never affect a scan: the implementations already swallow errors, this is the second belt.
+    private static void Notify(Action action)
+    {
+        try { action(); }
+        catch { }
     }
 
     private async Task SafeAsync(Func<Task> action, string what)
