@@ -11,6 +11,7 @@ using S3CompareService.Worker.Services;
 namespace S3CompareService.Tests;
 
 [TestClass]
+[DoNotParallelize] // each test points the process-wide DatabaseConfig at its own folder, so they must not overlap
 public class WorkerApiTests
 {
     private string _dataDir = string.Empty;
@@ -59,6 +60,22 @@ public class WorkerApiTests
 
         resp = await _client.GetAsync("/api/status");
         Assert.AreEqual(HttpStatusCode.OK, resp.StatusCode);
+    }
+
+    [TestMethod]
+    public async Task IdleMonStatus_RequiresTheClientHeader_AndShowsDisabledByDefault()
+    {
+        using var bare = _factory.CreateClient();
+        Assert.AreEqual(HttpStatusCode.Forbidden, (await bare.GetAsync("/api/idlemon/status")).StatusCode);
+
+        var resp = await _client.GetAsync("/api/idlemon/status");
+        Assert.AreEqual(HttpStatusCode.OK, resp.StatusCode);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.IsFalse(doc.RootElement.GetProperty("enabled").GetBoolean());
+        Assert.AreEqual("Disabled", doc.RootElement.GetProperty("mode").GetString());
+        Assert.AreEqual(0, doc.RootElement.GetProperty("queueLength").GetInt32());
+        Assert.AreEqual(0, doc.RootElement.GetProperty("accepted").GetInt64());
+        Assert.IsFalse(Directory.Exists(Path.Combine(_dataDir, "idlemon-spool")), "disabled creates no spool folder");
     }
 
     [TestMethod]

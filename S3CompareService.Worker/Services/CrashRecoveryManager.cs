@@ -83,9 +83,9 @@ public class CrashRecoveryManager
                 run.EndTimeUtc = DateTime.UtcNow;
                 run.ErrorMessage = "Scan interrupted by service restart / system reboot. Recovery checkpoint recorded.";
                 await _scanRunRepo.CompleteAsync(run, cancellationToken);
+                // One event per run, when it is marked now; a run left Interrupted earlier is not announced again at every start.
+                Notify(() => _events.RunRecovered(run, resumed: false));
             }
-
-            Notify(() => _events.RunRecovered(run, resumed: false));
         }
     }
 
