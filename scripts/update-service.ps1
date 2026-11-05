@@ -15,6 +15,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'idlemon-config-helpers.ps1')
 
 $ServiceName = "S3CompareService"
 
@@ -54,6 +55,7 @@ if (Test-Path -LiteralPath $dbPath) {
 
 # 3. Publish or copy new binaries
 Write-Host "[3/5] Updating binaries..." -ForegroundColor Yellow
+$publishTemp = $null
 if ([string]::IsNullOrWhiteSpace($PublishSource)) {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
     $projectFile = Join-Path (Join-Path $scriptDir "..\S3CompareService.Worker") "S3CompareService.Worker.csproj"
@@ -63,11 +65,35 @@ if ([string]::IsNullOrWhiteSpace($PublishSource)) {
     $publishTemp = Join-Path $env:TEMP "S3CompareService_Update"
     dotnet publish $projectFile -c Release -r win-x64 --self-contained false -o $publishTemp
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
-    Copy-Item -Path (Join-Path $publishTemp "*") -Destination $InstallDir -Recurse -Force
-    Remove-Item -Path $publishTemp -Recurse -Force -ErrorAction SilentlyContinue
+    $newBinaries = $publishTemp
 } else {
-    Copy-Item -Path (Join-Path $PublishSource "*") -Destination $InstallDir -Recurse -Force
+    $newBinaries = $PublishSource
 }
+
+# Local changes to appsettings.json in the install folder are overwritten by the copy below. Keep a backup, say so, and rescue
+# the IdleMon settings (they belong in <DataDir>\appsettings.Local.json, which an update never touches).
+$installedSettings = Join-Path $InstallDir "appsettings.json"
+$newSettings = Join-Path $newBinaries "appsettings.json"
+$localSettings = Get-LocalSettingsPath -DataDir $DataDir
+if ((Test-Path -LiteralPath $installedSettings) -and (Test-Path -LiteralPath $newSettings) -and
+    ((Get-FileHash -LiteralPath $installedSettings).Hash -ne (Get-FileHash -LiteralPath $newSettings).Hash)) {
+    $settingsTimestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $settingsBackup = "$installedSettings.bak_$settingsTimestamp"
+    Copy-Item -LiteralPath $installedSettings -Destination $settingsBackup -Force
+    Write-Host "       WARNING: the installed appsettings.json differs from the new one and will be replaced." -ForegroundColor Yellow
+    Write-Host "                Backup: $settingsBackup" -ForegroundColor Yellow
+    Write-Host "                Put local changes in $localSettings (it survives updates; restart the service to apply)." -ForegroundColor Yellow
+    try {
+        if (Move-IdleMonSectionToLocal -InstalledAppSettings $installedSettings -LocalPath $localSettings) {
+            Write-Host "       The installed appsettings.json had IdleMon enabled: its IdleMon section was moved to $localSettings" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "       Could not move the IdleMon section automatically ($($_.Exception.Message)). Copy it from the backup into $localSettings yourself." -ForegroundColor Red
+    }
+}
+
+Copy-Item -Path (Join-Path $newBinaries "*") -Destination $InstallDir -Recurse -Force
+if ($publishTemp) { Remove-Item -Path $publishTemp -Recurse -Force -ErrorAction SilentlyContinue }
 
 # 4. Start service
 Write-Host "[4/5] Starting updated service..." -ForegroundColor Yellow

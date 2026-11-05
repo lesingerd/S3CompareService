@@ -10,15 +10,24 @@
     Local REST API management port. Defaults to 5088. Passed to the worker as --S3Compare:Urls.
 .PARAMETER PublishSource
     Optional path to pre-published folder. If omitted, builds & publishes the worker automatically.
+.PARAMETER EnableIdleMon
+    Turns IdleMon reporting on: creates <DataDir>\appsettings.Local.json with IdleMon.Enabled = true (or sets it in the existing
+    file, keeping other content). That file lives outside the install folder, so service updates never overwrite it.
+.PARAMETER SetIdleMonApiKey
+    Prompts (hidden input) for the IdleMon per-tool API key and stores it as IDLEMON_APIKEY in the service's own environment.
+    The key is never a parameter, never written to a file and never printed.
 #>
 param(
     [string]$InstallDir = "C:\Program Files\S3CompareService",
     [string]$DataDir = "C:\ProgramData\S3CompareService",
     [int]$Port = 5088,
-    [string]$PublishSource = ""
+    [string]$PublishSource = "",
+    [switch]$EnableIdleMon,
+    [switch]$SetIdleMonApiKey
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'idlemon-config-helpers.ps1')
 
 $ServiceName = "S3CompareService"
 $DisplayName = "S3 Compare Continuous Audit Service"
@@ -45,6 +54,9 @@ Write-Host "==========================================================" -Foregro
 # 1. Stop & remove existing service (must happen before binaries are overwritten)
 Write-Host "[1/6] Checking existing service registration..." -ForegroundColor Yellow
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+# Deleting the service also deletes its registry key, and with it the service-scoped environment (for example IDLEMON_APIKEY). Keep it.
+$savedEnvironment = @()
+if ($existingService) { $savedEnvironment = Get-ServiceEnvironment $ServiceName }
 if ($existingService) {
     if ($existingService.Status -ne 'Stopped') {
         Write-Host "       Stopping existing service '$ServiceName'..." -ForegroundColor Gray
@@ -107,6 +119,20 @@ New-Service -Name $ServiceName `
             -Description $Description `
             -StartupType Automatic | Out-Null
 
+# Service-scoped environment: restore what a previous install had, then apply the IdleMon switches.
+if ($savedEnvironment.Count -gt 0) {
+    Set-ServiceEnvironment -Entries $savedEnvironment -ServiceName $ServiceName
+    Write-Host "       Restored the service environment of the previous installation ($($savedEnvironment.Count) entr$(if ($savedEnvironment.Count -eq 1) { 'y' } else { 'ies' }))." -ForegroundColor Gray
+}
+if ($EnableIdleMon) {
+    $localSettings = Get-LocalSettingsPath -DataDir $DataDir
+    Set-IdleMonEnabled -Path $localSettings -Enabled $true | Out-Null
+    Write-Host "       IdleMon enabled in $localSettings" -ForegroundColor Gray
+}
+if ($SetIdleMonApiKey) {
+    Set-ServiceApiKey -ServiceName $ServiceName
+}
+
 # 5. Configure failure recovery (auto-restart on crash)
 Write-Host "[5/6] Configuring crash recovery actions (restart after 60s)..." -ForegroundColor Yellow
 # Reset fail count after 1 day (86400s), restart after 60s on 1st, 2nd, and subsequent crashes.
@@ -129,4 +155,5 @@ Write-Host " Executable Path    : $ExePath" -ForegroundColor White
 Write-Host " Database Location  : $DataDir\s3compareservice.db" -ForegroundColor White
 Write-Host " Management API     : http://localhost:$Port/api/status" -ForegroundColor White
 Write-Host " Crash Recovery     : Enabled (Automatic restart on failure)" -ForegroundColor White
+Write-Host " Local settings     : $(Get-LocalSettingsPath -DataDir $DataDir) (IdleMon etc.; survives updates)" -ForegroundColor White
 Write-Host "==========================================================" -ForegroundColor Green
