@@ -183,6 +183,52 @@ The background service hosts a lightweight REST API on `http://localhost:5088`:
 | `/api/runs/{id}/resume` | `POST` | Resume a paused scan |
 | `/api/runs/{id}/cancel` | `POST` | Cancel an active scan |
 | `/api/logs` | `GET` | Retrieve service audit and crash recovery logs |
+| `/api/idlemon/status` | `GET` | IdleMon reporter status: enabled, last send time, queue length, spool files and size, last error, accepted and rejected counters |
+
+---
+
+## IdleMon integration
+
+S3CompareService can report to [IdleMon](https://github.com/lesingerd/IdleMon), a central collector for alerts, events and metrics from in-house tools on Windows servers. The reporter is **off by default**: with `IdleMon:Enabled` set to `false` nothing is sent and no file is written.
+
+When enabled, the Worker sends to the IdleMon agent **on the same machine only** (`http://127.0.0.1:47100`; any other host is refused). It uses ingest contract v1 and never blocks or affects a scan: messages are queued in memory, sent in the background, and spooled to disk (JSON Lines, oldest first on replay) when the agent is down.
+
+**What it sends**
+
+| Kind | Content |
+|---|---|
+| Metrics (every `MetricsIntervalSeconds`) | Per job: age of the last completed run, consecutive failures, and the newest completed run's counts (confirmed and in-flight disparities, missing in A/B, size, ETag and content mismatches, sequence gaps, objects compared, match rate, duration, bytes read), plus live progress of a running scan. Service level: enabled, failing, overdue and disparity job counts, active scans. |
+| Alerts | `run-failed`, `disparities` (the job's own thresholds), `overdue` and `scan-stuck`, per job. They fire and resolve on state changes and are refreshed every metrics interval. Disabling or deleting a job resolves its alerts. |
+| Events | Run completed, failed or cancelled; crash recovery; job created, updated, deleted, enabled, disabled; service start. |
+| Snapshots | `s3c.jobs` (one row per job); `s3c.run.top_disparities` only when `IncludeObjectKeys` is `true`. |
+| Heartbeat | Every `HeartbeatIntervalSeconds`; `degraded` when the database cannot be read, the scheduler has stopped evaluating, or a scan is stuck; `stopping` on a clean shutdown. |
+
+The full list of names, units and rules is in the [message catalog](https://github.com/lesingerd/IdleMon/blob/main/docs/integrations/s3compare-catalog.md).
+
+**Settings** (`IdleMon` section of `appsettings.json`)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `Enabled` | `false` | Turns the reporter on. |
+| `AgentUrl` | `http://127.0.0.1:47100` | The local IdleMon agent. Must be a loopback address. |
+| `ApiKeyEnv` | `IDLEMON_APIKEY` | Name of the environment variable that holds the key (sent as `X-IdleMon-ApiKey`). The key is never stored in configuration. |
+| `Instance` | `default` | Distinguishes several copies of the service on one host. |
+| `HeartbeatIntervalSeconds` | `60` | |
+| `MetricsIntervalSeconds` | `300` | Also declared to IdleMon as the data interval. |
+| `SpoolDirectory` | `<data directory>\idlemon-spool` | Where unsent messages wait. |
+| `SpoolMaxMegabytes` | `50` | When full, old info events go first; alerts are never dropped. |
+| `DryRunFile` | empty | When set, batches are written to this file as JSON Lines instead of being sent. |
+| `IncludeBucketNames` | `true` | When `false`, `A` and `B` are sent instead of the bucket names. |
+| `IncludeObjectKeys` | `false` | Send the top-disparities snapshot, which contains object keys. |
+| `OverdueMultiplier` | `2` | The `overdue` alert fires after this many cadences (plus 15 minutes) without a completed run. |
+| `StaleResultMultiplier` | `3` | A job's last result keeps being re-sent for this many cadences (at least 10 minutes); after that IdleMon shows it as stale. |
+| `StuckScanMinutes` | `15` | A running scan whose object count has not changed for this long raises `scan-stuck`. |
+
+For example, to try it without an agent, run the Worker with `--IdleMon:Enabled=true --IdleMon:DryRunFile=C:\Temp\idlemon.jsonl`. To send for real, set the key in the service's environment (for example `IDLEMON_APIKEY`) and enable it in `appsettings.json`. `GET /api/idlemon/status` and `scripts\status-service.ps1` show whether it is sending.
+
+**Never sent:** credentials, access keys, secret keys, webhook URLs, SMTP settings, or object contents. Object keys are sent only when `IncludeObjectKeys` is `true`; bucket names are sent unless `IncludeBucketNames` is `false`. Job names are always sent (for example `contoso-archive-vs-wasabi`).
+
+Nothing about this integration has been verified on a production server yet; it is tested with unit tests and with a dry run.
 
 ---
 
