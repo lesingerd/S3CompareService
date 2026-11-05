@@ -45,8 +45,9 @@ It runs continuous comparisons on automated schedules (interval or cron), captur
   - Modern Windows UI (`S3CompareService.UI`) built in WPF with a sleek dark theme matching S3Compare.
   - Directly prepared for any future Web UI dashboard consuming the same REST API.
 - **Automated PowerShell Lifecycle Scripts**:
-  - `install-service.ps1`: Registers Windows Service with auto-restart recovery and creates required folders.
-  - `update-service.ps1`: Safely stops service, snapshots/backs up SQLite database, replaces binaries, and restarts.
+  - `install-service.ps1`: Registers Windows Service with auto-restart recovery and creates required folders. Optional `-EnableIdleMon` and `-SetIdleMonApiKey`.
+  - `update-service.ps1`: Safely stops service, snapshots/backs up SQLite database, replaces binaries, and restarts. Backs up a changed `appsettings.json` and keeps IdleMon settings (see below).
+  - `configure-idlemon.ps1`: Turns IdleMon reporting on or off and stores its API key for an existing install (`-Enable`, `-Disable`, `-SetApiKey`, `-DataDir`, `-Restart`).
   - `uninstall-service.ps1`: Safely stops and unregisters the service, optionally preserving data.
   - `status-service.ps1`: Checks service process status and queries API health.
 
@@ -183,7 +184,7 @@ The background service hosts a lightweight REST API on `http://localhost:5088`:
 | `/api/runs/{id}/resume` | `POST` | Resume a paused scan |
 | `/api/runs/{id}/cancel` | `POST` | Cancel an active scan |
 | `/api/logs` | `GET` | Retrieve service audit and crash recovery logs |
-| `/api/idlemon/status` | `GET` | IdleMon reporter status: enabled, last send time, queue length, spool files and size, last error, accepted and rejected counters |
+| `/api/idlemon/status` | `GET` | IdleMon reporter status: enabled, last send time, queue length, spool files and size, last error, accepted and rejected counters, the settings file path and whether it exists, and whether an API key is set (never the key). Works when reporting is off. |
 
 ---
 
@@ -205,7 +206,32 @@ When enabled, the Worker sends to the IdleMon agent **on the same machine only**
 
 The full list of names, units and rules is in the [message catalog](https://github.com/lesingerd/IdleMon/blob/main/docs/integrations/s3compare-catalog.md).
 
-**Settings** (`IdleMon` section of `appsettings.json`)
+**Where the settings live (they survive updates)**
+
+The `IdleMon` section is read from `appsettings.json` in the install folder and then from an optional override file, **`appsettings.Local.json` in the data directory** (`C:\ProgramData\S3CompareService` by default, or the `--S3Compare:DataDirectory` the service was installed with). The override file is not part of the published output, so `update-service.ps1` never overwrites it; a file you edit in the install folder *is* overwritten by an update. Order of precedence, lowest to highest: `appsettings.json`, `appsettings.Local.json`, environment variables, command-line arguments. The file is read **once at start-up**; restart the service after editing it.
+
+`update-service.ps1` compares the installed `appsettings.json` with the new one. If they differ it saves the old one as `appsettings.json.bak_<timestamp>` and prints a warning. If the old file had `IdleMon.Enabled` set to `true` and no `appsettings.Local.json` exists yet, the old `IdleMon` section is moved into a new `appsettings.Local.json` automatically.
+
+**Enable it** (elevated PowerShell, existing install, no reinstall):
+
+```powershell
+.\scripts\configure-idlemon.ps1 -Enable -SetApiKey -Restart
+```
+
+`-SetApiKey` asks for the key with hidden input and stores it as `IDLEMON_APIKEY` in the service's own environment (the `Environment` value under `HKLM:\SYSTEM\CurrentControlSet\Services\S3CompareService`). The key is never a parameter, never written to a file and never printed. `-Disable` turns reporting off again. On a fresh install, `install-service.ps1 -EnableIdleMon -SetIdleMonApiKey` does the same; a reinstall keeps the service environment. A minimal override file looks like this:
+
+```json
+{
+  "IdleMon": {
+    "Enabled": true,
+    "Instance": "contoso-s3"
+  }
+}
+```
+
+**The IdleMon card in the UI.** The main window shows a read-only IdleMon card under the header, refreshed with the service status. Badge: `Off` (grey), `Dry run` (blue, with the output file), `Sending` (green: last send within two heartbeat intervals, no error), `Agent unreachable - spooling` (amber: a last error or files in the spool; shows spool size and file count), `No recent send` (amber: enabled but nothing sent recently), `Config problem` (red, with the reason) and `Unknown` (the service is offline). It also shows the last send (relative and UTC), accepted, rejected and dropped counters, queue length, whether an API key is set, and the settings file path. Settings cannot be edited from the UI; that keeps secrets and admin rights out of it.
+
+**Settings** (`IdleMon` section)
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -224,7 +250,7 @@ The full list of names, units and rules is in the [message catalog](https://gith
 | `StaleResultMultiplier` | `3` | A job's last result keeps being re-sent for this many cadences (at least 10 minutes); after that IdleMon shows it as stale. |
 | `StuckScanMinutes` | `15` | A running scan whose object count has not changed for this long raises `scan-stuck`. |
 
-For example, to try it without an agent, run the Worker with `--IdleMon:Enabled=true --IdleMon:DryRunFile=C:\Temp\idlemon.jsonl`. To send for real, set the key in the service's environment (for example `IDLEMON_APIKEY`) and enable it in `appsettings.json`. `GET /api/idlemon/status` and `scripts\status-service.ps1` show whether it is sending.
+For example, to try it without an agent, run the Worker with `--IdleMon:Enabled=true --IdleMon:DryRunFile=C:\Temp\idlemon.jsonl`. To send for real, use `scripts\configure-idlemon.ps1 -Enable -SetApiKey -Restart` as above. `GET /api/idlemon/status` and `scripts\status-service.ps1` show whether it is sending.
 
 **Never sent:** credentials, access keys, secret keys, webhook URLs, SMTP settings, or object contents. Object keys are sent only when `IncludeObjectKeys` is `true`; bucket names are sent unless `IncludeBucketNames` is `false`. Job names are always sent (for example `contoso-archive-vs-wasabi`).
 

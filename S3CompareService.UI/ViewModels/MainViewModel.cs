@@ -5,6 +5,7 @@ using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using S3CompareService.Core.Engine;
+using S3CompareService.Core.IdleMon;
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Storage;
 using S3CompareService.UI.Common;
@@ -23,6 +24,14 @@ public class MainViewModel : ViewModelBase
     {
         get => _serviceStatus;
         set => SetField(ref _serviceStatus, value);
+    }
+
+    // IdleMon card (read-only; refreshed on the same cycle as the service status)
+    private IdleMonCardView _idleMon = IdleMonCardView.From(null, DateTime.UtcNow);
+    public IdleMonCardView IdleMon
+    {
+        get => _idleMon;
+        private set => SetField(ref _idleMon, value);
     }
 
     private ActiveScanDto? _currentActiveScan;
@@ -428,6 +437,9 @@ public class MainViewModel : ViewModelBase
     {
         var status = await _client.GetStatusAsync();
         ServiceStatus = status;
+        // Do not ask a second time when the service is already known to be unreachable.
+        var idleMon = status.Status == "Running" ? await _client.GetIdleMonStatusAsync() : null;
+        IdleMon = IdleMonCardView.From(idleMon, DateTime.UtcNow);
         _lastStatusForScan = status;
         UpdateCurrentActiveScan();
     }

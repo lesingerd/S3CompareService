@@ -4,6 +4,7 @@ using S3CompareService.Core.Engine;
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Notifications;
 using S3CompareService.Core.Storage;
+using S3CompareService.Worker;
 using S3CompareService.Worker.IdleMon;
 using S3CompareService.Worker.Services;
 
@@ -30,6 +31,10 @@ if (!string.IsNullOrWhiteSpace(dataDirectory))
     DatabaseConfig.SetCustomDatabasePath(Path.Combine(dataDirectory.Trim().Trim('"'), "s3compareservice.db"));
 }
 
+// Optional override file in the data directory (survives service updates; restart to apply). Command-line arguments still win.
+string localSettingsFile = LocalSettings.PathFor(Path.GetDirectoryName(DatabaseConfig.GetDefaultDatabasePath())!);
+LocalSettings.Apply(builder.Configuration, localSettingsFile, args);
+
 // Defense in depth for DNS rebinding: Kestrel's host filtering plus the explicit middleware below.
 builder.Configuration["AllowedHosts"] = "localhost;127.0.0.1;[::1]";
 
@@ -55,7 +60,7 @@ builder.Services.AddSingleton<IAlertNotificationService, AlertNotificationServic
 builder.Services.AddSingleton<ScanExecutionCoordinator>();
 builder.Services.AddTransient<CrashRecoveryManager>();
 // IdleMon reporter (off by default). Registered before the scheduler so its sender is stopped last and can flush.
-builder.Services.AddIdleMon(builder.Configuration);
+builder.Services.AddIdleMon(builder.Configuration, localSettingsFile);
 builder.Services.AddHostedService<ScanSchedulerService>();
 
 var app = builder.Build();
