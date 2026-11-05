@@ -48,23 +48,8 @@ public class AlertNotificationService : IAlertNotificationService
             reasons.Add($"Scan failed with error: {run.ErrorMessage ?? "Unknown failure"}");
         }
 
-        // 2. Disparity Thresholds (Evaluated against CONFIRMED disparities to shield replication lag)
-        // Overall threshold: confirmed disparities strictly above it alert (0 = alert on any confirmed disparity).
-        // Per-type thresholds: 0 (or less) = disabled; an enabled threshold alerts when its count is strictly above it.
-        // An alert fires if the overall threshold OR any enabled per-type threshold is exceeded.
-        if (cfg.AlertOnDisparities)
-        {
-            if (run.FilteredDifferencesCount > cfg.MaxDisparitiesThreshold && run.FilteredDifferencesCount > 0)
-            {
-                reasons.Add($"Confirmed Disparities: {run.FilteredDifferencesCount:N0} (Exceeds threshold of {cfg.MaxDisparitiesThreshold:N0})");
-            }
-            AddIfExceeded(reasons, "Missing in Bucket B", run.MissingInBucketBCount, cfg.MaxMissingInBThreshold);
-            AddIfExceeded(reasons, "Missing in Bucket A", run.MissingInBucketACount, cfg.MaxMissingInAThreshold);
-            AddIfExceeded(reasons, "Size Mismatches", run.SizeMismatchCount, cfg.MaxSizeMismatchThreshold);
-            AddIfExceeded(reasons, "ETag Mismatches", run.ETagMismatchCount, cfg.MaxETagMismatchThreshold);
-            AddIfExceeded(reasons, "Content Byte Mismatches", run.ContentMismatchCount, cfg.MaxContentMismatchThreshold);
-            AddIfExceeded(reasons, "Sequence Gaps", run.SequenceGapCount, cfg.MaxSequenceGapThreshold);
-        }
+        // 2. Disparity thresholds (see EvaluateDisparityThresholds)
+        reasons.AddRange(EvaluateDisparityThresholds(cfg, run));
 
         // 3. Digest on Success
         if (reasons.Count == 0 && cfg.NotifyOnSuccess && run.Status == RunStatus.Completed)
@@ -75,6 +60,31 @@ public class AlertNotificationService : IAlertNotificationService
 
         bool shouldAlert = reasons.Count > 0;
         return Task.FromResult((shouldAlert, reasons));
+    }
+
+    /// <summary>
+    /// Pure threshold check, shared with the IdleMon reporter. Evaluated against CONFIRMED disparities to shield replication lag.
+    /// Overall threshold: confirmed disparities strictly above it alert (0 = alert on any confirmed disparity).
+    /// Per-type thresholds: 0 (or less) = disabled; an enabled threshold alerts when its count is strictly above it.
+    /// A breach is the overall threshold OR any enabled per-type threshold. Returns nothing when AlertOnDisparities is off.
+    /// It does not look at <see cref="JobAlertConfig.IsEnabled"/> (that switch is about delivery by e-mail or webhook).
+    /// </summary>
+    public static List<string> EvaluateDisparityThresholds(JobAlertConfig cfg, ScanRun run)
+    {
+        var reasons = new List<string>();
+        if (!cfg.AlertOnDisparities) return reasons;
+
+        if (run.FilteredDifferencesCount > cfg.MaxDisparitiesThreshold && run.FilteredDifferencesCount > 0)
+        {
+            reasons.Add($"Confirmed Disparities: {run.FilteredDifferencesCount:N0} (Exceeds threshold of {cfg.MaxDisparitiesThreshold:N0})");
+        }
+        AddIfExceeded(reasons, "Missing in Bucket B", run.MissingInBucketBCount, cfg.MaxMissingInBThreshold);
+        AddIfExceeded(reasons, "Missing in Bucket A", run.MissingInBucketACount, cfg.MaxMissingInAThreshold);
+        AddIfExceeded(reasons, "Size Mismatches", run.SizeMismatchCount, cfg.MaxSizeMismatchThreshold);
+        AddIfExceeded(reasons, "ETag Mismatches", run.ETagMismatchCount, cfg.MaxETagMismatchThreshold);
+        AddIfExceeded(reasons, "Content Byte Mismatches", run.ContentMismatchCount, cfg.MaxContentMismatchThreshold);
+        AddIfExceeded(reasons, "Sequence Gaps", run.SequenceGapCount, cfg.MaxSequenceGapThreshold);
+        return reasons;
     }
 
     private static void AddIfExceeded(List<string> reasons, string label, long count, int threshold)
