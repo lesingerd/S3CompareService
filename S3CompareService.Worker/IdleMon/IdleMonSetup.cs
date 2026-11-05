@@ -30,11 +30,16 @@ public static class IdleMonSetup
     }
 
     /// <summary>Registers everything. Call it before the scheduler is registered, so the sender stops last.</summary>
-    public static IServiceCollection AddIdleMon(this IServiceCollection services, IConfiguration configuration)
+    public static IServiceCollection AddIdleMon(this IServiceCollection services, IConfiguration configuration, string? settingsFile = null)
     {
         var options = new IdleMonOptions();
         configuration.GetSection(IdleMonOptions.SectionName).Bind(options);
-        var status = new IdleMonStatus();
+        var status = new IdleMonStatus
+        {
+            SettingsFile = settingsFile ?? "",
+            ApiKeyEnv = options.ApiKeyEnv,
+            HeartbeatIntervalSeconds = options.HeartbeatIntervalSeconds,
+        };
         services.AddSingleton(options);
         services.AddSingleton(status);
         services.AddSingleton(TimeProvider.System);
@@ -53,6 +58,7 @@ public static class IdleMonSetup
         status.Enabled = true;
         var dryRun = options.ResolvedDryRunFile is not null;
         status.Mode = dryRun ? "DryRun" : "Http";
+        status.DryRunFile = options.ResolvedDryRunFile ?? "";
 
         var queue = new IdleMonQueue();
         status.Queue = queue;

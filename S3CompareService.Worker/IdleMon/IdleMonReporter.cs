@@ -22,6 +22,18 @@ public sealed class IdleMonStatus
     /// <summary>Gets or sets why reporting was switched off although it was enabled in configuration.</summary>
     public string? ConfigProblem { get; set; }
 
+    /// <summary>Gets or sets the full path of the local override file (appsettings.Local.json), or empty when unknown.</summary>
+    public string SettingsFile { get; set; } = "";
+
+    /// <summary>Gets or sets the dry-run output file, or empty when not in dry-run mode.</summary>
+    public string DryRunFile { get; set; } = "";
+
+    /// <summary>Gets or sets the NAME of the environment variable that holds the API key.</summary>
+    public string ApiKeyEnv { get; set; } = "IDLEMON_APIKEY";
+
+    /// <summary>Gets or sets the configured heartbeat interval in seconds (lets a viewer judge how recent a send is).</summary>
+    public int HeartbeatIntervalSeconds { get; set; } = 60;
+
     /// <summary>Gets or sets the queue (null when disabled).</summary>
     public IdleMonQueue? Queue { get; set; }
 
@@ -83,6 +95,12 @@ public sealed class IdleMonStatus
         Rejected,
         Spooled,
         Dropped,
+        HeartbeatIntervalSeconds,
+        SettingsFile,
+        DryRunFile,
+        SettingsFileExists = SettingsFile.Length > 0 && File.Exists(SettingsFile),
+        // Only whether the key is set, never the key itself.
+        ApiKeyPresent = !string.IsNullOrEmpty(ApiKeyEnv) && !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(ApiKeyEnv)),
     };
 }
 
