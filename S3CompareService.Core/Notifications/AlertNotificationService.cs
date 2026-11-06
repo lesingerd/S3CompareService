@@ -27,9 +27,12 @@ public class AlertNotificationService : IAlertNotificationService
     private readonly IAuditLogRepository? _auditRepo;
     private static readonly HttpClient HttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
 
-    public AlertNotificationService(IAuditLogRepository? auditRepo = null)
+    private readonly TimeSpan _deliveryTimeout;
+
+    public AlertNotificationService(IAuditLogRepository? auditRepo = null, NotificationOptions? options = null)
     {
         _auditRepo = auditRepo;
+        _deliveryTimeout = (options ?? new NotificationOptions()).Timeout;
     }
 
     public Task<(bool ShouldAlert, List<string> Reasons)> EvaluateAlertConditionAsync(ComparisonJob job, ScanRun run)
@@ -95,21 +98,60 @@ public class AlertNotificationService : IAlertNotificationService
         }
     }
 
-    private static readonly TimeSpan DeliveryTimeout = TimeSpan.FromSeconds(30);
-
-    private static CancellationTokenSource CreateDeliveryCts(CancellationToken cancellationToken)
+    private CancellationTokenSource CreateDeliveryCts(CancellationToken cancellationToken)
     {
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(DeliveryTimeout);
+        cts.CancelAfter(_deliveryTimeout);
         return cts;
     }
 
-    private static async Task PostJsonAsync(string url, object payload, CancellationToken cancellationToken)
+    /// <summary>
+    /// Runs one delivery on its own task under a linked token that is cancelled after the delivery timeout, and stops waiting for it
+    /// after the same timeout even when the channel ignores its token (SmtpClient does not reliably honour cancellation). An abandoned
+    /// task is left to finish or fail on its own; its exception is observed so it never surfaces later. Throws TimeoutException when abandoned.
+    /// </summary>
+    protected async Task RunChannelAsync(string channel, Func<CancellationToken, Task> send, CancellationToken cancellationToken)
+    {
+        using var cts = CreateDeliveryCts(cancellationToken);
+        var task = Task.Run(() => send(cts.Token), CancellationToken.None);
+        try
+        {
+            await task.WaitAsync(_deliveryTimeout, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            cts.Cancel();
+            _ = task.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+            throw new TimeoutException($"{channel} delivery did not finish within {_deliveryTimeout.TotalSeconds:0.#} s and was abandoned.");
+        }
+    }
+
+    private async Task PostJsonAsync(string url, object payload, CancellationToken cancellationToken)
     {
         using var cts = CreateDeliveryCts(cancellationToken);
         using var resp = await HttpClient.PostAsJsonAsync(url, payload, cts.Token).ConfigureAwait(false);
         resp.EnsureSuccessStatusCode();
     }
+
+    /// <summary>Runs one channel; returns true when it succeeded and counts as a delivery. Never throws (audit failures included).</summary>
+    private static async Task<bool> DeliverAsync(Func<Task> deliver, Func<Exception, Task> onFailure, bool countsAsDelivery)
+    {
+        try
+        {
+            await deliver().ConfigureAwait(false);
+            return countsAsDelivery;
+        }
+        catch (Exception ex)
+        {
+            try { await onFailure(ex).ConfigureAwait(false); } catch { }
+            return false;
+        }
+    }
+
+    private Task AuditAsync(string level, string message, string? details, string? runId, string? jobId, CancellationToken cancellationToken)
+        => _auditRepo is null
+            ? Task.CompletedTask
+            : _auditRepo.LogAsync(level, "Alerts", message, details: details, scanRunId: runId, jobId: jobId, cancellationToken: cancellationToken);
 
     /// <summary>
     /// Dispatches threshold / failure alerts. Returns true when at least one channel (SMTP or webhook) delivered.
@@ -122,66 +164,38 @@ public class AlertNotificationService : IAlertNotificationService
         if (!cfg.IsEnabled) return false;
 
         bool isFailure = run.Status == RunStatus.Failed || (reasons.Count > 0 && !reasons[0].StartsWith("Periodic status"));
-        bool anyDelivered = false;
+        // The channels run side by side and each under its own timeout, so a slow or dead one never delays the others.
+        var channels = new List<Task<bool>>();
 
         // 1. Dispatch Email via SMTP
         if (!string.IsNullOrWhiteSpace(cfg.SmtpHost) && !string.IsNullOrWhiteSpace(cfg.ToEmails))
         {
-            try
+            channels.Add(DeliverAsync(async () =>
             {
-                using var cts = CreateDeliveryCts(cancellationToken);
-                await SendEmailAlertAsync(job, run, reasons, isFailure, cts.Token).ConfigureAwait(false);
-                anyDelivered = true;
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("INFO", "Alerts", $"SMTP alert sent successfully to {cfg.ToEmails} for job '{job.Name}'.", scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
-                }
-            }
-            catch (Exception ex)
-            {
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to send SMTP alert to {cfg.ToEmails}: {ex.Message}", details: ex.StackTrace, scanRunId: run.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
-                }
-            }
+                await RunChannelAsync("SMTP", ct => SendEmailAlertAsync(job, run, reasons, isFailure, ct), cancellationToken).ConfigureAwait(false);
+                await AuditAsync("INFO", $"SMTP alert sent successfully to {cfg.ToEmails} for job '{job.Name}'.", null, run.Id, job.Id, cancellationToken).ConfigureAwait(false);
+            }, ex => AuditAsync("ERROR", $"Failed to send SMTP alert to {cfg.ToEmails}: {ex.Message}", ex.StackTrace, run.Id, job.Id, CancellationToken.None), countsAsDelivery: true));
         }
 
         // 2. Dispatch Azure Webhook (Logic Apps / Action Groups / Azure Functions)
         if (!string.IsNullOrWhiteSpace(cfg.AzureWebhookUrl))
         {
-            try
+            channels.Add(DeliverAsync(async () =>
             {
-                await SendAzureWebhookAlertAsync(job, run, reasons, isFailure, cancellationToken).ConfigureAwait(false);
-                anyDelivered = true;
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("INFO", "Alerts", $"Azure Webhook alert dispatched successfully for job '{job.Name}'.", scanRunId: run.Id, jobId: job.Id, cancellationToken: cancellationToken);
-                }
-            }
-            catch (Exception ex)
-            {
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to dispatch Azure Webhook alert: {ex.Message}", details: ex.StackTrace, scanRunId: run.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
-                }
-            }
+                await RunChannelAsync("Webhook", ct => SendAzureWebhookAlertAsync(job, run, reasons, isFailure, ct), cancellationToken).ConfigureAwait(false);
+                await AuditAsync("INFO", $"Azure Webhook alert dispatched successfully for job '{job.Name}'.", null, run.Id, job.Id, cancellationToken).ConfigureAwait(false);
+            }, ex => AuditAsync("ERROR", $"Failed to dispatch Azure Webhook alert: {ex.Message}", ex.StackTrace, run.Id, job.Id, CancellationToken.None), countsAsDelivery: true));
         }
 
         // 3. Dispatch to Azure Application Insights Telemetry (telemetry only: does not count as an alert delivery)
         if (!string.IsNullOrWhiteSpace(cfg.AzureAppInsightsConnectionString))
         {
-            try
-            {
-                await TrackAppInsightsTelemetryAsync(job, run, isFailure, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("WARN", "Alerts", $"Failed to post App Insights telemetry: {ex.Message}", scanRunId: run.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
-                }
-            }
+            channels.Add(DeliverAsync(
+                () => RunChannelAsync("App Insights", ct => TrackAppInsightsTelemetryAsync(job, run, isFailure, ct), cancellationToken),
+                ex => AuditAsync("WARN", $"Failed to post App Insights telemetry: {ex.Message}", null, run.Id, job.Id, CancellationToken.None), countsAsDelivery: false));
         }
+
+        bool anyDelivered = (await Task.WhenAll(channels).ConfigureAwait(false)).Any(delivered => delivered);
 
         if (isFailure && anyDelivered)
         {
@@ -191,7 +205,7 @@ public class AlertNotificationService : IAlertNotificationService
         return anyDelivered;
     }
 
-    private async Task SendEmailAlertAsync(ComparisonJob job, ScanRun run, List<string> reasons, bool isFailure, CancellationToken cancellationToken)
+    protected virtual async Task SendEmailAlertAsync(ComparisonJob job, ScanRun run, List<string> reasons, bool isFailure, CancellationToken cancellationToken)
     {
         var cfg = job.AlertConfig;
         using var client = new SmtpClient(cfg.SmtpHost.Trim(), cfg.SmtpPort)
@@ -301,7 +315,7 @@ public class AlertNotificationService : IAlertNotificationService
         return sb.ToString();
     }
 
-    private async Task SendAzureWebhookAlertAsync(ComparisonJob job, ScanRun run, List<string> reasons, bool isFailure, CancellationToken cancellationToken)
+    protected virtual async Task SendAzureWebhookAlertAsync(ComparisonJob job, ScanRun run, List<string> reasons, bool isFailure, CancellationToken cancellationToken)
     {
         var cfg = job.AlertConfig;
         var payload = new
@@ -337,7 +351,7 @@ public class AlertNotificationService : IAlertNotificationService
         await PostJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task TrackAppInsightsTelemetryAsync(ComparisonJob job, ScanRun run, bool isFailure, CancellationToken cancellationToken)
+    protected virtual async Task TrackAppInsightsTelemetryAsync(ComparisonJob job, ScanRun run, bool isFailure, CancellationToken cancellationToken)
     {
         var cfg = job.AlertConfig;
         // Parse InstrumentationKey from ConnectionString (e.g. InstrumentationKey=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx;...)
@@ -562,78 +576,66 @@ public class AlertNotificationService : IAlertNotificationService
         int completedRuns24h = recentRuns24h.Count(r => r.Status == RunStatus.Completed);
         int failedRuns24h = recentRuns24h.Count(r => r.Status == RunStatus.Failed);
         var assessment = AssessDigest(latestRun, recentRuns24h, DateTime.UtcNow);
-        bool anyDelivered = false;
         string label = assessment.IsAllClear ? "all-clear" : "attention-needed";
+        var channels = new List<Task<bool>>();
+        var errorsLock = new object();
+        void AddError(string error) { lock (errorsLock) errors.Add(error); }
 
-        // 1. Send Email via SMTP
+        // 1. Send Email via SMTP (the channels run side by side, each under its own timeout)
         if (!string.IsNullOrWhiteSpace(cfg.SmtpHost) && !string.IsNullOrWhiteSpace(cfg.ToEmails))
         {
-            try
+            channels.Add(DeliverAsync(async () =>
             {
-                using var cts = CreateDeliveryCts(cancellationToken);
-                await SendDailyDigestEmailAsync(job, latestRun, totalRuns24h, completedRuns24h, failedRuns24h, assessment, cts.Token).ConfigureAwait(false);
-                anyDelivered = true;
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("INFO", "Alerts", $"Daily {label} digest sent to {cfg.ToEmails} for job '{job.Name}'.", scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
-                }
-            }
-            catch (Exception ex)
+                await RunChannelAsync("SMTP", ct => SendDailyDigestEmailAsync(job, latestRun, totalRuns24h, completedRuns24h, failedRuns24h, assessment, ct), cancellationToken).ConfigureAwait(false);
+                await AuditAsync("INFO", $"Daily {label} digest sent to {cfg.ToEmails} for job '{job.Name}'.", null, latestRun?.Id, job.Id, cancellationToken).ConfigureAwait(false);
+            }, ex =>
             {
-                errors.Add($"Email: {ex.Message}");
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to send daily digest email to {cfg.ToEmails}: {ex.Message}", details: ex.StackTrace, scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
-                }
-            }
+                AddError($"Email: {ex.Message}");
+                return AuditAsync("ERROR", $"Failed to send daily digest email to {cfg.ToEmails}: {ex.Message}", ex.StackTrace, latestRun?.Id, job.Id, CancellationToken.None);
+            }, countsAsDelivery: true));
         }
 
         // 2. Dispatch Azure Webhook if configured
         if (!string.IsNullOrWhiteSpace(cfg.AzureWebhookUrl))
         {
-            try
+            var payload = new
             {
-                var payload = new
+                alertType = assessment.IsAllClear ? "DailyDigestAllClear" : "DailyDigestAttentionNeeded",
+                jobId = job.Id,
+                jobName = job.Name,
+                isCritical = !assessment.IsAllClear,
+                status = assessment.IsAllClear ? "AllClear" : "AttentionNeeded",
+                issues = assessment.Issues,
+                message = assessment.IsAllClear
+                    ? $"Daily all-clear status confirmation for '{job.Name}'. S3CompareService is actively running and healthy."
+                    : $"Daily status for '{job.Name}': {string.Join(" ", assessment.Issues)}",
+                timestampUtc = DateTime.UtcNow.ToString("O"),
+                metrics = new
                 {
-                    alertType = assessment.IsAllClear ? "DailyDigestAllClear" : "DailyDigestAttentionNeeded",
-                    jobId = job.Id,
-                    jobName = job.Name,
-                    isCritical = !assessment.IsAllClear,
-                    status = assessment.IsAllClear ? "AllClear" : "AttentionNeeded",
-                    issues = assessment.Issues,
-                    message = assessment.IsAllClear
-                        ? $"Daily all-clear status confirmation for '{job.Name}'. S3CompareService is actively running and healthy."
-                        : $"Daily status for '{job.Name}': {string.Join(" ", assessment.Issues)}",
-                    timestampUtc = DateTime.UtcNow.ToString("O"),
-                    metrics = new
-                    {
-                        scansCompleted24h = completedRuns24h,
-                        failedScans24h = failedRuns24h,
-                        totalScans24h = totalRuns24h,
-                        objectsCompared = latestRun?.ObjectsCompared ?? 0,
-                        matchedCount = latestRun?.MatchedCount ?? 0,
-                        confirmedDisparities = latestRun?.FilteredDifferencesCount ?? 0,
-                        inFlightReplicationLag = latestRun?.InFlightDifferencesCount ?? 0,
-                        lastScanTimeUtc = latestRun?.EndTimeUtc?.ToString("O")
-                    }
-                };
+                    scansCompleted24h = completedRuns24h,
+                    failedScans24h = failedRuns24h,
+                    totalScans24h = totalRuns24h,
+                    objectsCompared = latestRun?.ObjectsCompared ?? 0,
+                    matchedCount = latestRun?.MatchedCount ?? 0,
+                    confirmedDisparities = latestRun?.FilteredDifferencesCount ?? 0,
+                    inFlightReplicationLag = latestRun?.InFlightDifferencesCount ?? 0,
+                    lastScanTimeUtc = latestRun?.EndTimeUtc?.ToString("O")
+                }
+            };
 
-                await PostJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, cancellationToken).ConfigureAwait(false);
-                anyDelivered = true;
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("INFO", "Alerts", $"Daily {label} webhook dispatched to Azure for job '{job.Name}'.", scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: cancellationToken);
-                }
-            }
-            catch (Exception ex)
+
+            channels.Add(DeliverAsync(async () =>
             {
-                errors.Add($"Webhook: {ex.Message}");
-                if (_auditRepo != null)
-                {
-                    await _auditRepo.LogAsync("ERROR", "Alerts", $"Failed to dispatch daily digest to Azure Webhook: {ex.Message}", details: ex.StackTrace, scanRunId: latestRun?.Id, jobId: job.Id, cancellationToken: CancellationToken.None);
-                }
-            }
+                await RunChannelAsync("Webhook", ct => PostJsonAsync(cfg.AzureWebhookUrl.Trim(), payload, ct), cancellationToken).ConfigureAwait(false);
+                await AuditAsync("INFO", $"Daily {label} webhook dispatched to Azure for job '{job.Name}'.", null, latestRun?.Id, job.Id, cancellationToken).ConfigureAwait(false);
+            }, ex =>
+            {
+                AddError($"Webhook: {ex.Message}");
+                return AuditAsync("ERROR", $"Failed to dispatch daily digest to Azure Webhook: {ex.Message}", ex.StackTrace, latestRun?.Id, job.Id, CancellationToken.None);
+            }, countsAsDelivery: true));
         }
+
+        bool anyDelivered = (await Task.WhenAll(channels).ConfigureAwait(false)).Any(delivered => delivered);
 
         if (!anyDelivered && errors.Count == 0)
         {
@@ -648,7 +650,7 @@ public class AlertNotificationService : IAlertNotificationService
         return (anyDelivered, errors);
     }
 
-    private async Task SendDailyDigestEmailAsync(ComparisonJob job, ScanRun? latestRun, int totalRuns24h, int completedRuns24h, int failedRuns24h, DigestAssessment assessment, CancellationToken cancellationToken)
+    protected virtual async Task SendDailyDigestEmailAsync(ComparisonJob job, ScanRun? latestRun, int totalRuns24h, int completedRuns24h, int failedRuns24h, DigestAssessment assessment, CancellationToken cancellationToken)
     {
         var cfg = job.AlertConfig;
         using var client = new SmtpClient(cfg.SmtpHost.Trim(), cfg.SmtpPort)
