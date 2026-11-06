@@ -49,6 +49,8 @@ public static class ReportExporter
         await writer.WriteLineAsync($"# In-Flight Replication   : {run.InFlightDifferencesCount:N0}").ConfigureAwait(false);
         await writer.WriteLineAsync($"# Grace Period Window     : {(run.ReplicationGracePeriodMinutes > 0 ? $"{run.ReplicationGracePeriodMinutes} minutes (Cutoff: {run.GracePeriodCutoffUtc:O})" : "None (Full scan)")}").ConfigureAwait(false);
         await writer.WriteLineAsync($"# Scan Window Clipped     : {run.IsScanWindowClipped} - {run.ScanWindowNotes}").ConfigureAwait(false);
+        if (run.DifferencesTruncated)
+            await writer.WriteLineAsync("# TRUNCATED              : Yes - the run hit the recorded-differences limit; the counters above are complete but the rows below are only the first ones stored.").ConfigureAwait(false);
         await writer.WriteLineAsync($"# Breakdown               : MissingInB={run.MissingInBucketBCount:N0}, MissingInA={run.MissingInBucketACount:N0}, SizeMismatch={run.SizeMismatchCount:N0}, ETagMismatch={run.ETagMismatchCount:N0}, ContentMismatch={run.ContentMismatchCount:N0}, SequenceGaps={run.SequenceGapCount:N0}").ConfigureAwait(false);
         await writer.WriteLineAsync().ConfigureAwait(false);
 

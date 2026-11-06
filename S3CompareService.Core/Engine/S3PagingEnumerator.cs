@@ -11,6 +11,7 @@ public class S3PagingEnumerator : IS3ObjectStream
     private readonly string _prefix;
     private readonly string? _startAfter;
     private readonly Action<List<S3ObjectSummary>, string?>? _onPageLoaded;
+    private readonly IRequestRateLimiter? _rateLimiter;
     
     private string? _continuationToken;
     private bool _isTruncated = true;
@@ -30,13 +31,15 @@ public class S3PagingEnumerator : IS3ObjectStream
         string? startAfter = null,
         Action<List<S3ObjectSummary>, string?>? onPageLoaded = null,
         long initialObjectsRead = 0,
-        long initialBytesRead = 0)
+        long initialBytesRead = 0,
+        IRequestRateLimiter? rateLimiter = null)
     {
         _s3Client = s3Client ?? throw new ArgumentNullException(nameof(s3Client));
         _bucketName = bucketName ?? throw new ArgumentNullException(nameof(bucketName));
         _prefix = prefix ?? string.Empty;
         _startAfter = string.IsNullOrEmpty(startAfter) ? null : startAfter;
         _onPageLoaded = onPageLoaded;
+        _rateLimiter = rateLimiter;
         _totalObjectsRead = initialObjectsRead;
         _totalBytesRead = initialBytesRead;
     }
@@ -63,6 +66,7 @@ public class S3PagingEnumerator : IS3ObjectStream
             };
             _isFirstRequest = false;
 
+            if (_rateLimiter != null) await _rateLimiter.WaitAsync(cancellationToken).ConfigureAwait(false);
             var response = await _s3Client.ListObjectsV2Async(request, cancellationToken).ConfigureAwait(false);
             _continuationToken = response.NextContinuationToken;
             _isTruncated = response.IsTruncated ?? false;

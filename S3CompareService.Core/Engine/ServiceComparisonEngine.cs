@@ -30,6 +30,10 @@ public class ServiceComparisonEngine
     private readonly IS3ObjectStream? _providedStreamB;
     private readonly ScanCheckpoint? _resumeCheckpoint;
     private readonly bool _checkpointDiscarded;
+    private readonly ScanOptions _options;
+    private readonly long _maxRecordedDifferences;
+    private long _recordedRows; // difference rows stored (or buffered) for this run; compared with the cap
+    private IRequestRateLimiter? _limiterA, _limiterB;
 
     private readonly SequenceGapDetector? _gapDetector;
     private readonly ComparisonStatistics _stats = new();
@@ -70,7 +74,8 @@ public class ServiceComparisonEngine
         IAuditLogRepository? auditLogRepo = null,
         ScanCheckpoint? resumeCheckpoint = null,
         IS3ObjectStream? streamA = null,
-        IS3ObjectStream? streamB = null)
+        IS3ObjectStream? streamB = null,
+        ScanOptions? options = null)
     {
         _job = job ?? throw new ArgumentNullException(nameof(job));
         _scanRun = scanRun ?? throw new ArgumentNullException(nameof(scanRun));
@@ -79,6 +84,8 @@ public class ServiceComparisonEngine
         _auditLogRepo = auditLogRepo;
         _providedStreamA = streamA;
         _providedStreamB = streamB;
+        _options = options ?? new ScanOptions();
+        _maxRecordedDifferences = _options.MaxRecordedDifferencesPerRun;
 
         if (_job.DetectSequenceGaps)
         {
@@ -143,6 +150,7 @@ public class ServiceComparisonEngine
         _stats.BucketABytesRead = _processedBytesA = cp.BucketABytesRead;
         _stats.BucketBBytesRead = _processedBytesB = cp.BucketBBytesRead;
         _stats.ElapsedTime = TimeSpan.FromSeconds(cp.ElapsedSeconds);
+        _recordedRows = _maxRecordedDifferences > 0 ? Math.Min(cp.TotalDifferences, _maxRecordedDifferences) : cp.TotalDifferences;
         _lastEvaluatedKey = cp.LastEvaluatedKey ?? string.Empty;
         _hasLastKey = cp.HasKey;
     }
@@ -249,7 +257,19 @@ public class ServiceComparisonEngine
             _scanRun.IsScanWindowClipped = false;
             _scanRun.ScanWindowNotes = "Full scan window (no grace period exclusion).";
         }
+
+        // A resumed run that was already truncated keeps saying so.
+        if (_scanRun.DifferencesTruncated) AppendTruncationNote();
     }
+
+    private void AppendTruncationNote()
+    {
+        _scanRun.ScanWindowNotes = (_scanRun.ScanWindowNotes + " " + TruncationNote(_maxRecordedDifferences)).Trim();
+    }
+
+    /// <summary>The text recorded in <see cref="ScanRun.ScanWindowNotes"/> (and shown in exports) when the difference cap was hit.</summary>
+    public static string TruncationNote(long cap) =>
+        $"Differences truncated: only the first {cap:N0} differences were stored; the counters below still count all of them.";
 
     public async Task<ScanRun> RunAsync(CancellationToken cancellationToken = default)
     {
@@ -293,6 +313,8 @@ public class ServiceComparisonEngine
             {
                 clientA = S3ClientFactory.CreateClient(_job.BucketA);
                 clientB = S3ClientFactory.CreateClient(_job.BucketB);
+                _limiterA = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
+                _limiterB = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
 
                 bool hasKey = IsResuming && _hasLastKey;
                 string? startAfterA = BuildStartAfterKey(hasKey, _lastEvaluatedKey, prefixA);
@@ -304,7 +326,8 @@ public class ServiceComparisonEngine
                     prefixA ?? string.Empty,
                     startAfterA,
                     initialObjectsRead: _processedA,
-                    initialBytesRead: _processedBytesA);
+                    initialBytesRead: _processedBytesA,
+                    rateLimiter: _limiterA);
 
                 enumB = new S3PagingEnumerator(
                     clientB,
@@ -312,7 +335,8 @@ public class ServiceComparisonEngine
                     prefixB ?? string.Empty,
                     startAfterB,
                     initialObjectsRead: _processedB,
-                    initialBytesRead: _processedBytesB);
+                    initialBytesRead: _processedBytesB,
+                    rateLimiter: _limiterB);
             }
 
             bool hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
@@ -447,6 +471,9 @@ public class ServiceComparisonEngine
             _scanRun.IsResumedFromCheckpoint = false;
             _scanRun.ResumedFromKey = null;
             _scanRun.LastEvaluatedKey = string.Empty;
+            _scanRun.DifferencesTruncated = false;
+            _recordedRows = 0;
+            ApplyGraceWindow(); // rebuild the notes without a stale truncation sentence
             SyncStatsToRun(_scanRun);
         }
     }
@@ -645,8 +672,19 @@ public class ServiceComparisonEngine
         {
             foreach (var d in toRecord)
             {
+                // Counters always count every difference; rows stop at the cap so one bad run cannot fill the disk.
                 ApplyDifferenceStats(d);
-                _differenceBuffer.Add(d);
+                if (_maxRecordedDifferences <= 0 || _recordedRows < _maxRecordedDifferences)
+                {
+                    _differenceBuffer.Add(d);
+                    _recordedRows++;
+                }
+                else if (!_scanRun.DifferencesTruncated)
+                {
+                    _scanRun.DifferencesTruncated = true;
+                    AppendTruncationNote();
+                    _ = LogAsync("WARN", $"Scan run '{_scanRun.Id}' reached the limit of {_maxRecordedDifferences:N0} recorded differences; further differences are counted but not stored.");
+                }
             }
         }
 
@@ -904,6 +942,8 @@ public class ServiceComparisonEngine
         string keyB,
         CancellationToken cancellationToken)
     {
+        if (_limiterA != null) await _limiterA.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (_limiterB != null) await _limiterB.WaitAsync(cancellationToken).ConfigureAwait(false);
         var getA = new GetObjectRequest { BucketName = _job.BucketA.BucketName, Key = keyA };
         var getB = new GetObjectRequest { BucketName = _job.BucketB.BucketName, Key = keyB };
 
