@@ -19,6 +19,15 @@ public static class HardeningSettings
         return options.Normalized();
     }
 
+    /// <summary>Reads the notification settings (<c>S3Compare:Notifications:DeliveryTimeoutSeconds</c>). Invalid values fall back to the default.</summary>
+    public static S3CompareService.Core.Notifications.NotificationOptions Notifications(IConfiguration configuration)
+    {
+        var options = new S3CompareService.Core.Notifications.NotificationOptions();
+        if (int.TryParse(configuration["S3Compare:Notifications:DeliveryTimeoutSeconds"], out var seconds) && seconds >= 1)
+            options.DeliveryTimeoutSeconds = seconds;
+        return options;
+    }
+
     /// <summary>Reads the scan limits.</summary>
     public static ScanOptions Scan(IConfiguration configuration)
     {

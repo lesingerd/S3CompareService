@@ -40,6 +40,7 @@ public class ScanExecutionCoordinator
     private readonly ILogger<ScanExecutionCoordinator> _logger;
     private readonly IIdleMonEvents _events;
     private readonly ScanOptions _scanOptions;
+    private readonly INotificationQueue? _notifications;
 
     private readonly ConcurrentDictionary<string, ActiveScanContext> _activeScansByRunId = new();
     private readonly ConcurrentDictionary<string, string> _activeRunIdByJobId = new();
@@ -53,7 +54,8 @@ public class ScanExecutionCoordinator
         S3CompareService.Core.Notifications.IAlertNotificationService alertService,
         ILogger<ScanExecutionCoordinator> logger,
         IIdleMonEvents? events = null,
-        ScanOptions? scanOptions = null)
+        ScanOptions? scanOptions = null,
+        INotificationQueue? notifications = null)
     {
         _jobRepo = jobRepo;
         _scanRunRepo = scanRunRepo;
@@ -63,6 +65,7 @@ public class ScanExecutionCoordinator
         _logger = logger;
         _events = events ?? NoOpIdleMonEvents.Instance;
         _scanOptions = scanOptions ?? new ScanOptions();
+        _notifications = notifications;
     }
 
     /// <summary>True once host shutdown has begun; no new scans may be started.</summary>
@@ -246,7 +249,11 @@ public class ScanExecutionCoordinator
             {
                 var currentJob = await _jobRepo.GetByIdAsync(job.Id) ?? job;
                 var (shouldAlert, reasons) = await _alertService.EvaluateAlertConditionAsync(currentJob, run);
-                if (shouldAlert)
+                if (shouldAlert && _notifications != null)
+                {
+                    _notifications.EnqueueAlert(currentJob, run, reasons); // delivered on the dispatcher's task; the scan never waits for it
+                }
+                else if (shouldAlert)
                 {
                     bool delivered = await _alertService.DispatchAlertsAsync(currentJob, run, reasons);
                     if (delivered)

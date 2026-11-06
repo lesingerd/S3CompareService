@@ -60,7 +60,11 @@ builder.Services.AddSingleton<IJobRepository, JobRepository>();
 builder.Services.AddSingleton<IScanRunRepository, ScanRunRepository>();
 builder.Services.AddSingleton<IDifferenceRepository, DifferenceRepository>();
 builder.Services.AddSingleton<IAuditLogRepository, AuditLogRepository>();
+builder.Services.AddSingleton(HardeningSettings.Notifications(builder.Configuration));
 builder.Services.AddSingleton<IAlertNotificationService, AlertNotificationService>();
+builder.Services.AddSingleton<NotificationDispatcher>();
+builder.Services.AddSingleton<INotificationQueue>(sp => sp.GetRequiredService<NotificationDispatcher>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<NotificationDispatcher>());
 
 // Engine & Coordination
 builder.Services.AddSingleton<ScanExecutionCoordinator>();
@@ -198,7 +202,7 @@ static async Task<ComparisonJob> SaveJobFromClientAsync(ComparisonJob job, IJobR
 }
 
 // 1. Status & Health
-app.MapGet("/api/status", (ScanExecutionCoordinator coordinator) =>
+app.MapGet("/api/status", (ScanExecutionCoordinator coordinator, NotificationDispatcher notifications) =>
 {
     var activeScans = coordinator.GetActiveScans().Select(s => new
     {
@@ -226,6 +230,7 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator) =>
         Uptime = (DateTime.UtcNow - startTime).ToString(@"d\.hh\:mm\:ss"),
         MemoryMB = Environment.WorkingSet / (1024.0 * 1024.0),
         DatabasePath = DatabaseConfig.GetDefaultDatabasePath(),
+        Notifications = notifications.GetStatus(),
         ActiveScanCount = activeScans.Count,
         ActiveScans = activeScans
     });
