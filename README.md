@@ -168,7 +168,7 @@ The background service hosts a lightweight REST API on `http://localhost:5088`:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/status` | `GET` | Service status, uptime, RAM, active scans, and live progress |
+| `/api/status` | `GET` | Service status, uptime, RAM, active scans and live progress, and the notification queue and last deliveries |
 | `/api/presets` | `GET` | Available Wasabi and AWS endpoint presets |
 | `/api/test-connection` | `POST` | Tests S3 credentials and connectivity for a bucket |
 | `/api/list-buckets` | `POST` | Discovers available buckets using provided credentials |
@@ -222,13 +222,28 @@ Scan threads do not use Windows background I/O mode (`THREAD_MODE_BACKGROUND_BEG
 
 **Time and clocks.** Waits, "next due" checks and stall detection use the monotonic clock, so setting the wall clock back or forward cannot stall or burst them: the IdleMon heartbeat, collection and sender backoff, the scheduler loop (it wakes every 10 seconds) and the retention task. Job schedules (interval after the last start, cron) are wall-clock UTC because they are calendar times. A job whose recorded last run is more than five minutes in the future (the clock was set back) is treated as due, rather than waiting for the clock to catch up.
 
+**Notifications** (`S3Compare:Notifications`). Alerts and daily digests are not sent by the scheduler loop or the scan. They go into a bounded queue (100 items) and a separate task, `NotificationDispatcher`, delivers them. The scheduler and the scans only add an item and carry on, so a slow or dead SMTP server cannot delay a schedule evaluation, a scan or the IdleMon heartbeat.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `S3Compare:Notifications:DeliveryTimeoutSeconds` | `30` | The longest one delivery (SMTP, webhook or App Insights) may take. After that the attempt is abandoned even if the channel ignores cancellation (`SmtpClient` often does), and counted as a failure. Values below 1 mean the default. |
+
+- **Channels are independent.** For one alert the SMTP, webhook and App Insights deliveries run side by side, each with its own timeout. A dead mail server does not delay the webhook.
+- **Timestamps only after a success.** `LastAlertSentUtc` and `LastDailyDigestSentUtc` are written only after a channel delivered, as before. The digest rules are unchanged (hour, once per day, "only if no recent alerts"); the dispatcher checks them again just before it sends. A failed digest is queued again after about 5 minutes, not every 10 seconds.
+- **At most one digest per job and UTC day**, even if the scheduler queues it twice.
+- **Full queue.** The oldest daily digest (or periodic "all clear" notice) is dropped and counted. Failure and threshold alerts are never dropped.
+- **Nothing can stop the host.** Every item is handled in its own try/catch; an exception is logged and counted. Items still queued at shutdown are not sent (a digest is queued again at the next start if it was not sent).
+- **Status.** `GET /api/status` has a `Notifications` block: `Queued`, `Dropped`, `Delivered`, `Failed`, `LastSuccessUtc`, `LastFailureUtc`, `LastError` (shortened), `ConsecutiveFailures` and `FailingSinceUtc`. This is kept in memory and resets at a restart. It does not feed the IdleMon heartbeat yet.
+- **Test buttons** (test e-mail, test webhook) in the UI still run in the request, with the same timeout.
+
 ```json
 {
   "S3Compare": {
     "ProcessPriority": "BelowNormal",
     "MaxListRequestsPerSecond": 20,
     "MaxRecordedDifferencesPerRun": 100000,
-    "Retention": { "KeepRunsPerJob": 500, "KeepDays": 180, "AuditLogDays": 90 }
+    "Retention": { "KeepRunsPerJob": 500, "KeepDays": 180, "AuditLogDays": 90 },
+    "Notifications": { "DeliveryTimeoutSeconds": 30 }
   }
 }
 ```
