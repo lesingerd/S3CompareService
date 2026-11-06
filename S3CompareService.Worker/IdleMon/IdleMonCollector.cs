@@ -231,6 +231,13 @@ public sealed class IdleMonCollector
             list.Add(Clone(cached.Snapshot));
         }
 
+        // A deleted job must not keep its cached snapshot for the life of the process.
+        if (_topDisparities.Count > 0)
+        {
+            var live = states.Select(s => s.Job.Id).ToHashSet();
+            foreach (var id in _topDisparities.Keys.Where(id => !live.Contains(id)).ToList()) _topDisparities.Remove(id);
+        }
+
         return list;
     }
 

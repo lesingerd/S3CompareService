@@ -119,6 +119,22 @@ public class IdleMonCollectorTests : TestDbBase
     }
 
     [TestMethod]
+    public async Task TopDisparitiesCache_IsPrunedWhenTheJobIsDeleted()
+    {
+        var (job, run) = await SeedCompletedJobAsync(confirmed: 2);
+        await DiffRepo.InsertBatchAsync(new[] { new RecordedDifference { ScanRunId = run.Id, Key = "a.gz", Type = DifferenceType.MissingInBucketB, IsWithinGracePeriod = false } });
+        var collector = NewCollector(Options(o => o.IncludeObjectKeys = true));
+        var cache = typeof(IdleMonCollector).GetField("_topDisparities", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+        await collector.CollectAsync(CancellationToken.None);
+        Assert.AreEqual(1, ((System.Collections.IDictionary)cache.GetValue(collector)!).Count);
+
+        await JobRepo.DeleteAsync(job.Id);
+        await collector.CollectAsync(CancellationToken.None);
+        Assert.AreEqual(0, ((System.Collections.IDictionary)cache.GetValue(collector)!).Count, "a deleted job leaves no cached snapshot");
+    }
+
+    [TestMethod]
     public async Task UnreadableDatabase_SendsNothing_KeepsAlertState_AndMakesTheHeartbeatDegraded()
     {
         await SeedCompletedJobAsync();
