@@ -20,7 +20,13 @@ public class SqliteConnectionFactory
         // Ensure WAL mode and reasonable busy timeout
         using (var cmd = conn.CreateCommand())
         {
+            // auto_vacuum only takes effect on a database that has no tables yet (a new file); on an existing file the
+            // statement is a harmless no-op. Existing databases are converted once by the retention service
+            // (RetentionManager.EnsureIncrementalVacuumAsync). It comes before journal_mode, which writes the header.
+            // journal_size_limit caps how large the -wal file may stay after a checkpoint.
             cmd.CommandText = @"
+                PRAGMA auto_vacuum = INCREMENTAL;
+                PRAGMA journal_size_limit = 67108864;
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
                 PRAGMA busy_timeout = 10000;

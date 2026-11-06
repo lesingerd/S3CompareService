@@ -157,7 +157,7 @@ public sealed class IdleMonCollector
         var states = new List<JobState>(jobs.Count);
         foreach (var job in jobs)
         {
-            var runs = await _runs.GetRecentRunsAsync(RunsPerJob, job.Id, cancellationToken).ConfigureAwait(false);
+            var runs = await _runs.GetRecentRunSummariesAsync(RunsPerJob, job.Id, cancellationToken).ConfigureAwait(false);
             scansByJob.TryGetValue(job.Id, out var scan);
             states.Add(new JobState(job, runs, scan));
         }

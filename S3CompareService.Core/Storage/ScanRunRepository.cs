@@ -14,6 +14,15 @@ public interface IScanRunRepository
     Task<List<ScanRun>> GetRecentRunsAsync(int count = 50, string? jobId = null, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Like <see cref="GetRecentRunsAsync"/> but without the wide, rarely needed text columns (LastEvaluatedKey,
+    /// ResumedFromKey, ScanWindowNotes stay empty/null on the returned runs). For polling readers such as the IdleMon collector.
+    /// </summary>
+    Task<List<ScanRun>> GetRecentRunSummariesAsync(int count = 50, string? jobId = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Start time of the newest run of a job (any status), or null when it never ran. One indexed row, one column.</summary>
+    Task<DateTime?> GetLatestStartTimeAsync(string jobId, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Runs that did not finish: Status Running, Paused or Interrupted, excluding runs already superseded by a
     /// newer run (<see cref="ScanRun.SupersededByRunId"/>).
     /// </summary>
@@ -76,6 +85,7 @@ public class ScanRunRepository : IScanRunRepository
         run.ResumedFromKey,
         run.ResumeCount,
         run.SupersededByRunId,
+        DifferencesTruncated = run.DifferencesTruncated ? 1 : 0,
         run.ObjectsCompared,
         run.MatchedCount,
         run.TotalDifferences,
@@ -103,7 +113,7 @@ public class ScanRunRepository : IScanRunRepository
                 Id, JobId, JobName, StartTimeUtc, EndTimeUtc, Status, Mode,
                 ReplicationGracePeriodMinutes, GracePeriodCutoffUtc, IsScanWindowClipped,
                 ScanWindowNotes, LastEvaluatedKey, IsResumedFromCheckpoint, ResumedFromKey,
-                ResumeCount, SupersededByRunId,
+                ResumeCount, SupersededByRunId, DifferencesTruncated,
                 ObjectsCompared, MatchedCount, TotalDifferences, FilteredDifferencesCount,
                 InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
                 SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount,
@@ -113,7 +123,7 @@ public class ScanRunRepository : IScanRunRepository
                 @Id, @JobId, @JobName, @StartTimeUtc, @EndTimeUtc, @Status, @Mode,
                 @ReplicationGracePeriodMinutes, @GracePeriodCutoffUtc, @IsScanWindowClipped,
                 @ScanWindowNotes, @LastEvaluatedKey, @IsResumedFromCheckpoint, @ResumedFromKey,
-                @ResumeCount, @SupersededByRunId,
+                @ResumeCount, @SupersededByRunId, @DifferencesTruncated,
                 @ObjectsCompared, @MatchedCount, @TotalDifferences, @FilteredDifferencesCount,
                 @InFlightDifferencesCount, @MissingInBucketBCount, @MissingInBucketACount,
                 @SizeMismatchCount, @ETagMismatchCount, @ContentMismatchCount, @SequenceGapCount,
@@ -136,6 +146,7 @@ public class ScanRunRepository : IScanRunRepository
                 IsResumedFromCheckpoint = @IsResumedFromCheckpoint,
                 ResumedFromKey = @ResumedFromKey,
                 ResumeCount = @ResumeCount,
+                DifferencesTruncated = @DifferencesTruncated,
                 LastEvaluatedKey = @LastEvaluatedKey,
                 ObjectsCompared = @ObjectsCompared,
                 MatchedCount = @MatchedCount,
@@ -177,12 +188,28 @@ public class ScanRunRepository : IScanRunRepository
         return row != null ? MapRowToScanRun(row) : null;
     }
 
-    public async Task<List<ScanRun>> GetRecentRunsAsync(int count = 50, string? jobId = null, CancellationToken cancellationToken = default)
+    public Task<List<ScanRun>> GetRecentRunsAsync(int count = 50, string? jobId = null, CancellationToken cancellationToken = default)
+        => QueryRecentAsync(AllRunColumns, count, jobId, cancellationToken);
+
+    public Task<List<ScanRun>> GetRecentRunSummariesAsync(int count = 50, string? jobId = null, CancellationToken cancellationToken = default)
+        => QueryRecentAsync(SummaryRunColumns, count, jobId, cancellationToken);
+
+    // Explicit column lists (no SELECT *). The summary list leaves out the wide text columns.
+    private const string SummaryRunColumns = @"Id, JobId, JobName, StartTimeUtc, EndTimeUtc, Status, Mode,
+        ReplicationGracePeriodMinutes, GracePeriodCutoffUtc, IsScanWindowClipped, IsResumedFromCheckpoint,
+        ResumeCount, SupersededByRunId, DifferencesTruncated, ObjectsCompared, MatchedCount, TotalDifferences,
+        FilteredDifferencesCount, InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
+        SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, BucketAObjectsRead,
+        BucketBObjectsRead, BucketABytesRead, BucketBBytesRead, DurationSeconds, ErrorMessage";
+
+    private const string AllRunColumns = SummaryRunColumns + ", ScanWindowNotes, LastEvaluatedKey, ResumedFromKey";
+
+    private async Task<List<ScanRun>> QueryRecentAsync(string columns, int count, string? jobId, CancellationToken cancellationToken)
     {
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         string sql = string.IsNullOrWhiteSpace(jobId)
-            ? "SELECT * FROM ScanRuns ORDER BY StartTimeUtc DESC LIMIT @Count"
-            : "SELECT * FROM ScanRuns WHERE JobId = @JobId ORDER BY StartTimeUtc DESC LIMIT @Count";
+            ? $"SELECT {columns} FROM ScanRuns ORDER BY StartTimeUtc DESC LIMIT @Count"
+            : $"SELECT {columns} FROM ScanRuns WHERE JobId = @JobId ORDER BY StartTimeUtc DESC LIMIT @Count";
 
         var rows = await conn.QueryAsync(new CommandDefinition(sql, new { Count = count, JobId = jobId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
         var list = new List<ScanRun>();
@@ -191,6 +218,15 @@ public class ScanRunRepository : IScanRunRepository
             list.Add(MapRowToScanRun(r));
         }
         return list;
+    }
+
+    public async Task<DateTime?> GetLatestStartTimeAsync(string jobId, CancellationToken cancellationToken = default)
+    {
+        await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        var value = await conn.ExecuteScalarAsync<string?>(new CommandDefinition(
+            "SELECT StartTimeUtc FROM ScanRuns WHERE JobId = @JobId ORDER BY StartTimeUtc DESC LIMIT 1",
+            new { JobId = jobId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        return string.IsNullOrEmpty(value) ? null : DbDateTime.Parse(value);
     }
 
     public async Task<List<ScanRun>> GetUnfinishedRunsAsync(CancellationToken cancellationToken = default)
@@ -274,7 +310,7 @@ public class ScanRunRepository : IScanRunRepository
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM Checkpoints WHERE ScanRunId = @Id", p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
         await conn.ExecuteAsync(new CommandDefinition(@"
             UPDATE ScanRuns SET
-                LastEvaluatedKey = '', IsResumedFromCheckpoint = 0, ResumedFromKey = NULL,
+                LastEvaluatedKey = '', IsResumedFromCheckpoint = 0, ResumedFromKey = NULL, DifferencesTruncated = 0,
                 ObjectsCompared = 0, MatchedCount = 0, TotalDifferences = 0, FilteredDifferencesCount = 0,
                 InFlightDifferencesCount = 0, MissingInBucketBCount = 0, MissingInBucketACount = 0,
                 SizeMismatchCount = 0, ETagMismatchCount = 0, ContentMismatchCount = 0, SequenceGapCount = 0,
@@ -397,43 +433,50 @@ public class ScanRunRepository : IScanRunRepository
         await conn.ExecuteAsync(new CommandDefinition(sql, new { ScanRunId = scanRunId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
     }
 
-    private static ScanRun MapRowToScanRun(dynamic r)
+    private static ScanRun MapRowToScanRun(dynamic row)
     {
+        // Rows may come from a narrower column list (summaries): absent columns keep the model defaults.
+        var d = (IDictionary<string, object?>)row;
+        string? Str(string name) => d.TryGetValue(name, out var v) && v is not null and not DBNull ? Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture) : null;
+        long Num(string name) => d.TryGetValue(name, out var v) && v is not null and not DBNull ? Convert.ToInt64(v, System.Globalization.CultureInfo.InvariantCulture) : 0;
+        object? Raw(string name) => d.TryGetValue(name, out var v) ? v : null;
+
         return new ScanRun
         {
-            Id = (string)r.Id,
-            JobId = (string)r.JobId,
-            JobName = (string)r.JobName,
-            StartTimeUtc = DbDateTime.Parse((object?)r.StartTimeUtc),
-            EndTimeUtc = DbDateTime.ParseNullable((object?)r.EndTimeUtc),
-            Status = (RunStatus)(int)r.Status,
-            Mode = (ComparisonMode)(int)r.Mode,
-            ReplicationGracePeriodMinutes = (int)r.ReplicationGracePeriodMinutes,
-            GracePeriodCutoffUtc = DbDateTime.ParseNullable((object?)r.GracePeriodCutoffUtc),
-            IsScanWindowClipped = ((long)r.IsScanWindowClipped) == 1,
-            ScanWindowNotes = (string)(r.ScanWindowNotes ?? string.Empty),
-            LastEvaluatedKey = (string)(r.LastEvaluatedKey ?? string.Empty),
-            IsResumedFromCheckpoint = ((long)r.IsResumedFromCheckpoint) == 1,
-            ResumedFromKey = (string?)r.ResumedFromKey,
-            ResumeCount = (int)(long)r.ResumeCount,
-            SupersededByRunId = (string?)r.SupersededByRunId,
-            ObjectsCompared = (long)r.ObjectsCompared,
-            MatchedCount = (long)r.MatchedCount,
-            TotalDifferences = (long)r.TotalDifferences,
-            FilteredDifferencesCount = (long)r.FilteredDifferencesCount,
-            InFlightDifferencesCount = (long)r.InFlightDifferencesCount,
-            MissingInBucketBCount = (long)r.MissingInBucketBCount,
-            MissingInBucketACount = (long)r.MissingInBucketACount,
-            SizeMismatchCount = (long)r.SizeMismatchCount,
-            ETagMismatchCount = (long)r.ETagMismatchCount,
-            ContentMismatchCount = (long)r.ContentMismatchCount,
-            SequenceGapCount = (long)r.SequenceGapCount,
-            BucketAObjectsRead = (long)r.BucketAObjectsRead,
-            BucketBObjectsRead = (long)r.BucketBObjectsRead,
-            BucketABytesRead = (long)r.BucketABytesRead,
-            BucketBBytesRead = (long)r.BucketBBytesRead,
-            DurationSeconds = (double)r.DurationSeconds,
-            ErrorMessage = (string?)r.ErrorMessage
+            Id = Str("Id")!,
+            JobId = Str("JobId")!,
+            JobName = Str("JobName")!,
+            StartTimeUtc = DbDateTime.Parse(Raw("StartTimeUtc")),
+            EndTimeUtc = DbDateTime.ParseNullable(Raw("EndTimeUtc")),
+            Status = (RunStatus)(int)Num("Status"),
+            Mode = (ComparisonMode)(int)Num("Mode"),
+            ReplicationGracePeriodMinutes = (int)Num("ReplicationGracePeriodMinutes"),
+            GracePeriodCutoffUtc = DbDateTime.ParseNullable(Raw("GracePeriodCutoffUtc")),
+            IsScanWindowClipped = Num("IsScanWindowClipped") == 1,
+            ScanWindowNotes = Str("ScanWindowNotes") ?? string.Empty,
+            LastEvaluatedKey = Str("LastEvaluatedKey") ?? string.Empty,
+            IsResumedFromCheckpoint = Num("IsResumedFromCheckpoint") == 1,
+            ResumedFromKey = Str("ResumedFromKey"),
+            ResumeCount = (int)Num("ResumeCount"),
+            SupersededByRunId = Str("SupersededByRunId"),
+            DifferencesTruncated = Num("DifferencesTruncated") == 1,
+            ObjectsCompared = Num("ObjectsCompared"),
+            MatchedCount = Num("MatchedCount"),
+            TotalDifferences = Num("TotalDifferences"),
+            FilteredDifferencesCount = Num("FilteredDifferencesCount"),
+            InFlightDifferencesCount = Num("InFlightDifferencesCount"),
+            MissingInBucketBCount = Num("MissingInBucketBCount"),
+            MissingInBucketACount = Num("MissingInBucketACount"),
+            SizeMismatchCount = Num("SizeMismatchCount"),
+            ETagMismatchCount = Num("ETagMismatchCount"),
+            ContentMismatchCount = Num("ContentMismatchCount"),
+            SequenceGapCount = Num("SequenceGapCount"),
+            BucketAObjectsRead = Num("BucketAObjectsRead"),
+            BucketBObjectsRead = Num("BucketBObjectsRead"),
+            BucketABytesRead = Num("BucketABytesRead"),
+            BucketBBytesRead = Num("BucketBBytesRead"),
+            DurationSeconds = d.TryGetValue("DurationSeconds", out var dur) && dur is not null and not DBNull ? Convert.ToDouble(dur, System.Globalization.CultureInfo.InvariantCulture) : 0,
+            ErrorMessage = Str("ErrorMessage")
         };
     }
 }

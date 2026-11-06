@@ -121,8 +121,7 @@ public class ScanSchedulerService : BackgroundService
         DateTime? lastStart = null;
         if (job.ScheduleType == JobScheduleType.IntervalMinutes)
         {
-            var latest = await scanRunRepo.GetRecentRunsAsync(1, job.Id, ct).ConfigureAwait(false);
-            lastStart = latest.FirstOrDefault()?.StartTimeUtc;
+            lastStart = await scanRunRepo.GetLatestStartTimeAsync(job.Id, ct).ConfigureAwait(false);
         }
         return ComputeSchedule(job, now, lastStart);
     }
