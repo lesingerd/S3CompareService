@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <ItemGroup>
+    <InternalsVisibleTo Include="S3CompareService.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\S3CompareService.Core\S3CompareService.Core.csproj" />
   </ItemGroup>
 

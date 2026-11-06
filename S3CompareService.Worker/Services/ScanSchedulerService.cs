@@ -137,7 +137,7 @@ public class ScanSchedulerService : BackgroundService
         return ComputeSchedule(job, now, lastStart);
     }
 
-    private async Task EvaluateSchedulesAsync(CancellationToken stoppingToken)
+    internal async Task EvaluateSchedulesAsync(CancellationToken stoppingToken)
     {
         using var scope = _serviceProvider.CreateScope();
         var jobRepo = scope.ServiceProvider.GetRequiredService<IJobRepository>();
@@ -162,7 +162,14 @@ public class ScanSchedulerService : BackgroundService
                 try
                 {
                     var (shouldSendDigest, _) = await alertService.EvaluateDailyDigestConditionAsync(job, now).ConfigureAwait(false);
-                    if (shouldSendDigest)
+                    var queue = _serviceProvider.GetService<INotificationQueue>();
+                    if (shouldSendDigest && queue != null)
+                    {
+                        // Hand over and move on: the dispatcher re-checks the condition, sends and records the timestamp (once per job and day).
+                        if (queue.TryEnqueueDigest(job.Id, now))
+                            _logger.LogInformation("Job '{JobName}' is due for daily all-clear status report. Queued for delivery.", job.Name);
+                    }
+                    else if (shouldSendDigest)
                     {
                         _logger.LogInformation("Job '{JobName}' is due for daily all-clear status report. Dispatching...", job.Name);
                         var recentRuns = await scanRunRepo.GetRecentRunsAsync(100, job.Id, stoppingToken).ConfigureAwait(false);
