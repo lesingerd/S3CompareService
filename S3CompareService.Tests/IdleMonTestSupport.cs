@@ -5,16 +5,32 @@ using S3CompareService.Worker.IdleMon;
 
 namespace S3CompareService.Tests;
 
-/// <summary>A clock the test moves by hand (no extra package needed).</summary>
+/// <summary>
+/// A clock the test moves by hand (no extra package needed). It has two independent readings, like the real one: the wall clock
+/// (<see cref="GetUtcNow"/>) and a monotonic timestamp (<see cref="GetTimestamp"/>, 1 tick = 100 ns). <see cref="Advance"/> moves
+/// both; <see cref="StepWallClock"/> moves only the wall clock, like an administrator or a time sync changing the time.
+/// </summary>
 public sealed class FakeClock : TimeProvider
 {
     private DateTimeOffset _now;
+    private long _monotonic = 1_000_000;
 
     public FakeClock(DateTimeOffset? start = null) => _now = start ?? new DateTimeOffset(2026, 11, 5, 12, 0, 0, TimeSpan.Zero);
 
     public override DateTimeOffset GetUtcNow() => _now;
 
-    public void Advance(TimeSpan by) => _now += by;
+    public override long GetTimestamp() => Interlocked.Read(ref _monotonic);
+
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+    public void Advance(TimeSpan by)
+    {
+        _now += by;
+        Interlocked.Add(ref _monotonic, by.Ticks);
+    }
+
+    /// <summary>Moves only the wall clock (forwards or backwards); the monotonic clock does not notice.</summary>
+    public void StepWallClock(TimeSpan by) => _now += by;
 
     public DateTime UtcNow => _now.UtcDateTime;
 }
