@@ -35,12 +35,18 @@ public sealed class IdleMonCollector
     private readonly ResultSendTracker _results = new();
     private readonly Dictionary<string, (string RunId, IdleMonMessage Snapshot)> _topDisparities = new();
     private readonly DateTimeOffset _startedAt;
-    private DateTimeOffset _nextMetrics;
-    private DateTimeOffset _nextHeartbeat;
-    private DateTimeOffset? _lastCollectionOk;
-    private string? _databaseError;
-    private IReadOnlyList<StuckScan> _stuckScans = [];
+    private readonly long _startedTs;
+    private long _lastMetricsTs;    // monotonic timestamps of the last start; 0 = never
+    private long _lastHeartbeatTs;
+    private volatile CollectionState _state = CollectionState.Initial;
     private int _lastLoggedFailure;
+
+    // What the last collection pass left behind, swapped as one immutable object so the heartbeat reads a consistent view
+    // without a lock and without waiting for the pass.
+    private sealed record CollectionState(long LastOkTimestamp, string? DatabaseError, IReadOnlyList<StuckScan> StuckScans)
+    {
+        public static readonly CollectionState Initial = new(0, null, []);
+    }
 
     /// <summary>Creates the collector.</summary>
     public IdleMonCollector(
@@ -66,38 +72,74 @@ public sealed class IdleMonCollector
         _time = time;
         _logger = logger;
         _startedAt = time.GetUtcNow();
-        _nextMetrics = _startedAt;
-        _nextHeartbeat = _startedAt;
+        _startedTs = time.GetTimestamp();
     }
 
     /// <summary>Gets the alerts firing now.</summary>
     public IReadOnlyCollection<string> FiringAlerts => _alerts.FiringKeys;
 
-    /// <summary>Does what is due now: a collection pass and/or a heartbeat.</summary>
+    /// <summary>Does what is due now: a collection pass and/or a heartbeat (one after the other; the hosted service runs them on separate tasks).</summary>
     public async Task TickAsync(CancellationToken cancellationToken)
     {
-        var now = _time.GetUtcNow();
-        if (now >= _nextMetrics)
-        {
-            _nextMetrics = now + TimeSpan.FromSeconds(_options.MetricsIntervalSeconds);
-            await CollectAsync(cancellationToken).ConfigureAwait(false);
-        }
+        await CollectIfDueAsync(cancellationToken).ConfigureAwait(false);
 
         // The heartbeat comes after the collection, so it reports the result of this very pass.
-        now = _time.GetUtcNow();
-        if (now >= _nextHeartbeat)
-        {
-            _nextHeartbeat = now + TimeSpan.FromSeconds(_options.HeartbeatIntervalSeconds);
-            SendHeartbeat();
-        }
+        HeartbeatIfDue();
     }
+
+    /// <summary>Runs a collection pass when one is due (monotonic time).</summary>
+    public async Task CollectIfDueAsync(CancellationToken cancellationToken)
+    {
+        if (!IsDue(ref _lastMetricsTs, _options.MetricsIntervalSeconds)) return;
+        await CollectAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Sends a heartbeat when one is due (monotonic time). Reads only in-memory state, never waits for I/O.</summary>
+    public bool HeartbeatIfDue()
+    {
+        if (!IsDue(ref _lastHeartbeatTs, _options.HeartbeatIntervalSeconds)) return false;
+        SendHeartbeat();
+        return true;
+    }
+
+    // Due when never done, when the interval has passed on the monotonic clock, or when the elapsed time is negative (a clock
+    // that went backwards must not make the next run wait for ever). Marks the run as started.
+    private bool IsDue(ref long lastTimestamp, int intervalSeconds)
+    {
+        long now = _time.GetTimestamp();
+        long last = Interlocked.Read(ref lastTimestamp);
+        if (last != 0)
+        {
+            var elapsed = _time.GetElapsedTime(last, now);
+            if (elapsed >= TimeSpan.Zero && elapsed < TimeSpan.FromSeconds(intervalSeconds)) return false;
+        }
+
+        Interlocked.Exchange(ref lastTimestamp, now == 0 ? 1 : now);
+        return true;
+    }
+
+    // Time until the next run, on the monotonic clock: at least 250 ms, at most one interval (a clock fault never makes it longer).
+    private TimeSpan DelayUntil(long lastTimestamp, int intervalSeconds)
+    {
+        var interval = TimeSpan.FromSeconds(intervalSeconds);
+        if (lastTimestamp == 0) return TimeSpan.FromMilliseconds(250);
+        var remaining = interval - _time.GetElapsedTime(lastTimestamp, _time.GetTimestamp());
+        if (remaining > interval) remaining = interval;
+        return remaining < TimeSpan.FromMilliseconds(250) ? TimeSpan.FromMilliseconds(250) : remaining;
+    }
+
+    /// <summary>Gets how long to wait until the next collection pass is due.</summary>
+    public TimeSpan DelayUntilNextCollection() => DelayUntil(Interlocked.Read(ref _lastMetricsTs), _options.MetricsIntervalSeconds);
+
+    /// <summary>Gets how long to wait until the next heartbeat is due.</summary>
+    public TimeSpan DelayUntilNextHeartbeat() => DelayUntil(Interlocked.Read(ref _lastHeartbeatTs), _options.HeartbeatIntervalSeconds);
 
     /// <summary>Gets how long to wait until something is due.</summary>
     public TimeSpan DelayUntilNextTick()
     {
-        var next = _nextMetrics < _nextHeartbeat ? _nextMetrics : _nextHeartbeat;
-        var delay = next - _time.GetUtcNow();
-        return delay < TimeSpan.FromMilliseconds(250) ? TimeSpan.FromMilliseconds(250) : delay;
+        var a = DelayUntilNextCollection();
+        var b = DelayUntilNextHeartbeat();
+        return a < b ? a : b;
     }
 
     /// <summary>One collection pass. Never throws (except for cancellation of <paramref name="cancellationToken"/>).</summary>
@@ -110,31 +152,33 @@ public sealed class IdleMonCollector
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(CollectionTimeout);
 
-            List<JobState> states;
+            IReadOnlyList<StuckScan> stuck;
             try
             {
-                states = await ReadStatesAsync(active, timeout.Token).ConfigureAwait(false);
+                var states = await ReadStatesAsync(active, timeout.Token).ConfigureAwait(false);
+
+                _progress.Observe(active, now);
+                // Active scans are matched to the states read above; a scan that started meanwhile shows up on the next pass.
+                var evaluation = AlertEvaluator.Evaluate(states, now, _options, _progress);
+
+                foreach (var message in _alerts.Apply(evaluation.Conditions, now)) _reporter.Submit(message);
+                foreach (var message in MetricBuilder.Build(states, active.Count, evaluation.OverdueJobs, now, _options, _results)) _reporter.Submit(message);
+                _reporter.Submit(SnapshotBuilder.Jobs(states, now, _options));
+                if (_options.IncludeObjectKeys)
+                {
+                    // The same timeout covers the top-disparities read: a locked database must not hold this pass for ever.
+                    foreach (var message in await TopDisparitiesAsync(states, now, timeout.Token).ConfigureAwait(false)) _reporter.Submit(message);
+                }
+
+                stuck = evaluation.StuckScans;
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
                 throw new TimeoutException("the read timed out");
             }
 
-            _progress.Observe(active, now);
-            // Active scans are matched to the states read above; a scan that started meanwhile shows up on the next pass.
-            var evaluation = AlertEvaluator.Evaluate(states, now, _options, _progress);
-
-            foreach (var message in _alerts.Apply(evaluation.Conditions, now)) _reporter.Submit(message);
-            foreach (var message in MetricBuilder.Build(states, active.Count, evaluation.OverdueJobs, now, _options, _results)) _reporter.Submit(message);
-            _reporter.Submit(SnapshotBuilder.Jobs(states, now, _options));
-            if (_options.IncludeObjectKeys)
-            {
-                foreach (var message in await TopDisparitiesAsync(states, now, cancellationToken).ConfigureAwait(false)) _reporter.Submit(message);
-            }
-
-            _lastCollectionOk = now;
-            _databaseError = null;
-            _stuckScans = evaluation.StuckScans;
+            // One swap: the heartbeat sees either the old state or the complete new one.
+            _state = new CollectionState(NonZero(_time.GetTimestamp()), null, stuck);
             _lastLoggedFailure = 0;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -144,11 +188,14 @@ public sealed class IdleMonCollector
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             // Unknown is not zero: nothing is sent for this pass, alerts keep their state, and the heartbeat says degraded.
-            _databaseError = ex is TimeoutException ? "timed out" : ex.GetType().Name;
+            var previous = _state;
+            _state = previous with { DatabaseError = ex is TimeoutException ? "timed out" : ex.GetType().Name };
             if (Interlocked.Exchange(ref _lastLoggedFailure, 1) == 0)
                 _logger.LogWarning("IdleMon collection failed ({Type}); the heartbeat will say degraded until it works again.", ex.GetType().Name);
         }
     }
+
+    private static long NonZero(long timestamp) => timestamp == 0 ? 1 : timestamp;
 
     private async Task<List<JobState>> ReadStatesAsync(IReadOnlyList<ActiveScanInfo> active, CancellationToken cancellationToken)
     {
@@ -157,7 +204,7 @@ public sealed class IdleMonCollector
         var states = new List<JobState>(jobs.Count);
         foreach (var job in jobs)
         {
-            var runs = await _runs.GetRecentRunsAsync(RunsPerJob, job.Id, cancellationToken).ConfigureAwait(false);
+            var runs = await _runs.GetRecentRunSummariesAsync(RunsPerJob, job.Id, cancellationToken).ConfigureAwait(false);
             scansByJob.TryGetValue(job.Id, out var scan);
             states.Add(new JobState(job, runs, scan));
         }
@@ -192,20 +239,26 @@ public sealed class IdleMonCollector
         Kind = m.Kind, Timestamp = m.Timestamp, Name = m.Name, Columns = m.Columns, Rows = m.Rows, Tags = m.Tags,
     };
 
-    /// <summary>Sends one heartbeat from the state of the last collection.</summary>
+    /// <summary>
+    /// Sends one heartbeat from the state of the last collection. It reads only memory (the last pass's result, the scheduler's
+    /// last evaluation, the spool's cached backlog), so a blocked database or disk cannot delay it. Ages are measured on the
+    /// monotonic clock and turned into times relative to now, so a wall-clock step cannot fake or hide a stall.
+    /// </summary>
     public void SendHeartbeat()
     {
         try
         {
             var now = _time.GetUtcNow();
+            var nowTs = _time.GetTimestamp();
+            var state = _state;
             _reporter.Submit(HeartbeatBuilder.Build(new HeartbeatInput
             {
                 Now = now,
-                StartedAt = _startedAt,
-                LastCollectionOk = _lastCollectionOk,
-                DatabaseError = _databaseError,
+                StartedAt = now - Positive(_time.GetElapsedTime(_startedTs, nowTs)),
+                LastCollectionOk = state.LastOkTimestamp == 0 ? null : now - Positive(_time.GetElapsedTime(state.LastOkTimestamp, nowTs)),
+                DatabaseError = state.DatabaseError,
                 SchedulerLastEvaluation = _schedulerLastEvaluation(),
-                StuckScans = _stuckScans,
+                StuckScans = state.StuckScans,
                 Backlog = Backlog(now),
             }, _options));
         }
@@ -214,6 +267,8 @@ public sealed class IdleMonCollector
             _logger.LogWarning("IdleMon heartbeat failed ({Type}).", ex.GetType().Name);
         }
     }
+
+    private static TimeSpan Positive(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : value;
 
     /// <summary>Sends the heartbeat for a clean shutdown.</summary>
     public void SendStopping()

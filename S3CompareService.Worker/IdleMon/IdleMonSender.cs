@@ -49,7 +49,8 @@ public sealed class IdleMonSender : BackgroundService
     private readonly string? _dryRunFile;
     private readonly Random _random = new();
     private TimeSpan _backoff = TimeSpan.Zero;
-    private DateTimeOffset _nextAttempt = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextAttempt = DateTimeOffset.MinValue; // for display; the decision uses the monotonic _nextAttemptTimestamp
+    private long _nextAttemptTimestamp; // 0 = no backoff
     private DateTimeOffset _lastUnauthorizedLog = DateTimeOffset.MinValue;
 
     /// <summary>Creates the sender. <paramref name="innerHandler"/> replaces the real network handler (tests).</summary>
@@ -150,7 +151,7 @@ public sealed class IdleMonSender : BackgroundService
             return;
         }
 
-        if (!force && _time.GetUtcNow() < _nextAttempt)
+        if (!force && _nextAttemptTimestamp != 0 && _time.GetTimestamp() < _nextAttemptTimestamp)
         {
             SpoolPending();
             return;
@@ -279,6 +280,7 @@ public sealed class IdleMonSender : BackgroundService
                     await ReadAcceptedAsync(response, envelope, cancellationToken).ConfigureAwait(false);
                     _backoff = TimeSpan.Zero;
                     _nextAttempt = DateTimeOffset.MinValue;
+                    _nextAttemptTimestamp = 0;
                     return SendOutcome.Done;
 
                 case HttpStatusCode.BadRequest:
@@ -380,6 +382,7 @@ public sealed class IdleMonSender : BackgroundService
 
         var jitter = 1 + ((_random.NextDouble() - 0.5) * 0.4);
         _nextAttempt = _time.GetUtcNow() + (delay * jitter);
+        _nextAttemptTimestamp = Math.Max(1, _time.GetTimestamp() + (long)(delay.TotalSeconds * jitter * _time.TimestampFrequency)); // monotonic: a clock step cannot freeze or skip the backoff
         _status.SetLastSend(_time.GetUtcNow(), $"{result}; retry in {delay.TotalSeconds:0} s");
     }
 }

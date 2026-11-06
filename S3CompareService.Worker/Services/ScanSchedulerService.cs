@@ -40,6 +40,7 @@ public class ScanSchedulerService : BackgroundService
 
             try
             {
+                // Task.Delay waits on the monotonic clock: a wall-clock step neither stalls nor shortens it.
                 await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -80,8 +81,15 @@ public class ScanSchedulerService : BackgroundService
     }
 
     /// <summary>
+    /// A run that "started" more than this far in the future means the wall clock stepped backwards (or the stored time is wrong).
+    /// Such a schedule is treated as due, not stalled until the clock catches up (a negative elapsed time counts as due).
+    /// </summary>
+    public static readonly TimeSpan ClockSkewTolerance = TimeSpan.FromMinutes(5);
+
+    /// <summary>
     /// Pure due-time computation. <paramref name="lastStartUtc"/> is the start of the most recent run (interval anchor);
-    /// when null the job's LastRunTimeUtc is used. All inputs are treated as UTC.
+    /// when null the job's LastRunTimeUtc is used. All inputs are treated as UTC. Due times are wall-clock UTC because they are
+    /// schedules ("every 60 minutes after the last start", cron); only the waiting between evaluations uses the monotonic clock.
     /// </summary>
     public static (bool IsDue, DateTime? NextRunUtc) ComputeSchedule(ComparisonJob job, DateTime nowUtc, DateTime? lastStartUtc = null)
     {
@@ -93,7 +101,9 @@ public class ScanSchedulerService : BackgroundService
             var anchor = lastStartUtc ?? job.LastRunTimeUtc;
             if (anchor == null) return (true, null); // never run before: initial run
 
-            var nextDue = AsUtc(anchor.Value).AddMinutes(job.IntervalMinutes);
+            var anchorUtc = AsUtc(anchor.Value);
+            var nextDue = anchorUtc.AddMinutes(job.IntervalMinutes);
+            if (anchorUtc - nowUtc > ClockSkewTolerance) return (true, nextDue); // the clock went backwards
             return (nowUtc >= nextDue, nextDue);
         }
 
@@ -101,6 +111,7 @@ public class ScanSchedulerService : BackgroundService
         {
             var expression = CronExpression.Parse(job.CronExpression);
             var baseTime = AsUtc(job.LastRunTimeUtc ?? job.CreatedAtUtc);
+            if (baseTime - nowUtc > ClockSkewTolerance) baseTime = nowUtc; // the clock went backwards: next slot after now
             var nextUtc = expression.GetNextOccurrence(baseTime, TimeZoneInfo.Utc);
             if (nextUtc.HasValue)
                 return (nowUtc >= nextUtc.Value, nextUtc.Value);
@@ -121,8 +132,7 @@ public class ScanSchedulerService : BackgroundService
         DateTime? lastStart = null;
         if (job.ScheduleType == JobScheduleType.IntervalMinutes)
         {
-            var latest = await scanRunRepo.GetRecentRunsAsync(1, job.Id, ct).ConfigureAwait(false);
-            lastStart = latest.FirstOrDefault()?.StartTimeUtc;
+            lastStart = await scanRunRepo.GetLatestStartTimeAsync(job.Id, ct).ConfigureAwait(false);
         }
         return ComputeSchedule(job, now, lastStart);
     }

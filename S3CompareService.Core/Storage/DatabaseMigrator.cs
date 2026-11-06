@@ -12,7 +12,7 @@ public class DatabaseMigrator
     }
 
     /// <summary>Latest schema version. Bump and add a step in <see cref="ApplyStepAsync"/> for every schema change.</summary>
-    public const int LatestVersion = 2;
+    public const int LatestVersion = 3;
 
     public async Task MigrateAsync(CancellationToken cancellationToken = default)
     {
@@ -51,6 +51,15 @@ public class DatabaseMigrator
                 await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "SupersededByRunId", "TEXT", ct).ConfigureAwait(false);
                 await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "ResumeCount", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
                 await conn.ExecuteAsync(new CommandDefinition("CREATE INDEX IF NOT EXISTS IX_Differences_ScanRun_Key ON RecordedDifferences (ScanRunId, Key);", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
+                break;
+            case 3:
+                // Long-run hardening. The scheduler and the IdleMon collector read "newest runs of one job" every few
+                // seconds/minutes: the composite index serves WHERE JobId = ? ORDER BY StartTimeUtc DESC LIMIT n without a
+                // sort and makes IX_ScanRuns_JobId (a prefix of it) redundant.
+                await conn.ExecuteAsync(new CommandDefinition("CREATE INDEX IF NOT EXISTS IX_ScanRuns_JobId_StartTimeUtc ON ScanRuns (JobId, StartTimeUtc DESC);", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
+                await conn.ExecuteAsync(new CommandDefinition("DROP INDEX IF EXISTS IX_ScanRuns_JobId;", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
+                // Set when a run hit the recorded-differences cap (counters stay exact, rows stop at the cap).
+                await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "DifferencesTruncated", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
                 break;
             default:
                 throw new InvalidOperationException($"No migration defined for schema version {version}.");

@@ -28,6 +28,12 @@ public class ScanRun
     /// <summary>If set, a newer run took over this run's checkpoint and differences; it must not be recovered again.</summary>
     public string? SupersededByRunId { get; set; }
 
+    /// <summary>
+    /// True when the run hit <c>MaxRecordedDifferencesPerRun</c>: the counters below still count every difference, but
+    /// only the first N were stored as rows, so the difference list and exports are incomplete.
+    /// </summary>
+    public bool DifferencesTruncated { get; set; }
+
     // Summary counts
     public long ObjectsCompared { get; set; }
     public long MatchedCount { get; set; }

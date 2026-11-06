@@ -48,6 +48,12 @@ builder.Host.UseWindowsService(options =>
 });
 
 // Core Storage & Repositories
+// Long-run hardening settings (retention, difference cap, request rate limit, process priority).
+HardeningSettings.ApplyPriority(builder.Configuration[HardeningSettings.ProcessPriorityKey], m => Console.Error.WriteLine(m));
+var retentionOptions = HardeningSettings.Retention(builder.Configuration);
+builder.Services.AddSingleton(retentionOptions);
+builder.Services.AddSingleton(HardeningSettings.Scan(builder.Configuration));
+builder.Services.AddSingleton<RetentionManager>();
 builder.Services.AddSingleton<SqliteConnectionFactory>();
 builder.Services.AddSingleton<DatabaseMigrator>();
 builder.Services.AddSingleton<IJobRepository, JobRepository>();
@@ -62,6 +68,8 @@ builder.Services.AddTransient<CrashRecoveryManager>();
 // IdleMon reporter (off by default). Registered before the scheduler so its sender is stopped last and can flush.
 builder.Services.AddIdleMon(builder.Configuration, localSettingsFile);
 builder.Services.AddHostedService<ScanSchedulerService>();
+builder.Services.AddSingleton<RetentionService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<RetentionService>());
 
 var app = builder.Build();
 

@@ -39,6 +39,7 @@ It runs continuous comparisons on automated schedules (interval or cron), captur
   - Self-contained SQLite database (`s3compareservice.db`) with Write-Ahead Logging (`WAL` mode) and busy-timeout handling.
   - Stores comparison jobs, execution runs, bucket metadata snapshots, difference records, and audit logs.
   - Zero external database server dependencies. Easily backed up, migrated, or inspected using standard tools.
+  - **Bounded for long runs**: hourly retention of old runs, differences and audit logs (the newest completed run of a job is always kept), a cap on stored differences per run, a WAL size limit and incremental vacuum. See "Long-run operation" below.
 - **Dual Architecture & Future-Proofing**:
   - Independent Background Worker (`S3CompareService.Worker`) capable of running as a native Windows Service or console process.
   - Embedded REST API (`http://localhost:5088/api`) exposing full health, job, run, and disparity data.
@@ -188,6 +189,52 @@ The background service hosts a lightweight REST API on `http://localhost:5088`:
 
 ---
 
+## Long-run operation: retention, limits and priority
+
+The service is built to run for months without attention. These settings live in the `S3Compare` section of `appsettings.json`, or in `appsettings.Local.json` in the data directory (same precedence and restart rule as the IdleMon section below). Every number has a safe default; you only need to change them for unusual data volumes.
+
+**Retention** (`S3Compare:Retention`). A background task (`RetentionService`) runs one hour after a start and then every hour. It never touches a running scan and never delays startup or crash recovery.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `KeepRunsPerJob` | `500` | The newest N runs of each job are kept. 500 runs of an hourly job is about three weeks; of a daily job, more than a year. `0` = no limit by count. |
+| `KeepDays` | `180` | Runs that started more than this many days ago are deleted. `0` = no limit by age. |
+| `AuditLogDays` | `90` | Service audit log rows older than this are deleted. `0` = keep for ever. |
+| `BatchSize` | `2000` | Rows deleted per transaction. The database is released between batches, so scans and the API keep their write access. |
+| `AutoVacuumConvertMaxMegabytes` | `128` | See "Disk space" below. `0` = never convert. |
+
+A run is deleted together with its differences and bucket snapshots. These are **never** deleted, whatever the settings say: the newest run of a job; the newest **completed** run of a job (IdleMon reporting reads it, even when later runs failed or it is older than `KeepDays`); any run that is Pending, Running, Paused or Interrupted (it can still be resumed); and any run that has a checkpoint. If the system clock is more than `KeepDays` (or `AuditLogDays`) ahead of the newest data, the age rules are skipped with a warning in the log, so a clock set years ahead cannot wipe the history; the count rule still applies.
+
+**Disk space.** After each pass the WAL is checkpointed and truncated (it also has a 64 MB size limit), and free pages are returned to the file with `PRAGMA incremental_vacuum` in small steps. New databases are created with `auto_vacuum = INCREMENTAL`. A database created by an older version cannot switch modes without a full `VACUUM`, which locks writers while it runs. The service therefore converts an old database **once, only if the file is at most `AutoVacuumConvertMaxMegabytes` and no scan is running** (and there is room on disk for a temporary copy). A larger database is left alone and a warning in the log says so; deleted history then frees pages inside the file for reuse, but the file does not shrink. To convert a large database: stop the service, back up `s3compareservice.db`, run `sqlite3 s3compareservice.db "PRAGMA auto_vacuum = INCREMENTAL; VACUUM;"`, start the service. Schema version 3 also adds the `(JobId, StartTimeUtc)` run index and drops the redundant `JobId` index; this happens automatically at start.
+
+**Differences per run** (`S3Compare:MaxRecordedDifferencesPerRun`, default `100000`). A bucket pair that diverges completely could otherwise store millions of rows in one run. Past the limit the scan continues and **every counter stays exact** (total, confirmed, in-flight, per type), but no more difference rows are stored. The run is flagged `DifferencesTruncated` (`differencesTruncated` in the API and in the JSON export), its `ScanWindowNotes` say so (the "Clipped Window" column in the UI), and the CSV export carries a `# TRUNCATED` header line. The paged difference list and the exports then hold the first N differences, not all of them. `0` = unlimited. 100,000 rows with their indexes are roughly 100 MB; that is far more than anyone reads in a UI, and enough to find the pattern of a large divergence.
+
+**Load on the host and on S3** (these protect the monitored storage and the server; all are read-only against the buckets as before)
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `S3Compare:ProcessPriority` | `BelowNormal` | Priority class of the service process, set at start: `Idle`, `BelowNormal`, `Normal`, `AboveNormal` or `High`. `RealTime` is refused. The service then yields CPU to everything else on the server. |
+| `S3Compare:MaxListRequestsPerSecond` | `20` | A token bucket (monotonic clock, burst of one second's worth) that paces every S3 request a scan sends: list pages, and in Full Data mode the object reads. It applies per scan and per bucket side. `0` = unlimited. |
+
+Why 20: one list request returns 1,000 keys, so 20 requests per second is 20,000 keys per second per side. A scan makes its list requests one after another and normally manages 5 to 10 per second against a public cloud endpoint, so the default does not slow a normal scan. It only matters when the endpoint answers very quickly (an on-premises S3 on a fast network), where an unthrottled scan would hammer it. Lower it (for example `2`) for a fragile on-premises object store; a 100-million-object bucket then takes about 14 hours instead of the 3 to 6 hours it takes at the usual 5 to 10 requests per second.
+
+Scan threads do not use Windows background I/O mode (`THREAD_MODE_BACKGROUND_BEGIN`): scans are async tasks that move between thread pool threads, so a per-thread mode would not be reliable. The below-normal process priority and the rate limit do the job instead.
+
+**Time and clocks.** Waits, "next due" checks and stall detection use the monotonic clock, so setting the wall clock back or forward cannot stall or burst them: the IdleMon heartbeat, collection and sender backoff, the scheduler loop (it wakes every 10 seconds) and the retention task. Job schedules (interval after the last start, cron) are wall-clock UTC because they are calendar times. A job whose recorded last run is more than five minutes in the future (the clock was set back) is treated as due, rather than waiting for the clock to catch up.
+
+```json
+{
+  "S3Compare": {
+    "ProcessPriority": "BelowNormal",
+    "MaxListRequestsPerSecond": 20,
+    "MaxRecordedDifferencesPerRun": 100000,
+    "Retention": { "KeepRunsPerJob": 500, "KeepDays": 180, "AuditLogDays": 90 }
+  }
+}
+```
+
+---
+
 ## IdleMon integration
 
 S3CompareService can report to [IdleMon](https://github.com/lesingerd/IdleMon), a central collector for alerts, events and metrics from in-house tools on Windows servers. The reporter is **off by default**: with `IdleMon:Enabled` set to `false` nothing is sent and no file is written.
@@ -202,7 +249,7 @@ When enabled, the Worker sends to the IdleMon agent **on the same machine only**
 | Alerts | `run-failed`, `disparities` (the job's own thresholds), `overdue` and `scan-stuck`, per job. They fire and resolve on state changes and are refreshed every metrics interval. Disabling or deleting a job resolves its alerts. |
 | Events | Run completed, failed or cancelled; crash recovery; job created, updated, deleted, enabled, disabled; service start. |
 | Snapshots | `s3c.jobs` (one row per job); `s3c.run.top_disparities` only when `IncludeObjectKeys` is `true`. |
-| Heartbeat | Every `HeartbeatIntervalSeconds`; `degraded` when the database cannot be read, the scheduler has stopped evaluating, or a scan is stuck; `stopping` on a clean shutdown. |
+| Heartbeat | Every `HeartbeatIntervalSeconds`, on its own task from in-memory state only (a blocked database or disk cannot delay it); `degraded` when the database cannot be read, the scheduler has stopped evaluating, or a scan is stuck; `stopping` on a clean shutdown. |
 
 The full list of names, units and rules is in the [message catalog](https://github.com/lesingerd/IdleMon/blob/main/docs/integrations/s3compare-catalog.md).
 
@@ -242,7 +289,7 @@ The `IdleMon` section is read from `appsettings.json` in the install folder and 
 | `HeartbeatIntervalSeconds` | `60` | |
 | `MetricsIntervalSeconds` | `300` | Also declared to IdleMon as the data interval. |
 | `SpoolDirectory` | `<data directory>\idlemon-spool` | Where unsent messages wait. |
-| `SpoolMaxMegabytes` | `50` | When full, old info events go first; alerts are never dropped. |
+| `SpoolMaxMegabytes` | `50` | When full, old info events go first, then other non-alert messages, then older refreshes of alerts (only the latest firing or resolved message per alert key is kept). Error events stay until the hard ceiling of twice this size; the latest state of an alert is never dropped. |
 | `DryRunFile` | empty | When set, batches are written to this file as JSON Lines instead of being sent. |
 | `IncludeBucketNames` | `true` | When `false`, `A` and `B` are sent instead of the bucket names. |
 | `IncludeObjectKeys` | `false` | Send the top-disparities snapshot, which contains object keys. |
@@ -255,6 +302,8 @@ For example, to try it without an agent, run the Worker with `--IdleMon:Enabled=
 **Never sent:** credentials, access keys, secret keys, webhook URLs, SMTP settings, or object contents. Object keys are sent only when `IncludeObjectKeys` is `true`; bucket names are sent unless `IncludeBucketNames` is `false`. Job names are always sent (for example `contoso-archive-vs-wasabi`).
 
 Nothing about this integration has been verified on a production server yet. It has been tested with unit tests, a dry run, and a local IdleMon agent on a development machine, using fake jobs and including a 40-second agent outage that was spooled and replayed.
+
+**Spool behaviour.** The spool keeps an in-memory index, so its size and backlog age (the heartbeat tag `backlogSeconds`) cost no disk access. A spool file that cannot be read (access denied, locked by a scanner) is skipped and retried every 30 seconds, so newer files and fresh messages are still sent; after 24 hours of failing it is renamed to `.bad` and counted as dropped. A spool file is deleted only after IdleMon accepted its contents.
 
 Known limitation: firing alerts are tracked in memory. If a job is disabled or deleted while the service is stopped, alerts already sent for it are not resolved by the service; resolve them in IdleMon.
 

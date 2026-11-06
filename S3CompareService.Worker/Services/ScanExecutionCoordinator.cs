@@ -39,6 +39,7 @@ public class ScanExecutionCoordinator
     private readonly S3CompareService.Core.Notifications.IAlertNotificationService _alertService;
     private readonly ILogger<ScanExecutionCoordinator> _logger;
     private readonly IIdleMonEvents _events;
+    private readonly ScanOptions _scanOptions;
 
     private readonly ConcurrentDictionary<string, ActiveScanContext> _activeScansByRunId = new();
     private readonly ConcurrentDictionary<string, string> _activeRunIdByJobId = new();
@@ -51,7 +52,8 @@ public class ScanExecutionCoordinator
         IAuditLogRepository auditLogRepo,
         S3CompareService.Core.Notifications.IAlertNotificationService alertService,
         ILogger<ScanExecutionCoordinator> logger,
-        IIdleMonEvents? events = null)
+        IIdleMonEvents? events = null,
+        ScanOptions? scanOptions = null)
     {
         _jobRepo = jobRepo;
         _scanRunRepo = scanRunRepo;
@@ -60,6 +62,7 @@ public class ScanExecutionCoordinator
         _alertService = alertService;
         _logger = logger;
         _events = events ?? NoOpIdleMonEvents.Instance;
+        _scanOptions = scanOptions ?? new ScanOptions();
     }
 
     /// <summary>True once host shutdown has begun; no new scans may be started.</summary>
@@ -173,7 +176,7 @@ public class ScanExecutionCoordinator
     {
         var cts = new CancellationTokenSource();
         var token = cts.Token;
-        var engine = new ServiceComparisonEngine(job, run, _scanRunRepo, _diffRepo, _auditLogRepo, checkpoint);
+        var engine = new ServiceComparisonEngine(job, run, _scanRunRepo, _diffRepo, _auditLogRepo, checkpoint, options: _scanOptions);
 
         var context = new ActiveScanContext
         {
