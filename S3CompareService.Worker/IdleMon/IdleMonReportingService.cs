@@ -5,9 +5,12 @@ using S3CompareService.Core.Storage;
 namespace S3CompareService.Worker.IdleMon;
 
 /// <summary>
-/// The hosted service that drives <see cref="IdleMonCollector"/>: the startup event, then a loop that collects every metrics
-/// interval and heartbeats every heartbeat interval, and on a clean stop the <c>stopping</c> heartbeat. It is registered after
-/// the sender, so it stops first and the sender flushes what it queued. It is only registered when reporting is enabled.
+/// The hosted service that drives <see cref="IdleMonCollector"/>. It runs two independent loops, each on its own task: the
+/// collection loop (the startup event, then a pass every metrics interval; it reads the database) and the heartbeat loop (a
+/// heartbeat every heartbeat interval; it reads only memory). A database that blocks the collection loop therefore cannot delay
+/// a heartbeat, and the heartbeat then says <c>degraded</c> because the collection made no progress. On a clean stop the
+/// <c>stopping</c> heartbeat is sent. It is registered after the sender, so it stops first and the sender flushes what it
+/// queued. It is only registered when reporting is enabled.
 /// </summary>
 public sealed class IdleMonReportingService(
     IdleMonCollector collector,
@@ -18,6 +21,45 @@ public sealed class IdleMonReportingService(
 {
     /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Task.Run: neither loop may block the host's startup, and a synchronous wait inside one stays inside its own task.
+        var heartbeat = Task.Run(() => HeartbeatLoopAsync(stoppingToken), CancellationToken.None);
+        var collection = Task.Run(() => CollectionLoopAsync(stoppingToken), CancellationToken.None);
+        try
+        {
+            await Task.WhenAll(heartbeat, collection).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown.
+        }
+    }
+
+    private async Task HeartbeatLoopAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                try
+                {
+                    collector.HeartbeatIfDue();
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException and not OperationCanceledException)
+                {
+                    logger.LogWarning("IdleMon heartbeat step failed ({Type}).", ex.GetType().Name);
+                }
+
+                await Task.Delay(collector.DelayUntilNextHeartbeat(), time, stoppingToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown.
+        }
+    }
+
+    private async Task CollectionLoopAsync(CancellationToken stoppingToken)
     {
         try
         {
@@ -37,7 +79,7 @@ public sealed class IdleMonReportingService(
             {
                 try
                 {
-                    await collector.TickAsync(stoppingToken).ConfigureAwait(false);
+                    await collector.CollectIfDueAsync(stoppingToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
                 {
@@ -45,11 +87,11 @@ public sealed class IdleMonReportingService(
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
-                    // Reporting must never hurt the service. No heartbeat is sent for a pass that threw before reaching it.
-                    logger.LogWarning("IdleMon reporting step failed ({Type}).", ex.GetType().Name);
+                    // Reporting must never hurt the service.
+                    logger.LogWarning("IdleMon collection step failed ({Type}).", ex.GetType().Name);
                 }
 
-                await Task.Delay(collector.DelayUntilNextTick(), time, stoppingToken).ConfigureAwait(false);
+                await Task.Delay(collector.DelayUntilNextCollection(), time, stoppingToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
