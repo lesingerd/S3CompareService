@@ -260,7 +260,7 @@ When enabled, the Worker sends to the IdleMon agent **on the same machine only**
 
 | Kind | Content |
 |---|---|
-| Metrics (every `MetricsIntervalSeconds`) | Per job: age of the last completed run, consecutive failures, and the newest completed run's counts (confirmed and in-flight disparities, missing in A/B, size, ETag and content mismatches, sequence gaps, objects compared, match rate, duration, bytes read), plus live progress of a running scan. Service level: enabled, failing, overdue and disparity job counts, active scans. |
+| Metrics (every `MetricsIntervalSeconds`) | Per job: age of the last completed run, consecutive failures, and the newest completed run's counts (confirmed and in-flight disparities, missing in A/B, size, ETag and content mismatches, sequence gaps, objects compared, match rate, duration, bytes read), plus live progress of a running scan. Service level: enabled, failing, overdue and disparity job counts, active scans. Process (the service's own, on by default, see `ProcessMetrics`): `process.memory.private_bytes`, `process.memory.working_set`, `process.gc.heap_bytes` (bytes), `process.gc.heap_limit_percent` (GC heap size as a percent of the memory the GC may use), `process.handles`, `process.threads` (count), `process.cpu.percent` (CPU time delta over wall time over processor count; left out on the first sample), `process.uptime` (seconds). A value that cannot be read is left out, never sent as zero. |
 | Alerts | `run-failed`, `disparities` (the job's own thresholds), `overdue` and `scan-stuck`, per job. They fire and resolve on state changes and are refreshed every metrics interval. Disabling or deleting a job resolves its alerts. |
 | Events | Run completed, failed or cancelled; crash recovery; job created, updated, deleted, enabled, disabled; service start. |
 | Snapshots | `s3c.jobs` (one row per job); `s3c.run.top_disparities` only when `IncludeObjectKeys` is `true`. |
@@ -311,6 +311,7 @@ The `IdleMon` section is read from `appsettings.json` in the install folder and 
 | `OverdueMultiplier` | `2` | The `overdue` alert fires after this many cadences (plus 15 minutes) without a completed run. |
 | `StaleResultMultiplier` | `3` | A job's last result keeps being re-sent for this many cadences (at least 10 minutes); after that IdleMon shows it as stale. |
 | `StuckScanMinutes` | `15` | A running scan whose object count has not changed for this long raises `scan-stuck`. |
+| `ProcessMetrics` | `true` | Send the service's own `process.*` metrics every `MetricsIntervalSeconds` (a few cheap in-process reads, no database access). Only used when `Enabled` is `true`. |
 
 For example, to try it without an agent, run the Worker with `--IdleMon:Enabled=true --IdleMon:DryRunFile=C:\Temp\idlemon.jsonl`. To send for real, use `scripts\configure-idlemon.ps1 -Enable -SetApiKey -Restart` as above. `GET /api/idlemon/status` and `scripts\status-service.ps1` show whether it is sending.
 
