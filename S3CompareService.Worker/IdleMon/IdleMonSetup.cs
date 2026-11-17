@@ -99,7 +99,8 @@ public static class IdleMonSetup
             sp.GetService<IdleMonSpool>(),
             () => sp.GetRequiredService<SchedulerHeartbeat>().LastEvaluation,
             sp.GetRequiredService<TimeProvider>(),
-            sp.GetRequiredService<ILogger<IdleMonCollector>>()));
+            sp.GetRequiredService<ILogger<IdleMonCollector>>(),
+            options.ProcessMetrics ? new ProcessMetricsReader(new CurrentProcessMetricsSource(), sp.GetRequiredService<TimeProvider>()) : null));
 
         // Registration order is start order; the host stops them in reverse: reporting service first (stopping heartbeat), then the sender (final flush).
         services.AddHostedService(sp => sp.GetRequiredService<IdleMonSender>());

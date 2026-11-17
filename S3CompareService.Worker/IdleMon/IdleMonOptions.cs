@@ -54,6 +54,9 @@ public sealed partial class IdleMonOptions
     /// <summary>Gets or sets the minutes without scan progress before the scan-stuck alert fires.</summary>
     public int StuckScanMinutes { get; set; } = 15;
 
+    /// <summary>Gets or sets whether the service reports its own process metrics (<c>process.*</c>: memory, GC heap, handles, threads, CPU, uptime) every metrics interval. On by default; only used when <see cref="Enabled"/> is true.</summary>
+    public bool ProcessMetrics { get; set; } = true;
+
     /// <summary>Gets the resolved dry-run file, or null when not in dry-run mode.</summary>
     public string? ResolvedDryRunFile => string.IsNullOrWhiteSpace(DryRunFile) ? null : Path.GetFullPath(DryRunFile.Trim().Trim('"'));
 
