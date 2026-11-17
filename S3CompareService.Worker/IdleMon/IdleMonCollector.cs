@@ -29,6 +29,7 @@ public sealed class IdleMonCollector
     private readonly Func<DateTimeOffset?> _schedulerLastEvaluation;
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
+    private readonly ProcessMetricsReader? _processMetrics;
 
     private readonly AlertStateMachine _alerts = new();
     private readonly ScanProgressTracker _progress = new();
@@ -59,8 +60,10 @@ public sealed class IdleMonCollector
         IdleMonSpool? spool,
         Func<DateTimeOffset?> schedulerLastEvaluation,
         TimeProvider time,
-        ILogger<IdleMonCollector> logger)
+        ILogger<IdleMonCollector> logger,
+        ProcessMetricsReader? processMetrics = null)
     {
+        _processMetrics = processMetrics;
         _options = options;
         _jobs = jobs;
         _runs = runs;
@@ -146,6 +149,7 @@ public sealed class IdleMonCollector
     public async Task CollectAsync(CancellationToken cancellationToken)
     {
         var now = _time.GetUtcNow();
+        SubmitProcessMetrics(now);
         try
         {
             var active = _activeScans.GetActiveScans();
@@ -192,6 +196,20 @@ public sealed class IdleMonCollector
             _state = previous with { DatabaseError = ex is TimeoutException ? "timed out" : ex.GetType().Name };
             if (Interlocked.Exchange(ref _lastLoggedFailure, 1) == 0)
                 _logger.LogWarning("IdleMon collection failed ({Type}); the heartbeat will say degraded until it works again.", ex.GetType().Name);
+        }
+    }
+
+    // Independent of the database: the process numbers are sent even when the read below fails. They read only the process itself.
+    private void SubmitProcessMetrics(DateTimeOffset now)
+    {
+        if (_processMetrics is null) return;
+        try
+        {
+            foreach (var message in _processMetrics.Build(now)) _reporter.Submit(message);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            _logger.LogWarning("IdleMon process metrics failed ({Type}).", ex.GetType().Name);
         }
     }
 
