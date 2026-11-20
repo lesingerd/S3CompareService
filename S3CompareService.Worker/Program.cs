@@ -168,6 +168,9 @@ static string? ValidateJob(ComparisonJob job)
         try { CronExpression.Parse(job.CronExpression); }
         catch (Exception ex) { return $"Invalid cron expression: {ex.Message}"; }
     }
+    // Throughput overrides: null = service default; anything set must be in range (400 otherwise).
+    var performanceError = ScanOptions.Validate(job.Performance);
+    if (performanceError != null) return performanceError;
     return null;
 }
 
@@ -219,7 +222,12 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator, NotificationDis
         s.LatestStats.InFlightDifferencesCount,
         s.LatestStats.ItemsPerSecond,
         s.LatestStats.CurrentKeyA,
-        s.LatestStats.CurrentKeyB
+        s.LatestStats.CurrentKeyB,
+        s.LatestStats.BucketAObjectsRead,
+        s.LatestStats.BucketBObjectsRead,
+        s.LatestStats.PartitionsTotal,
+        s.LatestStats.PartitionsCompleted,
+        s.LatestStats.PartitionsActive
     }).ToList();
 
     return Results.Ok(new

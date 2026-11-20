@@ -37,6 +37,12 @@ public class ActiveScanDto
     public double ItemsPerSecond { get; set; }
     public string CurrentKeyA { get; set; } = "-";
     public string CurrentKeyB { get; set; } = "-";
+    public long BucketAObjectsRead { get; set; }
+    public long BucketBObjectsRead { get; set; }
+    public int PartitionsTotal { get; set; }
+    public int PartitionsCompleted { get; set; }
+    public int PartitionsActive { get; set; }
+    public string PartitionsDisplay => PartitionsTotal > 0 ? $"{PartitionsCompleted}/{PartitionsTotal} ({PartitionsActive} active)" : "-";
 }
 
 public class DifferencePageResult

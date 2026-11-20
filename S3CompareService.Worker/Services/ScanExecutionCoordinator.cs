@@ -179,7 +179,8 @@ public class ScanExecutionCoordinator
     {
         var cts = new CancellationTokenSource();
         var token = cts.Token;
-        var engine = new ServiceComparisonEngine(job, run, _scanRunRepo, _diffRepo, _auditLogRepo, checkpoint, options: _scanOptions);
+        // Service-wide defaults with the job's own throughput overrides (Performance) applied.
+        var engine = new ServiceComparisonEngine(job, run, _scanRunRepo, _diffRepo, _auditLogRepo, checkpoint, options: _scanOptions.ForJob(job));
 
         var context = new ActiveScanContext
         {

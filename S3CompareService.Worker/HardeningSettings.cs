@@ -28,17 +28,42 @@ public static class HardeningSettings
         return options;
     }
 
-    /// <summary>Reads the scan limits.</summary>
+    /// <summary>
+    /// Reads the scan limits and the parallel-scan throughput defaults (<c>S3Compare:MaxParallelPartitions</c>,
+    /// <c>PrefetchPages</c>, <c>MaxObjectsPerSecond</c>, <c>MaxConcurrentContentChecks</c>, <c>MaxDiscoveryRequests</c>,
+    /// <c>PartitionOversubscription</c>, <c>MaxDiscoveryDepth</c>). A missing or out-of-range value keeps its default.
+    /// </summary>
     public static ScanOptions Scan(IConfiguration configuration)
     {
         var options = new ScanOptions();
         if (long.TryParse(configuration["S3Compare:MaxRecordedDifferencesPerRun"], out var cap) && cap >= 0)
             options.MaxRecordedDifferencesPerRun = cap;
-        if (double.TryParse(configuration["S3Compare:MaxListRequestsPerSecond"], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rate)
-            && rate >= 0 && !double.IsNaN(rate) && !double.IsInfinity(rate))
+        if (TryDouble(configuration["S3Compare:MaxListRequestsPerSecond"], ScanOptions.MaxListRequestsPerSecondLimit, out var rate))
             options.MaxListRequestsPerSecond = rate;
+        if (TryDouble(configuration["S3Compare:MaxObjectsPerSecond"], ScanOptions.MaxObjectsPerSecondLimit, out var objects))
+            options.MaxObjectsPerSecond = objects;
+        if (TryInt(configuration["S3Compare:MaxParallelPartitions"], 1, ScanOptions.MaxParallelPartitionsLimit, out var partitions))
+            options.MaxParallelPartitions = partitions;
+        if (TryInt(configuration["S3Compare:PrefetchPages"], 1, ScanOptions.PrefetchPagesLimit, out var prefetch))
+            options.PrefetchPages = prefetch;
+        if (TryInt(configuration["S3Compare:MaxConcurrentContentChecks"], 1, ScanOptions.MaxConcurrentContentChecksLimit, out var checks))
+            options.MaxConcurrentContentChecks = checks;
+        if (TryInt(configuration["S3Compare:MaxDiscoveryRequests"], 0, ScanOptions.MaxDiscoveryRequestsLimit, out var discovery))
+            options.MaxDiscoveryRequests = discovery;
+        if (TryInt(configuration["S3Compare:PartitionOversubscription"], 1, ScanOptions.PartitionOversubscriptionLimit, out var oversub))
+            options.PartitionOversubscription = oversub;
+        if (TryInt(configuration["S3Compare:MaxDiscoveryDepth"], 0, ScanOptions.MaxDiscoveryDepthLimit, out var depth))
+            options.MaxDiscoveryDepth = depth;
         return options;
     }
+
+    private static bool TryDouble(string? text, double max, out double value) =>
+        double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value)
+        && value >= 0 && value <= max && !double.IsNaN(value) && !double.IsInfinity(value);
+
+    private static bool TryInt(string? text, int min, int max, out int value) =>
+        int.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value)
+        && value >= min && value <= max;
 
     /// <summary>Parses a priority name. Empty or unknown means BelowNormal; RealTime is refused (it can starve the host).</summary>
     public static ProcessPriorityClass ParsePriority(string? value)

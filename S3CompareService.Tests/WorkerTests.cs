@@ -169,6 +169,35 @@ public class WorkerApiTests
         Assert.IsNotNull(resp.Content.Headers.ContentDisposition?.FileName);
         Assert.IsTrue((await resp.Content.ReadAsStringAsync()).Contains("Id,Key,Type"));
     }
+
+    [TestMethod]
+    public async Task Jobs_PerformanceOverrides_AreValidated_AndPersisted()
+    {
+        var bad = NewJob("p1");
+        bad.Performance.MaxParallelPartitions = 0;
+        var resp = await _client.PutAsJsonAsync("/api/jobs/p1", bad);
+        Assert.AreEqual(HttpStatusCode.BadRequest, resp.StatusCode);
+        StringAssert.Contains(await resp.Content.ReadAsStringAsync(), "MaxParallelPartitions");
+
+        bad.Performance.MaxParallelPartitions = null;
+        bad.Performance.MaxObjectsPerSecond = -1;
+        Assert.AreEqual(HttpStatusCode.BadRequest, (await _client.PostAsJsonAsync("/api/jobs", bad)).StatusCode);
+        bad.Performance.MaxObjectsPerSecond = null;
+        bad.Performance.PrefetchPages = 1000;
+        Assert.AreEqual(HttpStatusCode.BadRequest, (await _client.PutAsJsonAsync("/api/jobs/p1", bad)).StatusCode);
+
+        var good = NewJob("p1");
+        good.Performance.MaxParallelPartitions = 16;
+        good.Performance.MaxObjectsPerSecond = 2500.5;
+        good.Performance.MaxDiscoveryRequests = 0;
+        Assert.AreEqual(HttpStatusCode.OK, (await _client.PutAsJsonAsync("/api/jobs/p1", good)).StatusCode);
+
+        var loaded = (await _client.GetFromJsonAsync<ComparisonJob>("/api/jobs/p1"))!;
+        Assert.AreEqual(16, loaded.Performance.MaxParallelPartitions);
+        Assert.AreEqual(2500.5, loaded.Performance.MaxObjectsPerSecond);
+        Assert.AreEqual(0, loaded.Performance.MaxDiscoveryRequests);
+        Assert.IsNull(loaded.Performance.PrefetchPages, "unset overrides stay null (service default)");
+    }
 }
 
 [TestClass]

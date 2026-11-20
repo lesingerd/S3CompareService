@@ -414,6 +414,17 @@
                     <TextBlock Text="{Binding CurrentActiveScan.ItemsPerSecond, StringFormat={}{0:N0} obj/s}" FontWeight="SemiBold" Foreground="#81C784" Margin="0,0,16,0" />
                     <TextBlock Text="Evaluated: " Foreground="#A5D6A7" />
                     <TextBlock Text="{Binding CurrentActiveScan.ObjectsCompared, StringFormat={}{0:N0}}" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,16,0" />
+                    <TextBlock Text="Read A/B: " Foreground="#A5D6A7" ToolTip="Objects listed and compared from Bucket A and Bucket B so far" />
+                    <TextBlock FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,16,0">
+                        <TextBlock.Text>
+                            <MultiBinding StringFormat="{}{0:N0} / {1:N0}">
+                                <Binding Path="CurrentActiveScan.BucketAObjectsRead" />
+                                <Binding Path="CurrentActiveScan.BucketBObjectsRead" />
+                            </MultiBinding>
+                        </TextBlock.Text>
+                    </TextBlock>
+                    <TextBlock Text="Partitions: " Foreground="#A5D6A7" ToolTip="Key ranges completed / total, and how many are being compared right now" />
+                    <TextBlock Text="{Binding CurrentActiveScan.PartitionsDisplay}" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,16,0" />
                     <TextBlock Text="Matched: " Foreground="#A5D6A7" />
                     <TextBlock Text="{Binding CurrentActiveScan.MatchedCount, StringFormat={}{0:N0}}" FontWeight="SemiBold" Foreground="#4EC9B0" Margin="0,0,16,0" />
                     <TextBlock Text="Raw Diffs: " Foreground="#A5D6A7" />
@@ -638,6 +649,72 @@
                                             <TextBlock Text="🛡️ REPLICATION LAG SHIELD: Objects modified within the grace period (e.g. 15 min) prior to scan are recorded with full raw metadata but tagged as [IN-FLIGHT REPLICATION] so in-progress bucket replication does not trigger false alarms. Reports can filter these cleanly while retaining 100% complete raw data." 
                                                        FontSize="11" Foreground="#FFD166" TextWrapping="Wrap" />
                                         </Border>
+                                    </StackPanel>
+                                </Border>
+
+                                <!-- Performance / Throttling (per-job overrides; empty = service default from appsettings S3Compare:*) -->
+                                <Border Background="#2D2D30" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,0,0,16">
+                                    <StackPanel>
+                                        <TextBlock Text="PERFORMANCE / THROTTLING" FontWeight="Bold" Foreground="#DCDCAA" Margin="0,0,0,4" />
+                                        <TextBlock Text="Leave a field empty to use the service default (appsettings S3Compare:*). Throughput is roughly partitions x 1,000 keys per list round trip, capped by the list request rate x 1,000 keys per bucket."
+                                                   FontSize="11" Foreground="#888888" TextWrapping="Wrap" Margin="0,0,0,8" />
+
+                                        <Grid Margin="0,0,0,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="Parallel Partitions:" VerticalAlignment="Center"
+                                                       ToolTip="Key ranges compared at the same time (default 8). 1 = no partitioning: one listing per bucket, still with prefetch. More partitions = more S3 list requests in flight." />
+                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.Performance.MaxParallelPartitions, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="1 to 256. Empty = service default (S3Compare:MaxParallelPartitions, 8)." />
+                                            <TextBlock Grid.Column="3" Text="Prefetch Pages:" VerticalAlignment="Center"
+                                                       ToolTip="List pages (1,000 keys each) each listing fetches ahead of the comparison, per partition and bucket (default 2). Memory is about pages x partitions x 2 x 1,000 keys." />
+                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.Performance.PrefetchPages, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="1 to 64. Empty = service default (S3Compare:PrefetchPages, 2)." />
+                                        </Grid>
+
+                                        <Grid Margin="0,0,0,8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="Max List Requests / sec (per bucket):" VerticalAlignment="Center"
+                                                       ToolTip="S3 requests per second per bucket side, shared by all partitions, the planner and Full Data reads (default 20). One list request returns up to 1,000 keys. 0 = unlimited." />
+                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.Performance.MaxListRequestsPerSecond, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="0 to 100000 (0 = unlimited). Empty = service default (S3Compare:MaxListRequestsPerSecond, 20)." />
+                                            <TextBlock Grid.Column="3" Text="Max Objects / sec (all partitions):" VerticalAlignment="Center"
+                                                       ToolTip="Cap on compared keys per second across all partitions, for when a scan is too fast for the endpoint or the server. 0 = unlimited (default)." />
+                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.Performance.MaxObjectsPerSecond, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="0 to 100000000 (0 = unlimited). Empty = service default (S3Compare:MaxObjectsPerSecond, 0)." />
+                                        </Grid>
+
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="Max Content Checks (Full Data):" VerticalAlignment="Center"
+                                                       ToolTip="Full Data mode only: object pairs downloaded and compared at the same time across all partitions (default 8)." />
+                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.Performance.MaxConcurrentContentChecks, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="1 to 256. Empty = service default (S3Compare:MaxConcurrentContentChecks, 8)." />
+                                            <TextBlock Grid.Column="3" Text="Max Planning Requests:" VerticalAlignment="Center"
+                                                       ToolTip="Most S3 requests the partition planner may send at scan start to find key-range boundaries (default 500). 0 = no planning: the scan runs as one range." />
+                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.Performance.MaxDiscoveryRequests, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                     ToolTip="0 to 100000. Empty = service default (S3Compare:MaxDiscoveryRequests, 500)." />
+                                        </Grid>
                                     </StackPanel>
                                 </Border>
 
