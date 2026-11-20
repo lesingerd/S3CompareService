@@ -30,10 +30,44 @@ public class ComparisonStatistics
     public double GCTotalMemoryMB { get; set; }
     public string LastCheckpointKey { get; set; } = "-";
     public DateTime? LastCheckpointTime { get; set; }
+
+    // Key-range partitioning (see README "Parallel scanning"). A non-partitioned scan has one range.
+    public int PartitionsTotal { get; set; }
+    public int PartitionsCompleted { get; set; }
+    public int PartitionsActive { get; set; }
+}
+
+/// <summary>
+/// One key range of a partitioned scan, over keys RELATIVE to each bucket's own prefix: (<see cref="Lower"/> exclusive,
+/// <see cref="Upper"/> inclusive]. A null <see cref="Lower"/> is the start of the keyspace, a null <see cref="Upper"/> its end.
+/// The ranges of a plan tile the keyspace exactly, in order. Also the persisted per-range progress of a checkpoint.
+/// </summary>
+public sealed class PartitionRange
+{
+    public string? Lower { get; set; }
+    public string? Upper { get; set; }
+
+    /// <summary>The last relative key of this range whose differences are durably stored, or null when none was processed yet.</summary>
+    public string? LastCompletedKey { get; set; }
+
+    /// <summary>True when every key of the range has been processed.</summary>
+    public bool Completed { get; set; }
+
+    /// <summary>The relative key a listing of this range starts after: <see cref="LastCompletedKey"/>, else <see cref="Lower"/> (null = from the start).</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? ResumeAfter => LastCompletedKey ?? Lower;
+
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool HasProgress => Completed || LastCompletedKey != null;
+
+    public PartitionRange Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed };
+
+    public override string ToString() => $"({Lower ?? "-inf"}, {Upper ?? "+inf"}]{(Completed ? " done" : LastCompletedKey != null ? " @" + LastCompletedKey : string.Empty)}";
 }
 
 public class ScanCheckpoint
 {
+    /// <summary>1 = single key (<see cref="LastEvaluatedKey"/>); 2 = partition plan in <see cref="Partitions"/>.</summary>
     public int Version { get; set; } = 1;
     public string ScanRunId { get; set; } = string.Empty;
     public string JobId { get; set; } = string.Empty;
@@ -81,6 +115,18 @@ public class ScanCheckpoint
 
     public bool DetectSequenceGaps { get; set; } = true;
     public int MaxSequenceGapThreshold { get; set; } = 25;
+
+    /// <summary>
+    /// The partition plan with per-range progress (version 2). Stored in its own column (<c>Checkpoints.PartitionPlanJson</c>),
+    /// not in the checkpoint JSON. Null for a version 1 checkpoint, which resumes as one range after <see cref="LastEvaluatedKey"/>.
+    /// For a plan, <see cref="LastEvaluatedKey"/> is the frontier: every key up to it is done (other ranges may be further).
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public List<PartitionRange>? Partitions { get; set; }
+
+    /// <summary>True when the checkpoint records any progress to continue from.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool CanResume => HasKey || (Partitions?.Any(p => p.HasProgress) ?? false);
 }
 
 public class ServiceAuditLog

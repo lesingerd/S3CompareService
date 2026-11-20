@@ -12,7 +12,7 @@ public class DatabaseMigrator
     }
 
     /// <summary>Latest schema version. Bump and add a step in <see cref="ApplyStepAsync"/> for every schema change.</summary>
-    public const int LatestVersion = 3;
+    public const int LatestVersion = 4;
 
     public async Task MigrateAsync(CancellationToken cancellationToken = default)
     {
@@ -60,6 +60,16 @@ public class DatabaseMigrator
                 await conn.ExecuteAsync(new CommandDefinition("DROP INDEX IF EXISTS IX_ScanRuns_JobId;", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
                 // Set when a run hit the recorded-differences cap (counters stay exact, rows stop at the cap).
                 await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "DifferencesTruncated", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
+                break;
+            case 4:
+                // Parallel scanning. The partition plan of a checkpoint (key ranges with per-range progress) is stored as JSON
+                // next to the checkpoint JSON; NULL means a version 1 (single key) checkpoint. Jobs get optional throughput
+                // overrides (JobPerformanceSettings as JSON; NULL = service defaults).
+                await AddColumnIfMissingAsync(conn, trans, "Checkpoints", "PartitionPlanJson", "TEXT", ct).ConfigureAwait(false);
+                await AddColumnIfMissingAsync(conn, trans, "Jobs", "Performance_Json", "TEXT", ct).ConfigureAwait(false);
+                // Exports and per-range resume clean-up read differences by (ScanRunId, Key); version 2 created this index,
+                // repeated here so a database that lost it still gets it.
+                await conn.ExecuteAsync(new CommandDefinition("CREATE INDEX IF NOT EXISTS IX_Differences_ScanRun_Key ON RecordedDifferences (ScanRunId, Key);", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
                 break;
             default:
                 throw new InvalidOperationException($"No migration defined for schema version {version}.");

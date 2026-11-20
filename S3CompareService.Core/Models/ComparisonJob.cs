@@ -29,6 +29,9 @@ public class ComparisonJob
 
     public JobAlertConfig AlertConfig { get; set; } = new();
 
+    /// <summary>Optional per-job throughput overrides (null values use the service-wide <c>S3Compare:*</c> defaults).</summary>
+    public JobPerformanceSettings Performance { get; set; } = new();
+
     public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime? LastRunTimeUtc { get; set; }

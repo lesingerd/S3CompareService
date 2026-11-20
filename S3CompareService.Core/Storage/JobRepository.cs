@@ -96,12 +96,12 @@ public class JobRepository : IJobRepository
             INSERT INTO Jobs (
                 Id, Name, Description, BucketA_Json, BucketB_Json, Mode, ScheduleType,
                 IntervalMinutes, CronExpression, IsEnabled, ReplicationGracePeriodMinutes,
-                DetectSequenceGaps, MaxSequenceGapThreshold, AlertConfig_Json, CreatedAtUtc, UpdatedAtUtc,
+                DetectSequenceGaps, MaxSequenceGapThreshold, AlertConfig_Json, Performance_Json, CreatedAtUtc, UpdatedAtUtc,
                 LastRunTimeUtc, NextRunTimeUtc, LastRunStatus
             ) VALUES (
                 @Id, @Name, @Description, @BucketA_Json, @BucketB_Json, @Mode, @ScheduleType,
                 @IntervalMinutes, @CronExpression, @IsEnabled, @ReplicationGracePeriodMinutes,
-                @DetectSequenceGaps, @MaxSequenceGapThreshold, @AlertConfig_Json, @CreatedAtUtc, @UpdatedAtUtc,
+                @DetectSequenceGaps, @MaxSequenceGapThreshold, @AlertConfig_Json, @Performance_Json, @CreatedAtUtc, @UpdatedAtUtc,
                 @LastRunTimeUtc, @NextRunTimeUtc, @LastRunStatus
             )
             ON CONFLICT(Id) DO UPDATE SET
@@ -118,6 +118,7 @@ public class JobRepository : IJobRepository
                 DetectSequenceGaps = excluded.DetectSequenceGaps,
                 MaxSequenceGapThreshold = excluded.MaxSequenceGapThreshold,
                 AlertConfig_Json = excluded.AlertConfig_Json,
+                Performance_Json = excluded.Performance_Json,
                 UpdatedAtUtc = excluded.UpdatedAtUtc;
         ";
 
@@ -137,6 +138,7 @@ public class JobRepository : IJobRepository
             DetectSequenceGaps = job.DetectSequenceGaps ? 1 : 0,
             job.MaxSequenceGapThreshold,
             AlertConfig_Json = SerializeAlertConfig(job.AlertConfig),
+            Performance_Json = job.Performance == null || job.Performance.IsEmpty ? null : JsonSerializer.Serialize(job.Performance),
             CreatedAtUtc = DbDateTime.ToDb(job.CreatedAtUtc),
             UpdatedAtUtc = DbDateTime.ToDb(job.UpdatedAtUtc),
             LastRunTimeUtc = DbDateTime.ToDb(job.LastRunTimeUtc),
@@ -286,6 +288,11 @@ public class JobRepository : IJobRepository
             job.AlertConfig.LastAlertSentUtc = DbDateTime.ToUtc(job.AlertConfig.LastAlertSentUtc);
             job.AlertConfig.LastDailyDigestSentUtc = DbDateTime.ToUtc(job.AlertConfig.LastDailyDigestSentUtc);
             SecretProtector.Transform(job.AlertConfig, SafeUnprotect);
+        }
+
+        if (r is IDictionary<string, object> row && row.TryGetValue("Performance_Json", out var perfJson) && perfJson is string perfStr && !string.IsNullOrWhiteSpace(perfStr))
+        {
+            job.Performance = JsonSerializer.Deserialize<JobPerformanceSettings>(perfStr) ?? new();
         }
 
         return job;

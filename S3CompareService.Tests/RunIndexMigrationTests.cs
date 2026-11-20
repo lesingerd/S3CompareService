@@ -60,7 +60,7 @@ public class RunIndexMigrationTests : TestDbBase
         var indexes = await IndexesOfScanRunsAsync();
         CollectionAssert.Contains(indexes, "IX_ScanRuns_JobId_StartTimeUtc");
         CollectionAssert.DoesNotContain(indexes, "IX_ScanRuns_JobId");
-        Assert.AreEqual(3, await RawScalarAsync<int>("PRAGMA user_version"));
+        Assert.AreEqual(DatabaseMigrator.LatestVersion, await RawScalarAsync<int>("PRAGMA user_version"));
         var loaded = await RunRepo.GetByIdAsync(run.Id);
         Assert.IsNotNull(loaded);
         Assert.IsFalse(loaded.DifferencesTruncated);
