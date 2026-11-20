@@ -4,6 +4,11 @@ using S3CompareService.Core.Models;
 
 namespace S3CompareService.Core.Engine;
 
+/// <summary>
+/// Sequential listing over an <see cref="IAmazonS3"/>: the next page is requested only when the buffer is empty. The scan engine
+/// uses <see cref="PrefetchingObjectStream"/> instead, which fetches ahead in the background; this type is kept for callers that
+/// want the simple behaviour.
+/// </summary>
 public class S3PagingEnumerator : IS3ObjectStream
 {
     private readonly IAmazonS3 _s3Client;
@@ -81,14 +86,7 @@ public class S3PagingEnumerator : IS3ObjectStream
             var pageItems = new List<S3ObjectSummary>(objects.Count);
             foreach (var obj in objects)
             {
-                var summary = new S3ObjectSummary
-                {
-                    Key = obj.Key,
-                    Size = obj.Size ?? 0,
-                    ETag = (obj.ETag ?? string.Empty).Trim('\"'),
-                    LastModified = obj.LastModified?.ToUniversalTime() ?? DateTime.MinValue,
-                    StorageClass = obj.StorageClass?.Value ?? "STANDARD"
-                };
+                var summary = S3Lister.ToSummary(obj);
                 pageItems.Add(summary);
                 _currentBuffer.Enqueue(summary);
             }

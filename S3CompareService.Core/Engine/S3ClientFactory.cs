@@ -30,7 +30,11 @@ public static class S3ClientFactory
         };
     }
 
-    public static AmazonS3Client CreateClient(S3BucketConfig config)
+    /// <summary>
+    /// Creates a client for one bucket. <paramref name="maxConnections"/> sets the HTTP connections the client may open to the
+    /// endpoint; a parallel scan passes enough for all its partitions (two listings in flight each) plus the content checks.
+    /// </summary>
+    public static AmazonS3Client CreateClient(S3BucketConfig config, int? maxConnections = null)
     {
         var credentials = new BasicAWSCredentials(config.AccessKey.Trim(), config.SecretKey.Trim());
         
@@ -40,6 +44,11 @@ public static class S3ClientFactory
             Timeout = TimeSpan.FromSeconds(45),
             MaxErrorRetry = 3
         };
+
+        if (maxConnections is int connections && connections > 0)
+        {
+            s3Config.MaxConnectionsPerServer = connections;
+        }
 
         if (!string.IsNullOrWhiteSpace(config.EndpointUrl))
         {
@@ -59,6 +68,13 @@ public static class S3ClientFactory
 
         return new AmazonS3Client(credentials, s3Config);
     }
+
+    /// <summary>
+    /// HTTP connections one bucket's client needs for a scan: each partition can have a list request and (Full Data) an object
+    /// read in flight, plus headroom for the planner and retries. Never below 16.
+    /// </summary>
+    public static int ConnectionsForScan(int parallelPartitions, int contentChecks) =>
+        Math.Max(16, 2 * Math.Max(1, parallelPartitions) + Math.Max(0, contentChecks) + 4);
 
     public static async Task<(bool Success, string Message)> TestConnectionAsync(
         S3BucketConfig config, 
