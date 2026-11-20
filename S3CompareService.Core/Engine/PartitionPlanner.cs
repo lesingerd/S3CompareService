@@ -11,9 +11,11 @@ namespace S3CompareService.Core.Engine;
 /// <list type="number">
 /// <item>Delimiter discovery: "/" listings under the prefix on both buckets; the union of the common prefixes is the candidate
 /// set. It descends level by level (up to <c>maxDiscoveryDepth</c>) until there are at least <c>targetPartitions</c> candidates.</item>
-/// <item>Probe fallback for flat or shallow namespaces: for each printable ASCII character, a MaxKeys=1 listing with
-/// StartAfter = prefix + probe on both buckets; the keys found are the candidates. If still too few, it probes one character
-/// deeper below the prefixes found (up to 4 rounds, sized to the remaining budget).</item>
+/// <item>Probe fallback for flat or shallow namespaces, below the deepest "/" level found (or the whole keyspace): each base
+/// first jumps to the longest prefix all its keys share (so <c>file_00001.dat</c> style names split where they differ),
+/// then MaxKeys=1 listings with StartAfter = prefix + base + character find real keys as candidates, coarse to fine: evenly
+/// spaced characters first, then one character deeper below the prefixes found (up to 4 rounds). The budget is split
+/// evenly over rounds, bases and the two buckets (each probe goes to one bucket, alternating).</item>
 /// </list>
 /// The candidates are sorted and <c>targetPartitions - 1</c> of them, evenly spaced, become the boundaries. Correctness never
 /// depends on the quality of the plan: <see cref="BuildRanges"/> always returns ranges that tile the whole keyspace exactly.
@@ -26,7 +28,7 @@ public sealed class PartitionPlanner
     private const int MaxPagesPerPrefixListing = 10;
     private const int MaxConcurrentPlannerRequests = 8;
     private const int MaxProbeRounds = 4;
-    private const int MaxInitialProbeBases = 32;
+
 
     /// <summary>Characters probed when the budget does not allow the whole alphabet (ASCII order).</summary>
     private const string CommonKeyChars = "-./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
@@ -38,6 +40,7 @@ public sealed class PartitionPlanner
     private readonly int _maxRequests;
     private int _requestsUsed;
     private List<string>? _deepestLevel;
+    private readonly Func<CancellationToken, Task>? _pauseGate;
 
     private sealed record Side(IS3Lister Lister, string Bucket, string Prefix, IRequestRateLimiter? Limiter);
 
@@ -46,13 +49,15 @@ public sealed class PartitionPlanner
         IS3Lister listerB, string bucketB, string? prefixB, IRequestRateLimiter? limiterB,
         int targetPartitions,
         int maxDiscoveryDepth = ScanOptions.DefaultMaxDiscoveryDepth,
-        int maxRequests = ScanOptions.DefaultMaxDiscoveryRequests)
+        int maxRequests = ScanOptions.DefaultMaxDiscoveryRequests,
+        Func<CancellationToken, Task>? pauseGate = null)
     {
         _a = new Side(listerA ?? throw new ArgumentNullException(nameof(listerA)), bucketA, prefixA ?? string.Empty, limiterA);
         _b = new Side(listerB ?? throw new ArgumentNullException(nameof(listerB)), bucketB, prefixB ?? string.Empty, limiterB);
         _targetPartitions = Math.Max(1, targetPartitions);
         _maxDepth = Math.Max(0, maxDiscoveryDepth);
         _maxRequests = Math.Max(0, maxRequests);
+        _pauseGate = pauseGate;
     }
 
     /// <summary>S3 requests sent by <see cref="PlanAsync"/>.</summary>
@@ -134,7 +139,7 @@ public sealed class PartitionPlanner
         for (int page = 0; page < MaxPagesPerPrefixListing; page++)
         {
             if (!TryTakeRequest()) break;
-            if (side.Limiter != null) await side.Limiter.WaitAsync(ct).ConfigureAwait(false);
+            await BeforeRequestAsync(side, ct).ConfigureAwait(false);
             var response = await side.Lister.ListPageAsync(side.Bucket, listPrefix, null, token, "/", 1000, ct).ConfigureAwait(false);
             foreach (var cp in response.CommonPrefixes)
             {
@@ -149,53 +154,208 @@ public sealed class PartitionPlanner
     // ---------------- 2. probe fallback ----------------
 
     /// <summary>
-    /// Iterative deepening over key prefixes ("bases"). Round 0 probes every character after each base; each later round
-    /// probes one character deeper, below the prefixes the previous round found, with as many characters as the remaining
-    /// budget allows. So keys that share a long common prefix (zero-padded numbers, one big folder) still get boundaries.
-    /// The first bases are the start of the keyspace plus the deepest "/" level found by discovery (when it is small).
+    /// A key prefix whose keys are to be split further: the first key known under it (null = not looked up yet) and which
+    /// buckets have keys under it.
+    /// </summary>
+    private sealed record ProbeBase(string Prefix, string? FirstKey, bool OnA, bool OnB);
+
+    /// <summary>
+    /// Probes within the budget, coarse to fine. The bases are the deepest "/" level discovery found (or the start of the
+    /// keyspace). Each base first jumps to the longest prefix all of its keys share (cheap, not a probe round), so names
+    /// like <c>file_00001.dat</c> or <c>logs-2024-01-01</c> are split where they actually differ. Then each round probes
+    /// evenly spaced characters after every base (MaxKeys=1, StartAfter = prefix + base + char, one bucket per probe,
+    /// alternating), and the next round refines one character below the prefixes it found (again jumping over shared
+    /// prefixes). Each round may spend half of the remaining budget (the last round all of it), shared evenly by its bases.
     /// </summary>
     private async Task<bool> ProbeAsync(SortedSet<string> candidates, CancellationToken ct)
     {
-        bool any = false;
-        var bases = new List<string> { string.Empty };
-        if (_deepestLevel is { Count: > 0 and <= MaxInitialProbeBases }) bases.AddRange(_deepestLevel);
+        int before = candidates.Count;
+        var roots = _deepestLevel is { Count: > 0 } level ? level.ToList() : new List<string> { string.Empty };
+        int maxRoots = Math.Max(1, Remaining / 4);
+        if (roots.Count > maxRoots) roots = EvenlySpaced(roots, maxRoots);
+
+        // Shared-prefix jump for the roots: at most half of the budget, split evenly.
+        int jumpBudget = Math.Max(2, Remaining / (2 * roots.Count));
+        var bases = await JumpAllAsync(roots.Select(r => new ProbeBase(r, null, true, true)).ToList(), jumpBudget, candidates, ct).ConfigureAwait(false);
 
         for (int round = 0; round < MaxProbeRounds && bases.Count > 0 && candidates.Count < _targetPartitions; round++)
         {
-            int remaining = _maxRequests - RequestsUsed;
-            if (remaining < 2) break;
+            int remaining = Remaining;
+            if (remaining <= 0) break;
             int roundsLeft = MaxProbeRounds - round;
-            int maxProbes = remaining / 2;
-            if (bases.Count > maxProbes) bases = EvenlySpaced(bases, maxProbes);
-            int perBase = round == 0
-                ? ProbeAlphabet.Length
-                : Math.Clamp(remaining / (2 * bases.Count * roundsLeft), 1, ProbeAlphabet.Length);
-            var chars = ProbeChars(perBase);
+            int spend = roundsLeft == 1 ? remaining : Math.Max(1, remaining / 2);
+            if (bases.Count > spend) bases = EvenlySpaced(bases, spend);
+            int perBase = Math.Max(1, spend / bases.Count);
 
-            var probes = bases.SelectMany(b => chars.Select(c => (Base: b, Probe: b + c))).ToList();
+            var probes = new List<(ProbeBase Base, string Probe, Side Side)>();
+            for (int bi = 0; bi < bases.Count; bi++)
+            {
+                var b = bases[bi];
+                var chars = ProbeChars(MinNextChar(b), perBase);
+                for (int i = 0; i < chars.Count; i++) probes.Add((b, b.Prefix + chars[i], PickSide(b, bi + i)));
+            }
+            if (probes.Count == 0) break;
+
             var found = await RunProbesAsync(probes, ct).ConfigureAwait(false);
-            if (found.Count > 0) any = true;
-            candidates.UnionWith(found.Select(f => f.Key));
+            lock (candidates) candidates.UnionWith(found.Select(f => f.Key));
 
-            // Next round: one character deeper below every prefix this round found keys under.
-            bases = found
-                .Where(f => f.Key.Length > f.Base.Length + 1 && f.Key.StartsWith(f.Base, StringComparison.Ordinal))
-                .Select(f => f.Key.Substring(0, f.Base.Length + 1))
-                .Distinct(StringComparer.Ordinal)
-                .OrderBy(b => b, Utf8OrdinalComparer.Instance)
-                .ToList();
+            // Next round: one character below every prefix that has keys (the probe hits and each base's first key), keeping
+            // the first key seen under each new prefix.
+            var next = new Dictionary<string, ProbeBase>(StringComparer.Ordinal);
+            var seen = found.Concat(bases.Where(b => b.FirstKey != null).Select(b => (Base: b, Key: b.FirstKey!)));
+            foreach (var (b, key) in seen)
+            {
+                if (!key.StartsWith(b.Prefix, StringComparison.Ordinal)) continue;
+                int cut = CutAfter(key, b.Prefix.Length);
+                if (key.Length <= cut) continue; // the key is the prefix itself: nothing below it to split
+                string sub = key.Substring(0, cut);
+                if (!next.TryGetValue(sub, out var existing) || Utf8OrdinalComparer.CompareStatic(key, existing.FirstKey) < 0)
+                    next[sub] = new ProbeBase(sub, key, b.OnA, b.OnB);
+            }
+            bases = next.Values.OrderBy(p => p.Prefix, Utf8OrdinalComparer.Instance).ToList();
+
+            // Jump over shared prefixes below the new bases too, when the budget easily allows it (a check costs 1-2 requests).
+            if (bases.Count > 0 && Remaining >= bases.Count * 8)
+            {
+                bases = await JumpAllAsync(bases, Math.Max(2, Remaining / (4 * bases.Count)), candidates, ct).ConfigureAwait(false);
+            }
         }
-        return any;
+        return candidates.Count > before;
+    }
+
+    private int Remaining => Math.Max(0, _maxRequests - Volatile.Read(ref _requestsUsed));
+
+    private async Task<List<ProbeBase>> JumpAllAsync(List<ProbeBase> bases, int budgetEach, SortedSet<string> candidates, CancellationToken ct)
+    {
+        var result = new List<ProbeBase>();
+        var gate = new object();
+        await Parallel.ForEachAsync(bases, new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentPlannerRequests, CancellationToken = ct }, async (b, token) =>
+        {
+            var jumped = await JumpAsync(b, budgetEach, candidates, token).ConfigureAwait(false);
+            if (jumped != null) lock (gate) result.Add(jumped);
+        }).ConfigureAwait(false);
+        return result.OrderBy(p => p.Prefix, Utf8OrdinalComparer.Instance).ToList();
     }
 
     /// <summary>
-    /// <paramref name="count"/> probe characters: the whole alphabet, or the common key characters (digits, letters, - . / _)
-    /// evenly spaced when the budget allows fewer.
+    /// Extends <paramref name="b"/> to the longest prefix that every key under it shares (in both buckets), using at most
+    /// <paramref name="budget"/> requests. Looks up the first key under the base if not known (null result: no keys at all).
+    /// A prefix p is shared when the first key after p + U+10FFFF (the highest code point, so past every key starting with
+    /// p) no longer starts with the base. The shortest extension is tested first, so a base without a long shared prefix
+    /// costs one check; otherwise a binary search over the first key's length finds the longest one.
     /// </summary>
-    private static List<char> ProbeChars(int count)
+    private async Task<ProbeBase?> JumpAsync(ProbeBase b, int budget, SortedSet<string> candidates, CancellationToken ct)
     {
-        if (count >= ProbeAlphabet.Length) return ProbeAlphabet.ToList();
-        return EvenlySpaced(CommonKeyChars.ToList(), Math.Min(count, CommonKeyChars.Length));
+        int used = 0;
+        bool Take() => used++ < budget;
+        void Add(string key) { lock (candidates) candidates.Add(key); }
+
+        string? first = b.FirstKey;
+        bool onA = b.OnA, onB = b.OnB;
+        string common;
+        if (first == null)
+        {
+            string? fa = onA && Take() ? await ProbeOneAsync(_a, b.Prefix, ct).ConfigureAwait(false) : null;
+            string? fb = onB && Take() ? await ProbeOneAsync(_b, b.Prefix, ct).ConfigureAwait(false) : null;
+            if (fa != null && !fa.StartsWith(b.Prefix, StringComparison.Ordinal)) { Add(fa); fa = null; }
+            if (fb != null && !fb.StartsWith(b.Prefix, StringComparison.Ordinal)) { Add(fb); fb = null; }
+            if (fa == null && fb == null) return Remaining > 0 ? null : b; // no keys under it (or no budget to tell)
+            onA = fa != null;
+            onB = fb != null;
+            if (fa != null) Add(fa);
+            if (fb != null) Add(fb);
+            first = fa == null ? fb! : fb == null ? fa : Utf8OrdinalComparer.CompareStatic(fa, fb) <= 0 ? fa : fb;
+            common = fa == null ? fb! : fb == null ? fa : CommonPrefix(fa, fb);
+        }
+        else
+        {
+            common = first;
+        }
+
+        // Valid cut positions beyond the base (never between the two halves of a surrogate pair).
+        var cuts = new List<int>();
+        for (int k = b.Prefix.Length + 1; k <= common.Length; k++)
+        {
+            if (!char.IsHighSurrogate(common[k - 1])) cuts.Add(k);
+        }
+
+        int best = b.Prefix.Length;
+        if (cuts.Count > 0)
+        {
+            async Task<bool?> SharedAsync(int length)
+            {
+                string p = common.Substring(0, length);
+                foreach (var side in new[] { (Side: _a, On: onA), (Side: _b, On: onB) })
+                {
+                    if (!side.On) continue;
+                    if (!Take()) return null;
+                    var after = await ProbeOneAsync(side.Side, p + MaxCodePoint, ct).ConfigureAwait(false);
+                    if (after == null) continue;
+                    Add(after);
+                    if (after.StartsWith(b.Prefix, StringComparison.Ordinal)) return false;
+                }
+                return true;
+            }
+
+            if (await SharedAsync(cuts[0]).ConfigureAwait(false) == true)
+            {
+                int lo = 0, hi = cuts.Count - 1; // cuts[lo] is shared; find the last shared cut
+                while (lo < hi)
+                {
+                    int mid = (lo + hi + 1) / 2;
+                    var shared = await SharedAsync(cuts[mid]).ConfigureAwait(false);
+                    if (shared == null) break;
+                    if (shared.Value) lo = mid; else hi = mid - 1;
+                }
+                best = cuts[lo];
+            }
+        }
+
+        return new ProbeBase(common.Substring(0, best), first, onA, onB);
+    }
+
+    /// <summary>The highest Unicode code point (UTF-8 F4 8F BF BF): p + this sorts after every key that starts with p.</summary>
+    private const string MaxCodePoint = "\U0010FFFF";
+
+    private static string CommonPrefix(string x, string y)
+    {
+        int n = Math.Min(x.Length, y.Length), i = 0;
+        while (i < n && x[i] == y[i]) i++;
+        if (i > 0 && char.IsHighSurrogate(x[i - 1])) i--; // do not split a surrogate pair
+        return x.Substring(0, i);
+    }
+
+    /// <summary>The length of the prefix of <paramref name="key"/> that is one character (code point) longer than <paramref name="length"/>.</summary>
+    private static int CutAfter(string key, int length)
+    {
+        int cut = length + 1;
+        if (cut < key.Length && char.IsHighSurrogate(key[cut - 1])) cut++;
+        return Math.Min(cut, key.Length);
+    }
+
+    /// <summary>The character after the base in its first key: probing at or below it finds nothing new.</summary>
+    private static char? MinNextChar(ProbeBase b) =>
+        b.FirstKey != null && b.FirstKey.Length > b.Prefix.Length && b.FirstKey.StartsWith(b.Prefix, StringComparison.Ordinal)
+            ? b.FirstKey[b.Prefix.Length]
+            : null;
+
+    private Side PickSide(ProbeBase b, int index)
+    {
+        if (b.OnA && b.OnB) return index % 2 == 0 ? _a : _b;
+        return b.OnB ? _b : _a;
+    }
+
+    /// <summary>
+    /// Up to <paramref name="count"/> probe characters above <paramref name="after"/>: the whole printable alphabet when the
+    /// budget allows, otherwise the common key characters (digits, letters, - . / _) evenly spaced.
+    /// </summary>
+    private static List<char> ProbeChars(char? after, int count)
+    {
+        var alphabet = ProbeAlphabet.Where(c => after == null || c > after.Value).ToList();
+        if (count >= alphabet.Count) return alphabet;
+        var common = CommonKeyChars.Where(c => after == null || c > after.Value).ToList();
+        if (common.Count == 0) common = alphabet;
+        return EvenlySpacedCentered(common, Math.Min(count, common.Count));
     }
 
     private static List<T> EvenlySpaced<T>(List<T> items, int count)
@@ -206,17 +366,23 @@ public sealed class PartitionPlanner
         return list;
     }
 
-    private async Task<List<(string Base, string Key)>> RunProbesAsync(List<(string Base, string Probe)> probes, CancellationToken ct)
+    /// <summary>Evenly spaced, each pick in the middle of its share (so a single pick is the middle item, not the first).</summary>
+    private static List<T> EvenlySpacedCentered<T>(List<T> items, int count)
     {
-        var found = new List<(string Base, string Key)>();
+        if (count >= items.Count) return items;
+        var list = new List<T>(count);
+        for (int i = 0; i < count; i++) list.Add(items[(int)((2L * i + 1) * items.Count / (2L * count))]);
+        return list;
+    }
+
+    private async Task<List<(ProbeBase Base, string Key)>> RunProbesAsync(List<(ProbeBase Base, string Probe, Side Side)> probes, CancellationToken ct)
+    {
+        var found = new List<(ProbeBase Base, string Key)>();
         var gate = new object();
         await Parallel.ForEachAsync(probes, new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentPlannerRequests, CancellationToken = ct }, async (p, token) =>
         {
-            var keys = await Task.WhenAll(ProbeOneAsync(_a, p.Probe, token), ProbeOneAsync(_b, p.Probe, token)).ConfigureAwait(false);
-            lock (gate)
-            {
-                foreach (var k in keys) if (k != null) found.Add((p.Base, k));
-            }
+            var key = await ProbeOneAsync(p.Side, p.Probe, token).ConfigureAwait(false);
+            if (key != null) lock (gate) found.Add((p.Base, key));
         }).ConfigureAwait(false);
         return found;
     }
@@ -225,11 +391,37 @@ public sealed class PartitionPlanner
     private async Task<string?> ProbeOneAsync(Side side, string probe, CancellationToken ct)
     {
         if (!TryTakeRequest()) return null;
-        if (side.Limiter != null) await side.Limiter.WaitAsync(ct).ConfigureAwait(false);
+        await BeforeRequestAsync(side, ct).ConfigureAwait(false);
         var page = await side.Lister.ListPageAsync(side.Bucket, side.Prefix, side.Prefix + probe, null, null, 1, ct).ConfigureAwait(false);
         var key = page.Objects.FirstOrDefault()?.Key;
         if (key == null || !key.StartsWith(side.Prefix, StringComparison.Ordinal)) return null;
         return key.Substring(side.Prefix.Length);
+    }
+
+    /// <summary>Honours the scan's pause and the bucket's request rate before every planner request.</summary>
+    private async Task BeforeRequestAsync(Side side, CancellationToken ct)
+    {
+        if (_pauseGate != null) await _pauseGate(ct).ConfigureAwait(false);
+        if (side.Limiter != null) await side.Limiter.WaitAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The plan for resuming a single-key (version 1) checkpoint: the range (start, <paramref name="done"/>] is finished, and
+    /// the planned ranges after it follow, the first one starting at <paramref name="done"/>. Tiles the keyspace exactly.
+    /// </summary>
+    public static List<PartitionRange> ResumePlanAfter(IReadOnlyList<PartitionRange> plan, string done)
+    {
+        var result = new List<PartitionRange> { new() { Lower = null, Upper = done, LastCompletedKey = done, Completed = true } };
+        foreach (var r in plan)
+        {
+            if (r.Upper != null && Utf8OrdinalComparer.CompareStatic(r.Upper, done) <= 0) continue;
+            var c = r.Clone();
+            if (result.Count == 1) c.Lower = done;
+            c.LastCompletedKey = null;
+            c.Completed = false;
+            result.Add(c);
+        }
+        return result;
     }
 
     // ---------------- range construction ----------------

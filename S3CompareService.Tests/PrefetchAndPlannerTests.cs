@@ -209,6 +209,58 @@ public class PartitionPlannerTests
         AssertTiles(ranges, keys);
     }
 
+    private static int LargestShare(List<PartitionRange> ranges, List<string> keys) =>
+        keys.GroupBy(k => PartitionPlanner.IndexOf(ranges, k)).Max(g => g.Count());
+
+    [TestMethod]
+    [DataRow("file_{0:00000}.dat")]
+    [DataRow("IMG_{0:0000}.jpg")]
+    [DataRow("logs-2024-{0:0000}-host.gz")]
+    public async Task Flat_WithSharedPrefix_JumpsToWhereKeysDiffer(string format)
+    {
+        var keys = Enumerable.Range(0, 3000).Select(i => string.Format(System.Globalization.CultureInfo.InvariantCulture, format, i)).ToList();
+        var planner = Planner(keys, keys, target: 32); // 8 partitions x 4
+        var ranges = await planner.PlanAsync(CancellationToken.None);
+
+        AssertTiles(ranges, keys);
+        Assert.IsTrue(ranges.Count >= 8, $"{ranges.Count} ranges: {string.Join(" ", ranges)}");
+        int largest = LargestShare(ranges, keys);
+        Assert.IsTrue(largest <= keys.Count / 4, $"largest range has {largest} of {keys.Count} keys: {string.Join(" ", ranges)}");
+        Assert.IsTrue(planner.RequestsUsed <= 500);
+    }
+
+    [TestMethod]
+    public async Task Flat_SmallBudget_SpreadsProbesOverTheAlphabet()
+    {
+        var rng = new Random(17);
+        var keys = Enumerable.Range(0, 3000).Select(_ => new string(Enumerable.Range(0, 10).Select(_ => (char)('a' + rng.Next(26))).ToArray())).Distinct().ToList();
+        var planner = Planner(keys, keys, target: 8, maxRequests: 40);
+        var ranges = await planner.PlanAsync(CancellationToken.None);
+
+        AssertTiles(ranges, keys);
+        Assert.IsTrue(planner.RequestsUsed <= 40);
+        Assert.IsTrue(ranges.Count >= 6, $"{ranges.Count} ranges: {string.Join(" ", ranges)}");
+        int largest = LargestShare(ranges, keys);
+        Assert.IsTrue(largest <= keys.Count * 3 / 10, $"largest range has {largest} of {keys.Count} keys: {string.Join(" ", ranges)}");
+    }
+
+    [TestMethod]
+    public async Task TwoFolders_SmallBudget_SplitsBoth()
+    {
+        var rng = new Random(23);
+        string Name() => new string(Enumerable.Range(0, 8).Select(_ => (char)('a' + rng.Next(26))).ToArray());
+        var keys = Enumerable.Range(0, 1500).Select(_ => "alpha/" + Name()).Concat(Enumerable.Range(0, 1500).Select(_ => "beta/" + Name())).Distinct().ToList();
+        var planner = Planner(keys, keys, target: 8, maxRequests: 40);
+        var ranges = await planner.PlanAsync(CancellationToken.None);
+
+        AssertTiles(ranges, keys);
+        Assert.IsTrue(planner.RequestsUsed <= 40);
+        Assert.IsTrue(ranges.Count(r => r.Upper != null && r.Upper.StartsWith("alpha/", StringComparison.Ordinal) && r.Upper.Length > 6) >= 2, string.Join(" ", ranges));
+        Assert.IsTrue(ranges.Count(r => r.Upper != null && r.Upper.StartsWith("beta/", StringComparison.Ordinal) && r.Upper.Length > 5) >= 2, string.Join(" ", ranges));
+        int largest = LargestShare(ranges, keys);
+        Assert.IsTrue(largest <= keys.Count * 3 / 10, $"largest range has {largest} of {keys.Count} keys: {string.Join(" ", ranges)}");
+    }
+
     [TestMethod]
     public async Task EmptyBuckets_GiveOneRange()
     {
