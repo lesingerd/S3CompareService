@@ -47,11 +47,13 @@ public class ServiceComparisonEngine
     private readonly ScanCheckpoint? _resumeCheckpoint;
     private readonly List<PartitionRange>? _resumeRanges;
     private readonly bool _checkpointDiscarded;
+    private readonly bool _replanAfterLegacyKey;
     private readonly ScanOptions _options;
     private readonly long _maxRecordedDifferences;
 
     private IAmazonS3? _clientA, _clientB;
     private IS3Lister? _listerA, _listerB;
+    private IS3ObjectReader? _readerA, _readerB;
     private IRequestRateLimiter? _limiterA, _limiterB;
     private TokenBucketRateLimiter? _objectLimiter;
     private int _objectTokenBatch = 1;
@@ -75,7 +77,6 @@ public class ServiceComparisonEngine
     private long _lastProgressReportTime;
     private int _consecutiveCheckpointFailures;
 
-    private readonly object _eventLock = new();
     private int _handlerFailureLogged;
     private readonly Stopwatch _stopwatch = new();
     private readonly double _baselineElapsedSeconds;
@@ -86,11 +87,16 @@ public class ServiceComparisonEngine
     private TaskCompletionSource<bool>? _pauseTcs;
     private Task _statusPersistTask = Task.CompletedTask;
 
+    /// <summary>
+    /// Raised about every 250 ms from whichever worker is due (one at a time), and once at the end. Runs on a worker thread
+    /// and holds up that worker while it runs, so keep it short. No engine lock is held while it runs.
+    /// </summary>
     public event Action<ComparisonStatistics>? ProgressUpdated;
 
     /// <summary>
-    /// Raised for every difference. With several partitions differences are found concurrently and not in key order; the
-    /// handler is never invoked concurrently with itself.
+    /// Raised for every difference, on the worker thread that found it, with no engine lock held. With several partitions
+    /// differences are found concurrently and not in key order, and the handler CAN be invoked concurrently from several
+    /// workers: it must be thread-safe and fast (a slow handler slows the worker that raised it, not the others).
     /// </summary>
     public event Action<RecordedDifference>? DifferenceFound;
 
@@ -136,7 +142,8 @@ public class ServiceComparisonEngine
         _providedStreamB = streamB;
         _providedListerA = listerA;
         _providedListerB = listerB;
-        _options = options ?? new ScanOptions();
+        _options = options?.Clone() ?? new ScanOptions();
+        _options.ApplyMemoryCap();
         _maxRecordedDifferences = _options.MaxRecordedDifferencesPerRun;
         _contentChecks = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrentContentChecks));
 
@@ -160,6 +167,9 @@ public class ServiceComparisonEngine
                 _resumeCheckpoint = resumeCheckpoint;
                 _resumeRanges = ranges;
                 _ranges = ranges!.Select(r => r.Clone()).ToList();
+                // A version 1 checkpoint has one key and no plan: the rest of the keyspace is planned (and scanned in
+                // parallel) after that key at the start of RunAsync.
+                _replanAfterLegacyKey = resumeCheckpoint.Partitions is not { Count: > 0 } && !UsesProvidedStreams;
                 _baselineElapsedSeconds = resumeCheckpoint.ElapsedSeconds;
                 InitializeStatsFromCheckpoint(resumeCheckpoint);
                 _scanRun.IsResumedFromCheckpoint = true;
@@ -209,6 +219,7 @@ public class ServiceComparisonEngine
         _stats.ETagMismatchCount = cp.ETagMismatchCount;
         _stats.ContentMismatchCount = cp.ContentMismatchCount;
         _stats.SequenceGapCount = cp.SequenceGapCount;
+        _stats.ContentCheckErrorCount = cp.ContentCheckErrorCount;
         _stats.BucketAObjectsRead = cp.BucketAObjectsRead;
         _stats.BucketBObjectsRead = cp.BucketBObjectsRead;
         _stats.BucketABytesRead = cp.BucketABytesRead;
@@ -392,11 +403,20 @@ public class ServiceComparisonEngine
                 // One limiter per bucket side for the whole scan: every partition, the planner and content reads share it.
                 _limiterA = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
                 _limiterB = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
+                _readerA = _listerA as IS3ObjectReader;
+                _readerB = _listerB as IS3ObjectReader;
 
                 if (_resumeRanges == null)
                 {
                     var plan = await PlanPartitionsAsync(prefixA, prefixB, cancellationToken).ConfigureAwait(false);
                     lock (_stateLock) _ranges = plan;
+                }
+                else if (_replanAfterLegacyKey)
+                {
+                    string done = _resumeRanges[0].LastCompletedKey ?? string.Empty;
+                    var plan = PartitionPlanner.ResumePlanAfter(await PlanPartitionsAsync(prefixA, prefixB, cancellationToken).ConfigureAwait(false), done);
+                    lock (_stateLock) _ranges = plan;
+                    await LogAsync("INFO", $"Resume from a single-key checkpoint: the keyspace after '{done}' was planned as {plan.Count - 1} key range(s).").ConfigureAwait(false);
                 }
             }
 
@@ -436,8 +456,10 @@ public class ServiceComparisonEngine
 
             await LogAsync("INFO", $"Scan run '{_scanRun.Id}' completed successfully: {_scanRun.ObjectsCompared:N0} objects evaluated, {_scanRun.MatchedCount:N0} matched, {_scanRun.TotalDifferences:N0} raw diffs ({_scanRun.FilteredDifferencesCount:N0} confirmed disparities, {_scanRun.InFlightDifferencesCount:N0} in-flight replication).").ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested)
         {
+            // Cancelled (user) or interrupted (shutdown). A worker or the final steps may surface the cancellation as some
+            // other exception (an SDK or I/O error from an aborted request); that is still a cancellation, not a failure.
             var status = _isServiceShutdown ? RunStatus.Interrupted : RunStatus.Cancelled;
             string message = _isServiceShutdown
                 ? "Scan interrupted by service shutdown. Checkpoint saved for automatic recovery."
@@ -446,8 +468,10 @@ public class ServiceComparisonEngine
 
             await LogAsync(
                 _isServiceShutdown ? "RECOVERY" : "WARN",
-                $"Scan run '{_scanRun.Id}' {(_isServiceShutdown ? "interrupted for service shutdown" : "cancelled")}. Checkpoint saved at key '{FrontierKey()}'.").ConfigureAwait(false);
-            throw;
+                $"Scan run '{_scanRun.Id}' {(_isServiceShutdown ? "interrupted for service shutdown" : "cancelled")}. Checkpoint saved at key '{FrontierKey()}'.",
+                ex is OperationCanceledException ? null : $"Surfaced as {ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
+            if (ex is OperationCanceledException) throw;
+            throw new OperationCanceledException(message, ex, cancellationToken);
         }
         catch (Exception ex)
         {
@@ -480,7 +504,8 @@ public class ServiceComparisonEngine
         var planner = new PartitionPlanner(
             _listerA!, _job.BucketA.BucketName, prefixA, _limiterA,
             _listerB!, _job.BucketB.BucketName, prefixB, _limiterB,
-            _options.TargetPartitions, _options.MaxDiscoveryDepth, _options.MaxDiscoveryRequests);
+            _options.TargetPartitions, _options.MaxDiscoveryDepth, _options.MaxDiscoveryRequests,
+            pauseGate: CheckPauseAsync);
         var sw = Stopwatch.StartNew();
         try
         {
@@ -514,12 +539,15 @@ public class ServiceComparisonEngine
 
         async Task WorkerAsync()
         {
+            // Object-rate tokens are owed per worker, across its ranges: ranges smaller than a token batch still pay.
+            var tokens = new ObjectTokenAccount();
             try
             {
                 while (queue.TryDequeue(out var range))
                 {
-                    await RunRangeAsync(range, prefixA, prefixB, workersCts.Token).ConfigureAwait(false);
+                    await RunRangeAsync(range, prefixA, prefixB, tokens, workersCts.Token).ConfigureAwait(false);
                 }
+                await PayObjectTokensAsync(tokens, workersCts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -551,18 +579,24 @@ public class ServiceComparisonEngine
     {
         public required PartitionRange Range { get; init; }
         public SequenceGapDetector? GapDetector { get; init; }
-        public int PendingObjectTokens;
+        public required ObjectTokenAccount Tokens { get; init; }
+    }
+
+    /// <summary>Compared keys a worker has not yet paid to the object-rate limiter.</summary>
+    private sealed class ObjectTokenAccount
+    {
+        public int Pending;
     }
 
     /// <summary>Merge-joins the two listings of one key range.</summary>
-    private async Task RunRangeAsync(PartitionRange range, string? prefixA, string? prefixB, CancellationToken ct)
+    private async Task RunRangeAsync(PartitionRange range, string? prefixA, string? prefixB, ObjectTokenAccount tokens, CancellationToken ct)
     {
         IS3ObjectStream enumA, enumB;
         bool ownsStreams = !UsesProvidedStreams;
+        string? after;
+        lock (_stateLock) after = range.ResumeAfter;
         if (ownsStreams)
         {
-            string? after;
-            lock (_stateLock) after = range.ResumeAfter;
             bool hasAfter = after != null;
             enumA = new PrefetchingObjectStream(_listerA!, _job.BucketA.BucketName, prefixA, BuildStartAfterKey(hasAfter, after, prefixA), range.Upper, _options.PrefetchPages, _limiterA, _options.ListPageSize, ct);
             enumB = new PrefetchingObjectStream(_listerB!, _job.BucketB.BucketName, prefixB, BuildStartAfterKey(hasAfter, after, prefixB), range.Upper, _options.PrefetchPages, _limiterB, _options.ListPageSize, ct);
@@ -573,8 +607,14 @@ public class ServiceComparisonEngine
             enumB = _providedStreamB!;
         }
 
-        // Each range has its own gap detector: a numeric series cut by a range boundary is not checked across it.
-        var cursor = new RangeCursor { Range = range, GapDetector = _job.DetectSequenceGaps ? new SequenceGapDetector(_job.MaxSequenceGapThreshold) : null };
+        // Each range has its own gap detector, seeded with the key just before the range (its lower boundary, or the last key
+        // done when resuming), so a numeric series that crosses the boundary is checked as in one sequential listing.
+        var cursor = new RangeCursor { Range = range, Tokens = tokens, GapDetector = _job.DetectSequenceGaps ? new SequenceGapDetector(_job.MaxSequenceGapThreshold) : null };
+        if (cursor.GapDetector != null && !string.IsNullOrEmpty(after))
+        {
+            long unusedIdCounter = 0;
+            cursor.GapDetector.CheckKey(after, _scanRun.Id, ref unusedIdCounter); // primes the series; reports nothing
+        }
         lock (_stateLock) _stats.PartitionsActive++;
         try
         {
@@ -661,9 +701,16 @@ public class ServiceComparisonEngine
     private async ValueTask ThrottleObjectsAsync(RangeCursor cursor, CancellationToken ct)
     {
         if (_objectLimiter == null) return;
-        if (++cursor.PendingObjectTokens < _objectTokenBatch) return;
-        int tokens = cursor.PendingObjectTokens;
-        cursor.PendingObjectTokens = 0;
+        if (++cursor.Tokens.Pending < _objectTokenBatch) return;
+        await PayObjectTokensAsync(cursor.Tokens, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Pays the keys a worker still owes the object-rate limiter (a full batch, or the remainder when it finishes).</summary>
+    private async ValueTask PayObjectTokensAsync(ObjectTokenAccount account, CancellationToken ct)
+    {
+        if (_objectLimiter == null || account.Pending <= 0) return;
+        int tokens = account.Pending;
+        account.Pending = 0;
         await _objectLimiter.WaitAsync(tokens, ct).ConfigureAwait(false);
     }
 
@@ -799,22 +846,16 @@ public class ServiceComparisonEngine
         var handler = ProgressUpdated;
         if (handler == null) return;
         var snapshot = CloneStats();
-        lock (_eventLock)
-        {
-            try { handler(snapshot); }
-            catch (Exception ex) { ReportHandlerFailure("ProgressUpdated", ex); }
-        }
+        try { handler(snapshot); }
+        catch (Exception ex) { ReportHandlerFailure("ProgressUpdated", ex); }
     }
 
     private void RaiseDifferenceFound(RecordedDifference diff)
     {
         var handler = DifferenceFound;
         if (handler == null) return;
-        lock (_eventLock)
-        {
-            try { handler(diff); }
-            catch (Exception ex) { ReportHandlerFailure("DifferenceFound", ex); }
-        }
+        try { handler(diff); }
+        catch (Exception ex) { ReportHandlerFailure("DifferenceFound", ex); }
     }
 
     private void ReportHandlerFailure(string eventName, Exception ex)
@@ -877,6 +918,7 @@ public class ServiceComparisonEngine
                 case DifferenceType.ETagMismatch: _stats.ETagMismatchCount++; break;
                 case DifferenceType.ContentMismatch: _stats.ContentMismatchCount++; break;
                 case DifferenceType.PossibleMissingOnBothSides: _stats.SequenceGapCount++; break;
+                case DifferenceType.ContentCheckError: _stats.ContentCheckErrorCount++; break;
             }
         }
         _stats.TotalDifferences++;
@@ -1061,6 +1103,7 @@ public class ServiceComparisonEngine
                 ETagMismatchCount = snap.ETagMismatchCount,
                 ContentMismatchCount = snap.ContentMismatchCount,
                 SequenceGapCount = snap.SequenceGapCount,
+                ContentCheckErrorCount = snap.ContentCheckErrorCount,
                 BucketAObjectsRead = snap.BucketAObjectsRead,
                 BucketBObjectsRead = snap.BucketBObjectsRead,
                 BucketABytesRead = snap.BucketABytesRead,
@@ -1235,7 +1278,7 @@ public class ServiceComparisonEngine
         }
 
         // 3. ETags Differ
-        if (_job.Mode == ComparisonMode.ListingOnly || _clientA == null || _clientB == null)
+        if (_job.Mode == ComparisonMode.ListingOnly || _readerA == null || _readerB == null)
         {
             return (false, MakeDifference(
                 relativeKey,
@@ -1245,54 +1288,124 @@ public class ServiceComparisonEngine
         }
 
         // Full Data stream compare using each bucket's full key; bounded across all partitions.
-        bool contentMatches;
         await _contentChecks.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            contentMatches = await StreamCompareObjectsAsync(_clientA, _clientB, itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+            return await ContentCheckAsync(relativeKey, itemA, itemB, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             _contentChecks.Release();
         }
+    }
 
-        if (contentMatches)
+    /// <summary>
+    /// Compares the content of one key. A read failure affects only this key: it becomes a <see cref="DifferenceType.ContentCheckError"/>
+    /// (after one retry for transient errors), or an in-flight one when the object disappeared during the scan. Only the scan's
+    /// own cancellation propagates.
+    /// </summary>
+    private async Task<(bool Matched, RecordedDifference? Diff)> ContentCheckAsync(string relativeKey, S3ObjectSummary itemA, S3ObjectSummary itemB, CancellationToken cancellationToken)
+    {
+        for (int attempt = 1; ; attempt++)
         {
-            return (true, null);
+            try
+            {
+                bool contentMatches = await StreamCompareObjectsAsync(itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+                if (contentMatches) return (true, null);
+                return (false, MakeDifference(
+                    relativeKey,
+                    DifferenceType.ContentMismatch,
+                    $"Content byte mismatch! Size is identical ({itemA.FormattedSize}) but data stream differs.",
+                    itemA, itemB));
+            }
+            catch (ContentReadException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                if (IsNoSuchKey(ex.InnerException))
+                {
+                    // Listed, then gone before it could be read: the bucket changed during the scan. Recorded as in-flight
+                    // (like a change inside the replication grace window), not as a confirmed disparity.
+                    var gone = MakeDifference(
+                        relativeKey,
+                        DifferenceType.ContentCheckError,
+                        $"Object was deleted or replaced in bucket {ex.Side} during the scan (NoSuchKey); content not compared.",
+                        itemA, itemB);
+                    gone.IsWithinGracePeriod = true;
+                    return (false, gone);
+                }
+                if (attempt == 1 && IsTransient(ex.InnerException))
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                return (false, MakeDifference(
+                    relativeKey,
+                    DifferenceType.ContentCheckError,
+                    $"Content of bucket {ex.Side} could not be read{(attempt > 1 ? " (also after one retry)" : string.Empty)}: {Describe(ex.InnerException)}. The object was not verified.",
+                    itemA, itemB));
+            }
         }
+    }
 
-        return (false, MakeDifference(
-            relativeKey,
-            DifferenceType.ContentMismatch,
-            $"Content byte mismatch! Size is identical ({itemA.FormattedSize}) but data stream differs.",
-            itemA, itemB));
+    /// <summary>A failure to open or read one side's object content (wraps the original exception).</summary>
+    private sealed class ContentReadException : Exception
+    {
+        public ContentReadException(string side, Exception inner) : base($"Bucket {side}: {inner.Message}", inner) { Side = side; }
+        public string Side { get; }
+        public new Exception InnerException => base.InnerException!;
+    }
+
+    private static bool IsNoSuchKey(Exception ex) =>
+        ex is AmazonS3Exception s3 && (string.Equals(s3.ErrorCode, "NoSuchKey", StringComparison.Ordinal) || s3.StatusCode == System.Net.HttpStatusCode.NotFound);
+
+    /// <summary>Errors worth one retry: throttling, 5xx, and transport failures (network, timeouts). Not 403 or InvalidObjectState.</summary>
+    private static bool IsTransient(Exception ex) => ex switch
+    {
+        Amazon.Runtime.AmazonServiceException s => (int)s.StatusCode >= 500 || (int)s.StatusCode == 429
+            || string.Equals(s.ErrorCode, "SlowDown", StringComparison.Ordinal) || string.Equals(s.ErrorCode, "RequestTimeout", StringComparison.Ordinal)
+            || s.StatusCode == 0,
+        Amazon.Runtime.AmazonClientException => true,
+        IOException or HttpRequestException or TimeoutException or OperationCanceledException => true,
+        _ => false
+    };
+
+    private static string Describe(Exception ex) => ex switch
+    {
+        Amazon.Runtime.AmazonServiceException s when !string.IsNullOrEmpty(s.ErrorCode) => $"{s.ErrorCode} ({(int)s.StatusCode}) {s.Message}",
+        OperationCanceledException => "request timed out",
+        _ => $"{ex.GetType().Name}: {ex.Message}"
+    };
+
+    /// <summary>Runs one side's S3 call; any failure except the scan's own cancellation is wrapped with the side.</summary>
+    private static async Task<T> OnSideAsync<T>(string side, Func<Task<T>> call, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await call().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not ContentReadException && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+        {
+            throw new ContentReadException(side, ex);
+        }
     }
 
     private async Task<bool> StreamCompareObjectsAsync(
-        IAmazonS3 clientA,
-        IAmazonS3 clientB,
         string keyA,
         string keyB,
         CancellationToken cancellationToken)
     {
         if (_limiterA != null) await _limiterA.WaitAsync(cancellationToken).ConfigureAwait(false);
         if (_limiterB != null) await _limiterB.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var getA = new GetObjectRequest { BucketName = _job.BucketA.BucketName, Key = keyA };
-        var getB = new GetObjectRequest { BucketName = _job.BucketB.BucketName, Key = keyB };
 
-        using var respA = await clientA.GetObjectAsync(getA, cancellationToken).ConfigureAwait(false);
-        using var respB = await clientB.GetObjectAsync(getB, cancellationToken).ConfigureAwait(false);
-
-        await using var streamA = respA.ResponseStream;
-        await using var streamB = respB.ResponseStream;
+        await using var streamA = await OnSideAsync("A", () => _readerA!.OpenReadAsync(_job.BucketA.BucketName, keyA, cancellationToken), cancellationToken).ConfigureAwait(false);
+        await using var streamB = await OnSideAsync("B", () => _readerB!.OpenReadAsync(_job.BucketB.BucketName, keyB, cancellationToken), cancellationToken).ConfigureAwait(false);
 
         byte[] bufA = new byte[65536];
         byte[] bufB = new byte[65536];
 
         while (true)
         {
-            int bytesReadA = await ReadFullBufferAsync(streamA, bufA, cancellationToken).ConfigureAwait(false);
-            int bytesReadB = await ReadFullBufferAsync(streamB, bufB, cancellationToken).ConfigureAwait(false);
+            int bytesReadA = await OnSideAsync("A", () => ReadFullBufferAsync(streamA, bufA, cancellationToken), cancellationToken).ConfigureAwait(false);
+            int bytesReadB = await OnSideAsync("B", () => ReadFullBufferAsync(streamB, bufB, cancellationToken), cancellationToken).ConfigureAwait(false);
 
             if (bytesReadA != bytesReadB)
                 return false;
@@ -1367,6 +1480,7 @@ public class ServiceComparisonEngine
         run.ETagMismatchCount = s.ETagMismatchCount;
         run.ContentMismatchCount = s.ContentMismatchCount;
         run.SequenceGapCount = s.SequenceGapCount;
+        run.ContentCheckErrorCount = s.ContentCheckErrorCount;
         run.BucketAObjectsRead = s.BucketAObjectsRead;
         run.BucketBObjectsRead = s.BucketBObjectsRead;
         run.BucketABytesRead = s.BucketABytesRead;
@@ -1395,6 +1509,7 @@ public class ServiceComparisonEngine
             ETagMismatchCount = _stats.ETagMismatchCount,
             ContentMismatchCount = _stats.ContentMismatchCount,
             SequenceGapCount = _stats.SequenceGapCount,
+            ContentCheckErrorCount = _stats.ContentCheckErrorCount,
             BucketAObjectsRead = _stats.BucketAObjectsRead,
             BucketBObjectsRead = _stats.BucketBObjectsRead,
             BucketABytesRead = _stats.BucketABytesRead,

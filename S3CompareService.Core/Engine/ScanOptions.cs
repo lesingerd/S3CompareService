@@ -35,6 +35,13 @@ public sealed class ScanOptions
     public const int MaxDiscoveryDepthLimit = 10;
 
     /// <summary>
+    /// Memory bound: list pages one bucket side may hold at once, <c>MaxParallelPartitions x (PrefetchPages + 1)</c> (each
+    /// listing holds its prefetched pages plus the page being compared; a page is up to 1,000 object summaries). With both
+    /// buckets that is at most about 1 million summaries in flight.
+    /// </summary>
+    public const int MaxBufferedPagesPerBucket = 512;
+
+    /// <summary>
     /// The most difference rows stored per run. Beyond it the counters keep counting every difference but no more rows are
     /// inserted and the run is flagged <c>DifferencesTruncated</c>. 0 or less means unlimited.
     /// </summary>
@@ -52,7 +59,10 @@ public sealed class ScanOptions
     /// <summary>List pages a bucket listing fetches ahead of the comparison, per partition (bounded buffer).</summary>
     public int PrefetchPages { get; set; } = DefaultPrefetchPages;
 
-    /// <summary>Compared keys per second across all partitions. 0 or less means unlimited.</summary>
+    /// <summary>
+    /// Compared keys per second across all partitions (a key present in both buckets counts once, like a key present in one).
+    /// 0 or less means unlimited.
+    /// </summary>
     public double MaxObjectsPerSecond { get; set; } = DefaultMaxObjectsPerSecond;
 
     /// <summary>Full Data mode: object pairs downloaded and compared at the same time across all partitions.</summary>
@@ -81,14 +91,33 @@ public sealed class ScanOptions
     {
         var o = Clone();
         var p = job?.Performance;
-        if (p == null) return o;
+        if (p == null)
+        {
+            o.ApplyMemoryCap();
+            return o;
+        }
         if (p.MaxParallelPartitions is int mp) o.MaxParallelPartitions = mp;
         if (p.PrefetchPages is int pf) o.PrefetchPages = pf;
         if (p.MaxListRequestsPerSecond is double lr) o.MaxListRequestsPerSecond = lr;
         if (p.MaxObjectsPerSecond is double ob) o.MaxObjectsPerSecond = ob;
         if (p.MaxConcurrentContentChecks is int cc) o.MaxConcurrentContentChecks = cc;
         if (p.MaxDiscoveryRequests is int dr) o.MaxDiscoveryRequests = dr;
+        o.ApplyMemoryCap();
         return o;
+    }
+
+    /// <summary>
+    /// Lowers <see cref="PrefetchPages"/> (not below 1) so that <c>MaxParallelPartitions x (PrefetchPages + 1)</c> stays within
+    /// <see cref="MaxBufferedPagesPerBucket"/>. Returns true when it changed anything.
+    /// </summary>
+    public bool ApplyMemoryCap()
+    {
+        int partitions = Math.Max(1, MaxParallelPartitions);
+        if ((long)partitions * (Math.Max(1, PrefetchPages) + 1) <= MaxBufferedPagesPerBucket) return false;
+        int allowed = Math.Max(1, MaxBufferedPagesPerBucket / partitions - 1);
+        if (allowed >= PrefetchPages) return false;
+        PrefetchPages = allowed;
+        return true;
     }
 
     /// <summary>Validates per-job overrides. Returns an error message, or null when every set value is in range.</summary>
@@ -100,7 +129,10 @@ public sealed class ScanOptions
             ?? CheckDouble(p.MaxListRequestsPerSecond, nameof(p.MaxListRequestsPerSecond), MaxListRequestsPerSecondLimit)
             ?? CheckDouble(p.MaxObjectsPerSecond, nameof(p.MaxObjectsPerSecond), MaxObjectsPerSecondLimit)
             ?? CheckInt(p.MaxConcurrentContentChecks, nameof(p.MaxConcurrentContentChecks), 1, MaxConcurrentContentChecksLimit)
-            ?? CheckInt(p.MaxDiscoveryRequests, nameof(p.MaxDiscoveryRequests), 0, MaxDiscoveryRequestsLimit);
+            ?? CheckInt(p.MaxDiscoveryRequests, nameof(p.MaxDiscoveryRequests), 0, MaxDiscoveryRequestsLimit)
+            ?? (p.MaxParallelPartitions is int mp && p.PrefetchPages is int pf && (long)mp * (pf + 1) > MaxBufferedPagesPerBucket
+                ? $"MaxParallelPartitions x (PrefetchPages + 1) must not exceed {MaxBufferedPagesPerBucket} (list pages held in memory per bucket)."
+                : null);
     }
 
     private static string? CheckInt(int? value, string name, int min, int max) =>

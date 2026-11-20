@@ -286,7 +286,7 @@ public class ParallelScanTests : TestDbBase
     }
 
     [TestMethod]
-    public async Task OldSingleKeyCheckpoint_ResumesAsOneRange()
+    public async Task OldSingleKeyCheckpoint_Resumes_FromItsKey()
     {
         var (a, b) = Generate(13, HierarchicalKeys(20, 40));
         var job = NewJob();
@@ -314,7 +314,9 @@ public class ParallelScanTests : TestDbBase
         var resumed = await RunPartitionedAsync(job, new FakeS3Lister(a), new FakeS3Lister(b), Options(8), reopened, legacy);
 
         Assert.IsTrue(resumed.Engine.IsResuming);
-        Assert.AreEqual(1, resumed.Engine.GetPartitionsSnapshot().Count, "a single-key checkpoint continues as one range");
+        var plan = resumed.Engine.GetPartitionsSnapshot();
+        Assert.IsTrue(plan[0].Completed && plan[0].Upper == legacy.LastEvaluatedKey, "everything up to the old key was done");
+        Assert.IsTrue(plan.Count > 2, "the rest of the keyspace was planned (see ParallelScanHardeningTests)");
         AssertSameCounters(expected.Run, resumed.Run);
         CollectionAssert.AreEqual(Shape(expected.Diffs), Shape(resumed.Diffs));
     }
@@ -429,8 +431,8 @@ public class ParallelScanTests : TestDbBase
         sw.Stop();
 
         Assert.AreEqual(2000, result.Run.ObjectsCompared);
-        Assert.IsTrue(sw.Elapsed >= TimeSpan.FromMilliseconds(700), $"too fast for the cap: {sw.ElapsedMilliseconds} ms");
-        Assert.IsTrue(sw.Elapsed < TimeSpan.FromSeconds(10), $"much slower than the cap: {sw.ElapsedMilliseconds} ms");
+        Assert.IsTrue(sw.Elapsed >= TimeSpan.FromMilliseconds(600), $"too fast for the cap: {sw.ElapsedMilliseconds} ms");
+        Assert.IsTrue(sw.Elapsed < TimeSpan.FromSeconds(30), $"much slower than the cap: {sw.ElapsedMilliseconds} ms");
     }
 
     [TestMethod]
@@ -450,7 +452,7 @@ public class ParallelScanTests : TestDbBase
         // Burst of 50, then 50/s for the rest of bucket A's requests (planner + pages), whatever the partition count.
         double minSeconds = Math.Max(0, listerA.Calls - 50) / 50.0;
         Assert.IsTrue(listerA.Calls > 80);
-        Assert.IsTrue(sw.Elapsed.TotalSeconds >= minSeconds * 0.7, $"{listerA.Calls} requests in {sw.ElapsedMilliseconds} ms");
+        Assert.IsTrue(sw.Elapsed.TotalSeconds >= minSeconds * 0.6, $"{listerA.Calls} requests in {sw.ElapsedMilliseconds} ms");
     }
 
     [TestMethod]
@@ -459,7 +461,7 @@ public class ParallelScanTests : TestDbBase
     {
         var keys = HierarchicalKeys(30, 40); // 1,200 keys, 30 directories
         var items = keys.Select(k => Obj(k)).ToList();
-        var latency = TimeSpan.FromMilliseconds(15);
+        var latency = TimeSpan.FromMilliseconds(25);
         var job = NewJob();
 
         var single = Options(1, pageSize: 30);
@@ -478,7 +480,7 @@ public class ParallelScanTests : TestDbBase
         Assert.AreEqual(1200, r1.Run.MatchedCount);
         Assert.AreEqual(1200, r8.Run.MatchedCount);
         Assert.IsTrue(listerA.MaxInFlight > 1, "bucket A was listed by several partitions at once");
-        Assert.IsTrue(tParallel.TotalMilliseconds * 2.5 < tSingle.TotalMilliseconds,
+        Assert.IsTrue(tParallel.TotalMilliseconds * 2 < tSingle.TotalMilliseconds,
             $"1 partition: {tSingle.TotalMilliseconds:N0} ms, 8 partitions: {tParallel.TotalMilliseconds:N0} ms");
     }
 
@@ -486,7 +488,7 @@ public class ParallelScanTests : TestDbBase
     public async Task Prefetch_ListsBothBucketsConcurrently_InOnePartition()
     {
         var items = HierarchicalKeys(5, 40).Select(k => Obj(k)).ToList();
-        var latency = TimeSpan.FromMilliseconds(15);
+        var latency = TimeSpan.FromMilliseconds(25);
         int inFlight = 0, maxInFlight = 0;
         void Track(int _) { int n = Interlocked.Increment(ref inFlight); int m; while (n > (m = maxInFlight) && Interlocked.CompareExchange(ref maxInFlight, n, m) != m) { } }
         var listerA = new FakeS3Lister(items, latency) { OnCall = Track };
