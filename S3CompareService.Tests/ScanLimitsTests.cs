@@ -208,7 +208,7 @@ public class ScanLimitsTests
             parallel.MaxConcurrentContentChecks, parallel.MaxDiscoveryRequests, parallel.PartitionOversubscription, parallel.MaxDiscoveryDepth));
 
         var defaults = HardeningSettings.Scan(Config(("S3Compare:MaxParallelPartitions", "0"), ("S3Compare:PrefetchPages", "x"), ("S3Compare:MaxObjectsPerSecond", "-1"), ("S3Compare:MaxConcurrentContentChecks", "9999")));
-        Assert.AreEqual((ScanOptions.DefaultMaxParallelPartitions, ScanOptions.DefaultPrefetchPages, 0.0, ScanOptions.DefaultMaxConcurrentContentChecks, ScanOptions.DefaultMaxDiscoveryRequests),
+        Assert.AreEqual((ScanOptions.DefaultMaxParallelPartitions, ScanOptions.DefaultPrefetchPages, 0.0, ScanOptions.MaxConcurrentContentChecksLimit, ScanOptions.DefaultMaxDiscoveryRequests),
             (defaults.MaxParallelPartitions, defaults.PrefetchPages, defaults.MaxObjectsPerSecond, defaults.MaxConcurrentContentChecks, defaults.MaxDiscoveryRequests));
     }
 
