@@ -36,6 +36,7 @@ public class RecordedDifference
         DifferenceType.ETagMismatch => "ETag Mismatch",
         DifferenceType.ContentMismatch => "Content Mismatch",
         DifferenceType.PossibleMissingOnBothSides => "Possible Gap (Both Sides)",
+        DifferenceType.ContentCheckError => "Content Check Error",
         _ => Type.ToString()
     };
 

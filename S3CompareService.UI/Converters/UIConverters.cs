@@ -27,6 +27,7 @@ public class DifferenceTypeToBrushConverter : IValueConverter
                 DifferenceType.ETagMismatch => BrushETag,
                 DifferenceType.ContentMismatch => BrushContent,
                 DifferenceType.PossibleMissingOnBothSides => BrushGap,
+                DifferenceType.ContentCheckError => BrushDefault,
                 _ => BrushDefault
             };
         }

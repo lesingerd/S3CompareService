@@ -87,6 +87,7 @@ public class AlertNotificationService : IAlertNotificationService
         AddIfExceeded(reasons, "ETag Mismatches", run.ETagMismatchCount, cfg.MaxETagMismatchThreshold);
         AddIfExceeded(reasons, "Content Byte Mismatches", run.ContentMismatchCount, cfg.MaxContentMismatchThreshold);
         AddIfExceeded(reasons, "Sequence Gaps", run.SequenceGapCount, cfg.MaxSequenceGapThreshold);
+        AddIfExceeded(reasons, "Content Check Errors", run.ContentCheckErrorCount, cfg.MaxContentCheckErrorThreshold);
         return reasons;
     }
 
@@ -342,6 +343,7 @@ public class AlertNotificationService : IAlertNotificationService
                 eTagMismatches = run.ETagMismatchCount,
                 contentMismatches = run.ContentMismatchCount,
                 sequenceGaps = run.SequenceGapCount,
+                contentCheckErrors = run.ContentCheckErrorCount,
                 durationSeconds = run.DurationSeconds
             },
             bucketA = new { name = job.BucketA.BucketName, endpoint = job.BucketA.EndpointUrl, region = job.BucketA.Region },

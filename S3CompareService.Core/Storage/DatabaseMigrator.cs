@@ -67,6 +67,8 @@ public class DatabaseMigrator
                 // overrides (JobPerformanceSettings as JSON; NULL = service defaults).
                 await AddColumnIfMissingAsync(conn, trans, "Checkpoints", "PartitionPlanJson", "TEXT", ct).ConfigureAwait(false);
                 await AddColumnIfMissingAsync(conn, trans, "Jobs", "Performance_Json", "TEXT", ct).ConfigureAwait(false);
+                // Full Data mode: objects whose content could not be read (DifferenceType.ContentCheckError).
+                await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "ContentCheckErrorCount", "INTEGER NOT NULL DEFAULT 0", ct).ConfigureAwait(false);
                 // Exports and per-range resume clean-up read differences by (ScanRunId, Key); version 2 created this index,
                 // repeated here so a database that lost it still gets it.
                 await conn.ExecuteAsync(new CommandDefinition("CREATE INDEX IF NOT EXISTS IX_Differences_ScanRun_Key ON RecordedDifferences (ScanRunId, Key);", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);

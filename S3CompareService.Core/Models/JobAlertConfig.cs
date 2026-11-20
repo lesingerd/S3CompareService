@@ -23,6 +23,8 @@ public class JobAlertConfig
     public int MaxETagMismatchThreshold { get; set; } = 0;
     public int MaxContentMismatchThreshold { get; set; } = 0;
     public int MaxSequenceGapThreshold { get; set; } = 0;
+    /// <summary>Full Data mode: objects whose content could not be read (see <see cref="DifferenceType.ContentCheckError"/>).</summary>
+    public int MaxContentCheckErrorThreshold { get; set; } = 0;
 
     /// <summary>
     /// If true, sends a notification even when no thresholds are breached (digest/heartbeat).

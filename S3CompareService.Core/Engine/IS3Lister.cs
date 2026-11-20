@@ -35,8 +35,18 @@ public interface IS3Lister
         CancellationToken cancellationToken);
 }
 
-/// <summary><see cref="IS3Lister"/> over an <see cref="IAmazonS3"/> client. Does not own (dispose) the client.</summary>
-public sealed class S3Lister : IS3Lister
+/// <summary>
+/// Full Data mode: opens an object's content for reading. <see cref="S3Lister"/> implements it with GetObject; a lister that
+/// does not implement it makes Full Data scans fall back to the listing comparison (ETag mismatch) as without S3 clients.
+/// </summary>
+public interface IS3ObjectReader
+{
+    /// <summary>The object's content. The caller disposes the stream (which releases the connection).</summary>
+    Task<Stream> OpenReadAsync(string bucket, string key, CancellationToken cancellationToken);
+}
+
+/// <summary><see cref="IS3Lister"/> and <see cref="IS3ObjectReader"/> over an <see cref="IAmazonS3"/> client. Does not own (dispose) the client.</summary>
+public sealed class S3Lister : IS3Lister, IS3ObjectReader
 {
     private readonly IAmazonS3 _client;
 
@@ -76,6 +86,13 @@ public sealed class S3Lister : IS3Lister
             IsTruncated = response.IsTruncated ?? false,
             NextContinuationToken = response.NextContinuationToken
         };
+    }
+
+    public async Task<Stream> OpenReadAsync(string bucket, string key, CancellationToken cancellationToken)
+    {
+        // Disposing the response stream releases the HTTP connection; the response object holds nothing else.
+        var response = await _client.GetObjectAsync(new GetObjectRequest { BucketName = bucket, Key = key }, cancellationToken).ConfigureAwait(false);
+        return response.ResponseStream;
     }
 
     /// <summary>Maps an SDK object to the engine's summary (ETag without quotes, UTC time, STANDARD when no class is given).</summary>

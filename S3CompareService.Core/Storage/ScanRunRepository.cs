@@ -104,6 +104,7 @@ public class ScanRunRepository : IScanRunRepository
         run.ETagMismatchCount,
         run.ContentMismatchCount,
         run.SequenceGapCount,
+        run.ContentCheckErrorCount,
         run.BucketAObjectsRead,
         run.BucketBObjectsRead,
         run.BucketABytesRead,
@@ -123,7 +124,7 @@ public class ScanRunRepository : IScanRunRepository
                 ResumeCount, SupersededByRunId, DifferencesTruncated,
                 ObjectsCompared, MatchedCount, TotalDifferences, FilteredDifferencesCount,
                 InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
-                SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount,
+                SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, ContentCheckErrorCount,
                 BucketAObjectsRead, BucketBObjectsRead, BucketABytesRead, BucketBBytesRead,
                 DurationSeconds, ErrorMessage
             ) VALUES (
@@ -133,7 +134,7 @@ public class ScanRunRepository : IScanRunRepository
                 @ResumeCount, @SupersededByRunId, @DifferencesTruncated,
                 @ObjectsCompared, @MatchedCount, @TotalDifferences, @FilteredDifferencesCount,
                 @InFlightDifferencesCount, @MissingInBucketBCount, @MissingInBucketACount,
-                @SizeMismatchCount, @ETagMismatchCount, @ContentMismatchCount, @SequenceGapCount,
+                @SizeMismatchCount, @ETagMismatchCount, @ContentMismatchCount, @SequenceGapCount, @ContentCheckErrorCount,
                 @BucketAObjectsRead, @BucketBObjectsRead, @BucketABytesRead, @BucketBBytesRead,
                 @DurationSeconds, @ErrorMessage
             );
@@ -166,6 +167,7 @@ public class ScanRunRepository : IScanRunRepository
                 ETagMismatchCount = @ETagMismatchCount,
                 ContentMismatchCount = @ContentMismatchCount,
                 SequenceGapCount = @SequenceGapCount,
+                ContentCheckErrorCount = @ContentCheckErrorCount,
                 BucketAObjectsRead = @BucketAObjectsRead,
                 BucketBObjectsRead = @BucketBObjectsRead,
                 BucketABytesRead = @BucketABytesRead,
@@ -206,7 +208,7 @@ public class ScanRunRepository : IScanRunRepository
         ReplicationGracePeriodMinutes, GracePeriodCutoffUtc, IsScanWindowClipped, IsResumedFromCheckpoint,
         ResumeCount, SupersededByRunId, DifferencesTruncated, ObjectsCompared, MatchedCount, TotalDifferences,
         FilteredDifferencesCount, InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
-        SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, BucketAObjectsRead,
+        SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, ContentCheckErrorCount, BucketAObjectsRead,
         BucketBObjectsRead, BucketABytesRead, BucketBBytesRead, DurationSeconds, ErrorMessage";
 
     private const string AllRunColumns = SummaryRunColumns + ", ScanWindowNotes, LastEvaluatedKey, ResumedFromKey";
@@ -332,7 +334,7 @@ public class ScanRunRepository : IScanRunRepository
                 LastEvaluatedKey = '', IsResumedFromCheckpoint = 0, ResumedFromKey = NULL, DifferencesTruncated = 0,
                 ObjectsCompared = 0, MatchedCount = 0, TotalDifferences = 0, FilteredDifferencesCount = 0,
                 InFlightDifferencesCount = 0, MissingInBucketBCount = 0, MissingInBucketACount = 0,
-                SizeMismatchCount = 0, ETagMismatchCount = 0, ContentMismatchCount = 0, SequenceGapCount = 0,
+                SizeMismatchCount = 0, ETagMismatchCount = 0, ContentMismatchCount = 0, SequenceGapCount = 0, ContentCheckErrorCount = 0,
                 BucketAObjectsRead = 0, BucketBObjectsRead = 0, BucketABytesRead = 0, BucketBBytesRead = 0,
                 DurationSeconds = 0
             WHERE Id = @Id", p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
@@ -497,6 +499,7 @@ public class ScanRunRepository : IScanRunRepository
             ETagMismatchCount = Num("ETagMismatchCount"),
             ContentMismatchCount = Num("ContentMismatchCount"),
             SequenceGapCount = Num("SequenceGapCount"),
+            ContentCheckErrorCount = Num("ContentCheckErrorCount"),
             BucketAObjectsRead = Num("BucketAObjectsRead"),
             BucketBObjectsRead = Num("BucketBObjectsRead"),
             BucketABytesRead = Num("BucketABytesRead"),

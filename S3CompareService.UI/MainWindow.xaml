@@ -863,6 +863,10 @@
                                                         <TextBlock Text="Max Sequence / Numerical Gaps:" Margin="0,0,0,2" FontSize="11" />
                                                         <TextBox Text="{Binding SelectedJob.AlertConfig.MaxSequenceGapsThreshold, UpdateSourceTrigger=PropertyChanged}" />
                                                     </StackPanel>
+                                                    <StackPanel Grid.Column="6" Grid.Row="2" ToolTip="Full Data mode: objects whose content could not be read (access denied, service or network error after one retry). 0 = disabled; they still count as confirmed disparities.">
+                                                        <TextBlock Text="Max Content Check Errors:" Margin="0,0,0,2" FontSize="11" />
+                                                        <TextBox Text="{Binding SelectedJob.AlertConfig.MaxContentCheckErrorThreshold, UpdateSourceTrigger=PropertyChanged}" />
+                                                    </StackPanel>
                                                 </Grid>
                                                 <TextBlock Text="ℹ️ Thresholds trigger when confirmed disparities exceed the set limit. The overall limit of 0 alerts on any disparity; per-type limits of 0 are disabled. In-flight objects within the Replication Grace Period are automatically excluded to prevent false alerts." 
                                                            Foreground="#888888" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap" />
@@ -1118,6 +1122,7 @@
                                     <ComboBoxItem Content="ETag / Hash Mismatch" Tag="ETagMismatch" />
                                     <ComboBoxItem Content="Content Mismatch" Tag="ContentMismatch" />
                                     <ComboBoxItem Content="Sequence Gap" Tag="SequenceGap" />
+                                    <ComboBoxItem Content="Content Check Error" Tag="ContentCheckError" />
                                 </ComboBox>
                             </StackPanel>
 
