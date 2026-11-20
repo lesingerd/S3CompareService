@@ -1121,7 +1121,7 @@
                                     <ComboBoxItem Content="Size Mismatch" Tag="SizeMismatch" />
                                     <ComboBoxItem Content="ETag / Hash Mismatch" Tag="ETagMismatch" />
                                     <ComboBoxItem Content="Content Mismatch" Tag="ContentMismatch" />
-                                    <ComboBoxItem Content="Sequence Gap" Tag="SequenceGap" />
+                                    <ComboBoxItem Content="Sequence Gap" Tag="PossibleMissingOnBothSides" />
                                     <ComboBoxItem Content="Content Check Error" Tag="ContentCheckError" />
                                 </ComboBox>
                             </StackPanel>
