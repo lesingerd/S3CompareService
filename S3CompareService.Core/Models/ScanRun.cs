@@ -47,6 +47,7 @@ public class ScanRun
     public long ETagMismatchCount { get; set; }
     public long ContentMismatchCount { get; set; }
     public long SequenceGapCount { get; set; }
+    public long ContentCheckErrorCount { get; set; }
 
     public long BucketAObjectsRead { get; set; }
     public long BucketBObjectsRead { get; set; }

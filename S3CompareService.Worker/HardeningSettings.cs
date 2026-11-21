@@ -28,16 +28,66 @@ public static class HardeningSettings
         return options;
     }
 
-    /// <summary>Reads the scan limits.</summary>
-    public static ScanOptions Scan(IConfiguration configuration)
+    /// <summary>
+    /// Reads the scan limits and the parallel-scan throughput defaults (<c>S3Compare:MaxParallelPartitions</c>,
+    /// <c>PrefetchPages</c>, <c>MaxObjectsPerSecond</c>, <c>MaxConcurrentContentChecks</c>, <c>MaxDiscoveryRequests</c>,
+    /// <c>PartitionOversubscription</c>, <c>MaxDiscoveryDepth</c>). A missing value keeps its default. A value above its
+    /// limit is clamped to the limit; an unreadable or too small value keeps the default. Both are reported through
+    /// <paramref name="warn"/>.
+    /// </summary>
+    public static ScanOptions Scan(IConfiguration configuration, Action<string>? warn = null)
     {
         var options = new ScanOptions();
         if (long.TryParse(configuration["S3Compare:MaxRecordedDifferencesPerRun"], out var cap) && cap >= 0)
             options.MaxRecordedDifferencesPerRun = cap;
-        if (double.TryParse(configuration["S3Compare:MaxListRequestsPerSecond"], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var rate)
-            && rate >= 0 && !double.IsNaN(rate) && !double.IsInfinity(rate))
-            options.MaxListRequestsPerSecond = rate;
+        options.MaxListRequestsPerSecond = ReadDouble(configuration, "MaxListRequestsPerSecond", options.MaxListRequestsPerSecond, ScanOptions.MaxListRequestsPerSecondLimit, warn);
+        options.MaxObjectsPerSecond = ReadDouble(configuration, "MaxObjectsPerSecond", options.MaxObjectsPerSecond, ScanOptions.MaxObjectsPerSecondLimit, warn);
+        options.MaxParallelPartitions = ReadInt(configuration, "MaxParallelPartitions", options.MaxParallelPartitions, 1, ScanOptions.MaxParallelPartitionsLimit, warn);
+        options.PrefetchPages = ReadInt(configuration, "PrefetchPages", options.PrefetchPages, 1, ScanOptions.PrefetchPagesLimit, warn);
+        options.MaxConcurrentContentChecks = ReadInt(configuration, "MaxConcurrentContentChecks", options.MaxConcurrentContentChecks, 1, ScanOptions.MaxConcurrentContentChecksLimit, warn);
+        options.MaxDiscoveryRequests = ReadInt(configuration, "MaxDiscoveryRequests", options.MaxDiscoveryRequests, 0, ScanOptions.MaxDiscoveryRequestsLimit, warn);
+        options.PartitionOversubscription = ReadInt(configuration, "PartitionOversubscription", options.PartitionOversubscription, 1, ScanOptions.PartitionOversubscriptionLimit, warn);
+        options.MaxDiscoveryDepth = ReadInt(configuration, "MaxDiscoveryDepth", options.MaxDiscoveryDepth, 0, ScanOptions.MaxDiscoveryDepthLimit, warn);
+        if (options.ApplyMemoryCap())
+        {
+            warn?.Invoke($"S3Compare:PrefetchPages lowered to {options.PrefetchPages}: MaxParallelPartitions x (PrefetchPages + 1) may not exceed {ScanOptions.MaxBufferedPagesPerBucket} list pages per bucket.");
+        }
         return options;
+    }
+
+    private static double ReadDouble(IConfiguration configuration, string name, double fallback, double max, Action<string>? warn)
+    {
+        string? text = configuration["S3Compare:" + name];
+        if (string.IsNullOrWhiteSpace(text)) return fallback;
+        if (!double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var value)
+            || double.IsNaN(value) || value < 0)
+        {
+            warn?.Invoke($"S3Compare:{name} = '{text}' is not a number of at least 0; using the default {fallback}.");
+            return fallback;
+        }
+        if (value > max)
+        {
+            warn?.Invoke($"S3Compare:{name} = {text} is above the limit; using {max}.");
+            return max;
+        }
+        return value;
+    }
+
+    private static int ReadInt(IConfiguration configuration, string name, int fallback, int min, int max, Action<string>? warn)
+    {
+        string? text = configuration["S3Compare:" + name];
+        if (string.IsNullOrWhiteSpace(text)) return fallback;
+        if (!long.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var value) || value < min)
+        {
+            warn?.Invoke($"S3Compare:{name} = '{text}' is not a whole number of at least {min}; using the default {fallback}.");
+            return fallback;
+        }
+        if (value > max)
+        {
+            warn?.Invoke($"S3Compare:{name} = {text} is above the limit; using {max}.");
+            return max;
+        }
+        return (int)value;
     }
 
     /// <summary>Parses a priority name. Empty or unknown means BelowNormal; RealTime is refused (it can starve the host).</summary>

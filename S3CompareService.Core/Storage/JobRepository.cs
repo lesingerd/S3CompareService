@@ -34,10 +34,13 @@ public interface IJobRepository
 public class JobRepository : IJobRepository
 {
     private readonly SqliteConnectionFactory _factory;
+    private readonly IAuditLogRepository? _auditLog;
 
-    public JobRepository(SqliteConnectionFactory factory)
+    /// <param name="auditLog">Optional: where an unreadable stored setting (corrupt JSON) is reported.</param>
+    public JobRepository(SqliteConnectionFactory factory, IAuditLogRepository? auditLog = null)
     {
         _factory = factory;
+        _auditLog = auditLog;
     }
 
     public async Task<List<ComparisonJob>> GetAllAsync(CancellationToken cancellationToken = default)
@@ -96,12 +99,12 @@ public class JobRepository : IJobRepository
             INSERT INTO Jobs (
                 Id, Name, Description, BucketA_Json, BucketB_Json, Mode, ScheduleType,
                 IntervalMinutes, CronExpression, IsEnabled, ReplicationGracePeriodMinutes,
-                DetectSequenceGaps, MaxSequenceGapThreshold, AlertConfig_Json, CreatedAtUtc, UpdatedAtUtc,
+                DetectSequenceGaps, MaxSequenceGapThreshold, AlertConfig_Json, Performance_Json, CreatedAtUtc, UpdatedAtUtc,
                 LastRunTimeUtc, NextRunTimeUtc, LastRunStatus
             ) VALUES (
                 @Id, @Name, @Description, @BucketA_Json, @BucketB_Json, @Mode, @ScheduleType,
                 @IntervalMinutes, @CronExpression, @IsEnabled, @ReplicationGracePeriodMinutes,
-                @DetectSequenceGaps, @MaxSequenceGapThreshold, @AlertConfig_Json, @CreatedAtUtc, @UpdatedAtUtc,
+                @DetectSequenceGaps, @MaxSequenceGapThreshold, @AlertConfig_Json, @Performance_Json, @CreatedAtUtc, @UpdatedAtUtc,
                 @LastRunTimeUtc, @NextRunTimeUtc, @LastRunStatus
             )
             ON CONFLICT(Id) DO UPDATE SET
@@ -118,6 +121,7 @@ public class JobRepository : IJobRepository
                 DetectSequenceGaps = excluded.DetectSequenceGaps,
                 MaxSequenceGapThreshold = excluded.MaxSequenceGapThreshold,
                 AlertConfig_Json = excluded.AlertConfig_Json,
+                Performance_Json = excluded.Performance_Json,
                 UpdatedAtUtc = excluded.UpdatedAtUtc;
         ";
 
@@ -137,6 +141,7 @@ public class JobRepository : IJobRepository
             DetectSequenceGaps = job.DetectSequenceGaps ? 1 : 0,
             job.MaxSequenceGapThreshold,
             AlertConfig_Json = SerializeAlertConfig(job.AlertConfig),
+            Performance_Json = job.Performance == null || job.Performance.IsEmpty ? null : JsonSerializer.Serialize(job.Performance),
             CreatedAtUtc = DbDateTime.ToDb(job.CreatedAtUtc),
             UpdatedAtUtc = DbDateTime.ToDb(job.UpdatedAtUtc),
             LastRunTimeUtc = DbDateTime.ToDb(job.LastRunTimeUtc),
@@ -247,7 +252,7 @@ public class JobRepository : IJobRepository
         }
     }
 
-    private static ComparisonJob MapRowToJob(dynamic r)
+    private ComparisonJob MapRowToJob(dynamic r)
     {
         var job = new ComparisonJob
         {
@@ -282,12 +287,42 @@ public class JobRepository : IJobRepository
 
         if (r is IDictionary<string, object> dict && dict.TryGetValue("AlertConfig_Json", out var alertJson) && alertJson is string jsonStr && !string.IsNullOrWhiteSpace(jsonStr))
         {
-            job.AlertConfig = JsonSerializer.Deserialize<JobAlertConfig>(jsonStr) ?? new();
+            try
+            {
+                job.AlertConfig = JsonSerializer.Deserialize<JobAlertConfig>(jsonStr) ?? new();
+            }
+            catch (JsonException ex)
+            {
+                // One corrupt row must not break loading every job (GET /api/jobs, the scheduler).
+                job.AlertConfig = new();
+                ReportCorruptColumn(job, "AlertConfig_Json", ex);
+            }
             job.AlertConfig.LastAlertSentUtc = DbDateTime.ToUtc(job.AlertConfig.LastAlertSentUtc);
             job.AlertConfig.LastDailyDigestSentUtc = DbDateTime.ToUtc(job.AlertConfig.LastDailyDigestSentUtc);
             SecretProtector.Transform(job.AlertConfig, SafeUnprotect);
         }
 
+        if (r is IDictionary<string, object> row && row.TryGetValue("Performance_Json", out var perfJson) && perfJson is string perfStr && !string.IsNullOrWhiteSpace(perfStr))
+        {
+            try
+            {
+                job.Performance = JsonSerializer.Deserialize<JobPerformanceSettings>(perfStr) ?? new();
+            }
+            catch (JsonException ex)
+            {
+                job.Performance = new(); // service defaults
+                ReportCorruptColumn(job, "Performance_Json", ex);
+            }
+        }
+
         return job;
+    }
+
+    private void ReportCorruptColumn(ComparisonJob job, string column, Exception ex)
+    {
+        if (_auditLog == null) return;
+        _ = _auditLog.LogAsync("WARN", "JobRepository",
+            $"Job '{job.Name}' ({job.Id}): {column} could not be read ({ex.Message}); using defaults until the job is saved again.",
+            jobId: job.Id);
     }
 }

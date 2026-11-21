@@ -61,7 +61,8 @@ public class CrashRecoveryManager
 
             await _auditLogRepo.LogAsync("RECOVERY", "CrashRecovery", message, details: details, scanRunId: run.Id, jobId: run.JobId, cancellationToken: cancellationToken);
 
-            if (checkpoint != null && !string.IsNullOrWhiteSpace(checkpoint.LastEvaluatedKey))
+            // CanResume: a key (version 1) or any range progress in the partition plan (version 2; its frontier key may be empty).
+            if (checkpoint != null && checkpoint.CanResume)
             {
                 var result = await _coordinator.ResumeUnfinishedRunAsync(run.Id);
                 if (result.Success)

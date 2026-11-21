@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -8,18 +10,30 @@ using S3CompareService.Core.Storage;
 namespace S3CompareService.Core.Engine;
 
 /// <summary>
-/// Streaming, checkpointed comparison of two S3 buckets.
+/// Streaming, checkpointed, parallel comparison of two S3 buckets.
 ///
-/// Resume contract: a checkpoint is only written after every difference up to its LastEvaluatedKey has been
-/// persisted, and LastEvaluatedKey / counters only advance once a key has been completely processed. To resume,
-/// pass the *same* ScanRun row (see <see cref="IScanRunRepository.ReopenForResumeAsync"/>) and its checkpoint
-/// (<see cref="IScanRunRepository.GetCheckpointAsync"/>) and, when not using the real S3 enumerators, streams that
-/// already start after the checkpoint key. Differences then stay under the original run id.
+/// The keyspace (keys relative to each bucket's prefix) is split into key ranges by <see cref="PartitionPlanner"/>; up to
+/// <see cref="ScanOptions.MaxParallelPartitions"/> workers pull ranges from a queue and merge-join the two buckets' listings of
+/// their range. Each listing is a <see cref="PrefetchingObjectStream"/> (background producer, bounded page buffer), so A and B
+/// list concurrently and ahead of the comparison. With MaxParallelPartitions = 1 (or supplied test streams) there is one range.
+///
+/// Shared state (counters, the difference buffer, per-range progress) changes only under one lock, per key, in
+/// <c>CommitKey</c>. Database writes go through a single-writer gate: one flush or checkpoint at a time. A checkpoint swaps the
+/// difference buffer and snapshots every range's last completed key and the counters under that lock, inserts the swapped
+/// differences, and only then saves the plan, so a persisted key never claims differences that are not stored.
+///
+/// Resume contract: pass the *same* ScanRun row (see <see cref="IScanRunRepository.ReopenForResumeAsync"/>) and its checkpoint
+/// (<see cref="IScanRunRepository.GetCheckpointAsync"/>). The persisted plan is reused (no re-planning): completed ranges are
+/// skipped, the others continue after their last completed key. A version 1 checkpoint (one key) resumes as one range. When
+/// supplying streams instead of S3 (tests), they must already start after the checkpoint key, and only one range is possible.
 /// </summary>
 public class ServiceComparisonEngine
 {
     private const int DifferenceBatchSize = 500;
     private const int MaxConsecutiveCheckpointFailures = 5;
+    private const long CheckpointIntervalMs = 5000;
+    private const long CheckpointEveryItems = 5000; // per worker, so many fast partitions do not checkpoint many times a second
+    private const long ProgressIntervalMs = 250;
 
     private readonly ComparisonJob _job;
     private readonly ScanRun _scanRun;
@@ -28,28 +42,44 @@ public class ServiceComparisonEngine
     private readonly IAuditLogRepository? _auditLogRepo;
     private readonly IS3ObjectStream? _providedStreamA;
     private readonly IS3ObjectStream? _providedStreamB;
+    private readonly IS3Lister? _providedListerA;
+    private readonly IS3Lister? _providedListerB;
     private readonly ScanCheckpoint? _resumeCheckpoint;
+    private readonly List<PartitionRange>? _resumeRanges;
     private readonly bool _checkpointDiscarded;
+    private readonly bool _replanAfterLegacyKey;
     private readonly ScanOptions _options;
     private readonly long _maxRecordedDifferences;
-    private long _recordedRows; // difference rows stored (or buffered) for this run; compared with the cap
-    private IRequestRateLimiter? _limiterA, _limiterB;
 
-    private readonly SequenceGapDetector? _gapDetector;
+    private IAmazonS3? _clientA, _clientB;
+    private IS3Lister? _listerA, _listerB;
+    private IS3ObjectReader? _readerA, _readerB;
+    private IRequestRateLimiter? _limiterA, _limiterB;
+    private TokenBucketRateLimiter? _objectLimiter;
+    private int _objectTokenBatch = 1;
+    private readonly SemaphoreSlim _contentChecks;
+
+    // ---- shared state: everything below is read and written under _stateLock ----
+    private readonly object _stateLock = new();
     private readonly ComparisonStatistics _stats = new();
+    private List<PartitionRange> _ranges = new() { new PartitionRange() };
+    private List<RecordedDifference> _differenceBuffer = new();
+    private long _recordedRows; // difference rows stored (or buffered) for this run; compared with the cap
+    private readonly BucketAggregate _aggregateA = new();
+    private readonly BucketAggregate _aggregateB = new();
+
+    // ---- single writer: at most one flush or checkpoint at a time ----
+    private readonly SemaphoreSlim _writerGate = new(1, 1);
+    private long _lastBufferFlushTime;
+    private long _lastCheckpointTime;
+    private long _itemsSinceLastCheckpoint;
+    private long _checkpointItemThreshold = CheckpointEveryItems;
+    private long _lastProgressReportTime;
+    private int _consecutiveCheckpointFailures;
+
+    private int _handlerFailureLogged;
     private readonly Stopwatch _stopwatch = new();
     private readonly double _baselineElapsedSeconds;
-    private string _lastEvaluatedKey = string.Empty;
-    private bool _hasLastKey;
-
-    // Objects fully consumed from each side (excludes the look-ahead item the merge loop is holding).
-    private long _processedA, _processedB, _processedBytesA, _processedBytesB;
-
-    private readonly List<RecordedDifference> _differenceBuffer = new();
-    private readonly object _bufferLock = new();
-    private long _lastBufferFlushTime = 0;
-    private int _consecutiveCheckpointFailures;
-    private int _handlerFailureLogged;
 
     private readonly object _pauseLock = new();
     private volatile bool _isPaused = false;
@@ -57,7 +87,17 @@ public class ServiceComparisonEngine
     private TaskCompletionSource<bool>? _pauseTcs;
     private Task _statusPersistTask = Task.CompletedTask;
 
+    /// <summary>
+    /// Raised about every 250 ms from whichever worker is due (one at a time), and once at the end. Runs on a worker thread
+    /// and holds up that worker while it runs, so keep it short. No engine lock is held while it runs.
+    /// </summary>
     public event Action<ComparisonStatistics>? ProgressUpdated;
+
+    /// <summary>
+    /// Raised for every difference, on the worker thread that found it, with no engine lock held. With several partitions
+    /// differences are found concurrently and not in key order, and the handler CAN be invoked concurrently from several
+    /// workers: it must be thread-safe and fast (a slow handler slows the worker that raised it, not the others).
+    /// </summary>
     public event Action<RecordedDifference>? DifferenceFound;
 
     /// <summary>Why a supplied checkpoint was ignored (job configuration changed), or null.</summary>
@@ -66,6 +106,20 @@ public class ServiceComparisonEngine
     /// <summary>True when the engine will continue from a valid checkpoint.</summary>
     public bool IsResuming => _resumeCheckpoint != null;
 
+    /// <summary>The effective options of this scan (service defaults with the job's overrides already applied by the caller).</summary>
+    public ScanOptions Options => _options;
+
+    /// <summary>A copy of the current partition plan with its progress.</summary>
+    public List<PartitionRange> GetPartitionsSnapshot()
+    {
+        lock (_stateLock) return _ranges.Select(r => r.Clone()).ToList();
+    }
+
+    /// <param name="options">The scan's effective options. Pass <c>serviceOptions.ForJob(job)</c> to honour per-job overrides.</param>
+    /// <param name="streamA">Test hook: a ready listing of bucket A (single range; no planning).</param>
+    /// <param name="streamB">Test hook: a ready listing of bucket B.</param>
+    /// <param name="listerA">Test hook: list bucket A through this instead of an S3 client (partitioned path).</param>
+    /// <param name="listerB">Test hook: list bucket B through this instead of an S3 client.</param>
     public ServiceComparisonEngine(
         ComparisonJob job,
         ScanRun scanRun,
@@ -75,7 +129,9 @@ public class ServiceComparisonEngine
         ScanCheckpoint? resumeCheckpoint = null,
         IS3ObjectStream? streamA = null,
         IS3ObjectStream? streamB = null,
-        ScanOptions? options = null)
+        ScanOptions? options = null,
+        IS3Lister? listerA = null,
+        IS3Lister? listerB = null)
     {
         _job = job ?? throw new ArgumentNullException(nameof(job));
         _scanRun = scanRun ?? throw new ArgumentNullException(nameof(scanRun));
@@ -84,20 +140,36 @@ public class ServiceComparisonEngine
         _auditLogRepo = auditLogRepo;
         _providedStreamA = streamA;
         _providedStreamB = streamB;
-        _options = options ?? new ScanOptions();
+        _providedListerA = listerA;
+        _providedListerB = listerB;
+        _options = options?.Clone() ?? new ScanOptions();
+        _options.ApplyMemoryCap();
         _maxRecordedDifferences = _options.MaxRecordedDifferencesPerRun;
-
-        if (_job.DetectSequenceGaps)
-        {
-            _gapDetector = new SequenceGapDetector(_job.MaxSequenceGapThreshold);
-        }
+        _contentChecks = new SemaphoreSlim(Math.Max(1, _options.MaxConcurrentContentChecks));
 
         if (resumeCheckpoint != null)
         {
-            CheckpointDiscardReason = ValidateCheckpoint(resumeCheckpoint);
-            if (CheckpointDiscardReason == null)
+            var reason = ValidateCheckpoint(resumeCheckpoint);
+            List<PartitionRange>? ranges = null;
+            if (reason == null)
+            {
+                ranges = resumeCheckpoint.Partitions is { Count: > 0 } plan
+                    ? plan.Select(r => r.Clone()).ToList()
+                    : new List<PartitionRange> { new() { LastCompletedKey = resumeCheckpoint.HasKey ? resumeCheckpoint.LastEvaluatedKey ?? string.Empty : null } };
+                var tiling = PartitionPlanner.ValidateTiling(ranges);
+                if (tiling != null) reason = $"partition plan is invalid ({tiling})";
+                else if (ranges.Count > 1 && UsesProvidedStreams) reason = "a partitioned checkpoint cannot resume over supplied streams";
+            }
+
+            CheckpointDiscardReason = reason;
+            if (reason == null)
             {
                 _resumeCheckpoint = resumeCheckpoint;
+                _resumeRanges = ranges;
+                _ranges = ranges!.Select(r => r.Clone()).ToList();
+                // A version 1 checkpoint has one key and no plan: the rest of the keyspace is planned (and scanned in
+                // parallel) after that key at the start of RunAsync.
+                _replanAfterLegacyKey = resumeCheckpoint.Partitions is not { Count: > 0 } && !UsesProvidedStreams;
                 _baselineElapsedSeconds = resumeCheckpoint.ElapsedSeconds;
                 InitializeStatsFromCheckpoint(resumeCheckpoint);
                 _scanRun.IsResumedFromCheckpoint = true;
@@ -110,9 +182,11 @@ public class ServiceComparisonEngine
         }
     }
 
+    private bool UsesProvidedStreams => _providedStreamA != null && _providedStreamB != null;
+
     private string? ValidateCheckpoint(ScanCheckpoint cp)
     {
-        if (!cp.HasKey) return "checkpoint has no evaluated key";
+        if (!cp.CanResume) return "checkpoint has no evaluated key";
         if (!string.IsNullOrEmpty(cp.JobId) && !string.Equals(cp.JobId, _job.Id, StringComparison.Ordinal))
             return $"checkpoint belongs to job '{cp.JobId}', not '{_job.Id}'";
         if (!string.IsNullOrEmpty(cp.BucketNameA) && cp.BucketNameA != _job.BucketA.BucketName)
@@ -145,14 +219,13 @@ public class ServiceComparisonEngine
         _stats.ETagMismatchCount = cp.ETagMismatchCount;
         _stats.ContentMismatchCount = cp.ContentMismatchCount;
         _stats.SequenceGapCount = cp.SequenceGapCount;
-        _stats.BucketAObjectsRead = _processedA = cp.BucketAObjectsRead;
-        _stats.BucketBObjectsRead = _processedB = cp.BucketBObjectsRead;
-        _stats.BucketABytesRead = _processedBytesA = cp.BucketABytesRead;
-        _stats.BucketBBytesRead = _processedBytesB = cp.BucketBBytesRead;
+        _stats.ContentCheckErrorCount = cp.ContentCheckErrorCount;
+        _stats.BucketAObjectsRead = cp.BucketAObjectsRead;
+        _stats.BucketBObjectsRead = cp.BucketBObjectsRead;
+        _stats.BucketABytesRead = cp.BucketABytesRead;
+        _stats.BucketBBytesRead = cp.BucketBBytesRead;
         _stats.ElapsedTime = TimeSpan.FromSeconds(cp.ElapsedSeconds);
         _recordedRows = _maxRecordedDifferences > 0 ? Math.Min(cp.TotalDifferences, _maxRecordedDifferences) : cp.TotalDifferences;
-        _lastEvaluatedKey = cp.LastEvaluatedKey ?? string.Empty;
-        _hasLastKey = cp.HasKey;
     }
 
     public void Pause()
@@ -271,6 +344,12 @@ public class ServiceComparisonEngine
     public static string TruncationNote(long cap) =>
         $"Differences truncated: only the first {cap:N0} differences were stored; the counters below still count all of them.";
 
+    /// <summary>The frontier key of the current plan (see <see cref="PartitionPlanner.Frontier"/>). Caller holds no lock.</summary>
+    private string FrontierKey()
+    {
+        lock (_stateLock) return PartitionPlanner.Frontier(_ranges).Key;
+    }
+
     public async Task<ScanRun> RunAsync(CancellationToken cancellationToken = default)
     {
         _stopwatch.Restart();
@@ -285,11 +364,6 @@ public class ServiceComparisonEngine
         }
         ApplyGraceWindow();
 
-        IAmazonS3? clientA = null;
-        IAmazonS3? clientB = null;
-        IS3ObjectStream? enumA = null;
-        IS3ObjectStream? enumB = null;
-
         string? prefixA = string.IsNullOrEmpty(_job.BucketA.Prefix) ? null : _job.BucketA.Prefix;
         string? prefixB = string.IsNullOrEmpty(_job.BucketB.Prefix) ? null : _job.BucketB.Prefix;
 
@@ -302,52 +376,256 @@ public class ServiceComparisonEngine
             {
                 await LogAsync("WARN", $"Checkpoint for run '{_scanRun.Id}' was discarded ({CheckpointDiscardReason}); starting a fresh scan.").ConfigureAwait(false);
             }
-            await LogAsync("INFO", $"Starting scan run '{_scanRun.Id}' for job '{_job.Name}' (Grace Period: {_job.ReplicationGracePeriodMinutes}m){(IsResuming ? $", resuming after key '{_lastEvaluatedKey}'" : string.Empty)}").ConfigureAwait(false);
+            await LogAsync("INFO", $"Starting scan run '{_scanRun.Id}' for job '{_job.Name}' (Grace Period: {_job.ReplicationGracePeriodMinutes}m){(IsResuming ? $", resuming after key '{FrontierKey()}'" : string.Empty)}").ConfigureAwait(false);
 
-            if (_providedStreamA != null && _providedStreamB != null)
+            if (_options.MaxObjectsPerSecond > 0)
             {
-                enumA = _providedStreamA;
-                enumB = _providedStreamB;
+                // Paid in batches of about 1/20 s worth of keys, so the limiter costs one lock per batch, not per key.
+                _objectTokenBatch = (int)Math.Clamp(_options.MaxObjectsPerSecond / 20, 1, 256);
+                _objectLimiter = new TokenBucketRateLimiter(_options.MaxObjectsPerSecond, burst: Math.Max(_options.MaxObjectsPerSecond, _objectTokenBatch));
             }
-            else
+
+            if (!UsesProvidedStreams)
             {
-                clientA = S3ClientFactory.CreateClient(_job.BucketA);
-                clientB = S3ClientFactory.CreateClient(_job.BucketB);
+                int connections = S3ClientFactory.ConnectionsForScan(_options.MaxParallelPartitions, _job.Mode == ComparisonMode.FullData ? _options.MaxConcurrentContentChecks : 0);
+                _listerA = _providedListerA;
+                _listerB = _providedListerB;
+                if (_listerA == null)
+                {
+                    _clientA = S3ClientFactory.CreateClient(_job.BucketA, connections);
+                    _listerA = new S3Lister(_clientA);
+                }
+                if (_listerB == null)
+                {
+                    _clientB = S3ClientFactory.CreateClient(_job.BucketB, connections);
+                    _listerB = new S3Lister(_clientB);
+                }
+                // One limiter per bucket side for the whole scan: every partition, the planner and content reads share it.
                 _limiterA = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
                 _limiterB = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
+                _readerA = _listerA as IS3ObjectReader;
+                _readerB = _listerB as IS3ObjectReader;
 
-                bool hasKey = IsResuming && _hasLastKey;
-                string? startAfterA = BuildStartAfterKey(hasKey, _lastEvaluatedKey, prefixA);
-                string? startAfterB = BuildStartAfterKey(hasKey, _lastEvaluatedKey, prefixB);
-
-                enumA = new S3PagingEnumerator(
-                    clientA,
-                    _job.BucketA.BucketName,
-                    prefixA ?? string.Empty,
-                    startAfterA,
-                    initialObjectsRead: _processedA,
-                    initialBytesRead: _processedBytesA,
-                    rateLimiter: _limiterA);
-
-                enumB = new S3PagingEnumerator(
-                    clientB,
-                    _job.BucketB.BucketName,
-                    prefixB ?? string.Empty,
-                    startAfterB,
-                    initialObjectsRead: _processedB,
-                    initialBytesRead: _processedBytesB,
-                    rateLimiter: _limiterB);
+                if (_resumeRanges == null)
+                {
+                    var plan = await PlanPartitionsAsync(prefixA, prefixB, cancellationToken).ConfigureAwait(false);
+                    lock (_stateLock) _ranges = plan;
+                }
+                else if (_replanAfterLegacyKey)
+                {
+                    string done = _resumeRanges[0].LastCompletedKey ?? string.Empty;
+                    var plan = PartitionPlanner.ResumePlanAfter(await PlanPartitionsAsync(prefixA, prefixB, cancellationToken).ConfigureAwait(false), done);
+                    lock (_stateLock) _ranges = plan;
+                    await LogAsync("INFO", $"Resume from a single-key checkpoint: the keyspace after '{done}' was planned as {plan.Count - 1} key range(s).").ConfigureAwait(false);
+                }
             }
 
-            bool hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
-            bool hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
+            lock (_stateLock)
+            {
+                _stats.PartitionsTotal = _ranges.Count;
+                _stats.PartitionsCompleted = _ranges.Count(r => r.Completed);
+            }
 
-            var maintenance = new MaintenanceState();
+            await RunPartitionsAsync(prefixA, prefixB, cancellationToken).ConfigureAwait(false);
+
+            // Flush any remaining differences
+            await FlushDifferencesAsync(cancellationToken).ConfigureAwait(false);
+
+            // Record Bucket Metadata Snapshots
+            if (UsesProvidedStreams)
+            {
+                lock (_stateLock)
+                {
+                    _aggregateA.Add(_providedStreamA!);
+                    _aggregateB.Add(_providedStreamB!);
+                }
+            }
+            await RecordBucketMetadataSnapshotsAsync(cancellationToken).ConfigureAwait(false);
+
+            // Scan completed normally
+            UpdateLiveStats(includeSystemDiagnostics: true);
+            _scanRun.Status = RunStatus.Completed;
+            _scanRun.EndTimeUtc = DateTime.UtcNow;
+            _scanRun.ErrorMessage = null;
+            _scanRun.LastEvaluatedKey = FrontierKey();
+            SyncStatsToRun(_scanRun, CloneStats());
+
+            await ObserveStatusPersistAsync().ConfigureAwait(false);
+            await _scanRunRepo.CompleteAsync(_scanRun, cancellationToken).ConfigureAwait(false);
+            await _scanRunRepo.DeleteCheckpointAsync(_scanRun.Id, cancellationToken).ConfigureAwait(false);
+
+            await LogAsync("INFO", $"Scan run '{_scanRun.Id}' completed successfully: {_scanRun.ObjectsCompared:N0} objects evaluated, {_scanRun.MatchedCount:N0} matched, {_scanRun.TotalDifferences:N0} raw diffs ({_scanRun.FilteredDifferencesCount:N0} confirmed disparities, {_scanRun.InFlightDifferencesCount:N0} in-flight replication).").ConfigureAwait(false);
+        }
+        catch (Exception ex) when (cancellationToken.IsCancellationRequested)
+        {
+            // Cancelled (user) or interrupted (shutdown). A worker or the final steps may surface the cancellation as some
+            // other exception (an SDK or I/O error from an aborted request); that is still a cancellation, not a failure.
+            var status = _isServiceShutdown ? RunStatus.Interrupted : RunStatus.Cancelled;
+            string message = _isServiceShutdown
+                ? "Scan interrupted by service shutdown. Checkpoint saved for automatic recovery."
+                : "Scan was cancelled by user.";
+            await FinalizeRunAsync(status, message).ConfigureAwait(false);
+
+            await LogAsync(
+                _isServiceShutdown ? "RECOVERY" : "WARN",
+                $"Scan run '{_scanRun.Id}' {(_isServiceShutdown ? "interrupted for service shutdown" : "cancelled")}. Checkpoint saved at key '{FrontierKey()}'.",
+                ex is OperationCanceledException ? null : $"Surfaced as {ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
+            if (ex is OperationCanceledException) throw;
+            throw new OperationCanceledException(message, ex, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            await FinalizeRunAsync(RunStatus.Failed, $"{ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
+            await LogAsync("ERROR", $"Scan run '{_scanRun.Id}' failed with error: {ex.Message}", ex.StackTrace).ConfigureAwait(false);
+            throw;
+        }
+        finally
+        {
+            _stopwatch.Stop();
+            try { if (_providedStreamA != null) await _providedStreamA.DisposeAsync().ConfigureAwait(false); } catch { }
+            try { if (_providedStreamB != null) await _providedStreamB.DisposeAsync().ConfigureAwait(false); } catch { }
+            try { _clientA?.Dispose(); } catch { }
+            try { _clientB?.Dispose(); } catch { }
+        }
+
+        UpdateLiveStats(includeSystemDiagnostics: true);
+        RaiseProgress();
+        return _scanRun;
+    }
+
+    /// <summary>Plans the key ranges. A planning failure is not fatal: the scan then runs as one range.</summary>
+    private async Task<List<PartitionRange>> PlanPartitionsAsync(string? prefixA, string? prefixB, CancellationToken ct)
+    {
+        if (_options.MaxParallelPartitions <= 1 || _options.MaxDiscoveryRequests <= 0)
+        {
+            return PartitionPlanner.BuildRanges(Array.Empty<string>(), 1);
+        }
+
+        var planner = new PartitionPlanner(
+            _listerA!, _job.BucketA.BucketName, prefixA, _limiterA,
+            _listerB!, _job.BucketB.BucketName, prefixB, _limiterB,
+            _options.TargetPartitions, _options.MaxDiscoveryDepth, _options.MaxDiscoveryRequests,
+            pauseGate: CheckPauseAsync);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var plan = await planner.PlanAsync(ct).ConfigureAwait(false);
+            await LogAsync("INFO", $"Partition plan for run '{_scanRun.Id}': {plan.Count} key range(s) for {_options.MaxParallelPartitions} parallel worker(s) (method: {planner.Method}, {planner.CandidateCount} candidate boundaries, {planner.RequestsUsed} planning requests, {sw.ElapsedMilliseconds} ms).").ConfigureAwait(false);
+            return plan;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await LogAsync("WARN", $"Partition planning failed for run '{_scanRun.Id}' ({ex.Message}); scanning as one key range.", ex.StackTrace).ConfigureAwait(false);
+            return PartitionPlanner.BuildRanges(Array.Empty<string>(), 1);
+        }
+    }
+
+    /// <summary>Runs the workers over all unfinished ranges. All workers stop when one fails or the scan is cancelled.</summary>
+    private async Task RunPartitionsAsync(string? prefixA, string? prefixB, CancellationToken ct)
+    {
+        List<PartitionRange> pending;
+        lock (_stateLock) pending = _ranges.Where(r => !r.Completed).ToList();
+        if (pending.Count == 0) return;
+
+        var queue = new ConcurrentQueue<PartitionRange>(pending);
+        int workerCount = UsesProvidedStreams ? 1 : Math.Clamp(_options.MaxParallelPartitions, 1, pending.Count);
+        _checkpointItemThreshold = CheckpointEveryItems * workerCount;
+        using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var errors = new ConcurrentQueue<Exception>();
+
+        async Task WorkerAsync()
+        {
+            // Object-rate tokens are owed per worker, across its ranges: ranges smaller than a token batch still pay.
+            var tokens = new ObjectTokenAccount();
+            try
+            {
+                while (queue.TryDequeue(out var range))
+                {
+                    await RunRangeAsync(range, prefixA, prefixB, tokens, workersCts.Token).ConfigureAwait(false);
+                }
+                await PayObjectTokensAsync(tokens, workersCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                errors.Enqueue(ex);
+                try { workersCts.Cancel(); } catch (ObjectDisposedException) { }
+            }
+        }
+
+        if (workerCount == 1)
+        {
+            await WorkerAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            await Task.WhenAll(Enumerable.Range(0, workerCount).Select(_ => Task.Run(WorkerAsync))).ConfigureAwait(false);
+        }
+
+        if (!errors.IsEmpty)
+        {
+            // The caller's cancellation wins (other workers then only saw its echo); otherwise report the root cause.
+            ct.ThrowIfCancellationRequested();
+            var root = errors.FirstOrDefault(e => e is not OperationCanceledException) ?? errors.First();
+            ExceptionDispatchInfo.Capture(root).Throw();
+        }
+    }
+
+    /// <summary>Per-worker merge state of one range.</summary>
+    private sealed class RangeCursor
+    {
+        public required PartitionRange Range { get; init; }
+        public SequenceGapDetector? GapDetector { get; init; }
+        public required ObjectTokenAccount Tokens { get; init; }
+    }
+
+    /// <summary>Compared keys a worker has not yet paid to the object-rate limiter.</summary>
+    private sealed class ObjectTokenAccount
+    {
+        public int Pending;
+    }
+
+    /// <summary>Merge-joins the two listings of one key range.</summary>
+    private async Task RunRangeAsync(PartitionRange range, string? prefixA, string? prefixB, ObjectTokenAccount tokens, CancellationToken ct)
+    {
+        IS3ObjectStream enumA, enumB;
+        bool ownsStreams = !UsesProvidedStreams;
+        string? after;
+        lock (_stateLock) after = range.ResumeAfter;
+        if (ownsStreams)
+        {
+            bool hasAfter = after != null;
+            enumA = new PrefetchingObjectStream(_listerA!, _job.BucketA.BucketName, prefixA, BuildStartAfterKey(hasAfter, after, prefixA), range.Upper, _options.PrefetchPages, _limiterA, _options.ListPageSize, ct);
+            enumB = new PrefetchingObjectStream(_listerB!, _job.BucketB.BucketName, prefixB, BuildStartAfterKey(hasAfter, after, prefixB), range.Upper, _options.PrefetchPages, _limiterB, _options.ListPageSize, ct);
+        }
+        else
+        {
+            enumA = _providedStreamA!;
+            enumB = _providedStreamB!;
+        }
+
+        // Each range has its own gap detector, seeded with the key just before the range (its lower boundary, or the last key
+        // done when resuming), so a numeric series that crosses the boundary is checked as in one sequential listing.
+        var cursor = new RangeCursor { Range = range, Tokens = tokens, GapDetector = _job.DetectSequenceGaps ? new SequenceGapDetector(_job.MaxSequenceGapThreshold) : null };
+        if (cursor.GapDetector != null && !string.IsNullOrEmpty(after))
+        {
+            long unusedIdCounter = 0;
+            cursor.GapDetector.CheckKey(after, _scanRun.Id, ref unusedIdCounter); // primes the series; reports nothing
+        }
+        lock (_stateLock) _stats.PartitionsActive++;
+        try
+        {
+            bool hasA = await enumA.MoveNextAsync(ct).ConfigureAwait(false);
+            bool hasB = await enumB.MoveNextAsync(ct).ConfigureAwait(false);
 
             while (hasA || hasB)
             {
-                await CheckPauseAsync(cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
+                await CheckPauseAsync(ct).ConfigureAwait(false);
+                ct.ThrowIfCancellationRequested();
+                await ThrottleObjectsAsync(cursor, ct).ConfigureAwait(false);
 
                 S3ObjectSummary? itemA = hasA ? enumA.Current : null;
                 S3ObjectSummary? itemB = hasB ? enumB.Current : null;
@@ -363,10 +641,10 @@ public class ServiceComparisonEngine
                 // Phase 2 (CommitKey): synchronous bookkeeping - the key is either fully recorded or not at all.
                 if (cmp == 0)
                 {
-                    var (matched, diff) = await CompareSameKeyAsync(clientA, clientB, relKeyA!, itemA!, itemB!, cancellationToken).ConfigureAwait(false);
-                    CommitKey(relKeyA!, itemA, itemB, matched, diff);
-                    hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
-                    hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
+                    var (matched, diff) = await CompareSameKeyAsync(relKeyA!, itemA!, itemB!, ct).ConfigureAwait(false);
+                    CommitKey(cursor, relKeyA!, itemA, itemB, matched, diff);
+                    hasA = await enumA.MoveNextAsync(ct).ConfigureAwait(false);
+                    hasB = await enumB.MoveNextAsync(ct).ConfigureAwait(false);
                 }
                 else if (cmp < 0)
                 {
@@ -378,8 +656,8 @@ public class ServiceComparisonEngine
                             ? $"Object exists in Bucket A only (Tail). Size: {itemA!.FormattedSize}, ETag: {itemA.ETag}, StorageClass: {itemA.StorageClass}, LastModified: {itemA.LastModified:yyyy-MM-dd HH:mm:ss}"
                             : $"Object exists in Bucket A but is missing in Bucket B. Size: {itemA!.FormattedSize}, ETag: {itemA.ETag}, StorageClass: {itemA.StorageClass}, LastModified: {itemA.LastModified:yyyy-MM-dd HH:mm:ss}",
                         itemA, null);
-                    CommitKey(relKeyA!, itemA, null, false, diff);
-                    hasA = await enumA.MoveNextAsync(cancellationToken).ConfigureAwait(false);
+                    CommitKey(cursor, relKeyA!, itemA, null, false, diff);
+                    hasA = await enumA.MoveNextAsync(ct).ConfigureAwait(false);
                 }
                 else
                 {
@@ -391,64 +669,49 @@ public class ServiceComparisonEngine
                             ? $"Object exists in Bucket B only (Tail). Size: {itemB!.FormattedSize}, ETag: {itemB.ETag}, StorageClass: {itemB.StorageClass}, LastModified: {itemB.LastModified:yyyy-MM-dd HH:mm:ss}"
                             : $"Object exists in Bucket B but is missing in Bucket A. Size: {itemB!.FormattedSize}, ETag: {itemB.ETag}, StorageClass: {itemB.StorageClass}, LastModified: {itemB.LastModified:yyyy-MM-dd HH:mm:ss}",
                         null, itemB);
-                    CommitKey(relKeyB!, null, itemB, false, diff);
-                    hasB = await enumB.MoveNextAsync(cancellationToken).ConfigureAwait(false);
+                    CommitKey(cursor, relKeyB!, null, itemB, false, diff);
+                    hasB = await enumB.MoveNextAsync(ct).ConfigureAwait(false);
                 }
 
-                await PeriodicMaintenanceStepAsync(maintenance, cancellationToken).ConfigureAwait(false);
+                await PeriodicMaintenanceStepAsync(ct).ConfigureAwait(false);
             }
 
-            // Flush any remaining differences
-            await FlushDifferencesAsync(cancellationToken).ConfigureAwait(false);
-
-            // Record Bucket Metadata Snapshots
-            await RecordBucketMetadataSnapshotsAsync(clientA, clientB, enumA, enumB, cancellationToken).ConfigureAwait(false);
-
-            // Scan completed normally
-            UpdateLiveStats(includeSystemDiagnostics: true);
-            _scanRun.Status = RunStatus.Completed;
-            _scanRun.EndTimeUtc = DateTime.UtcNow;
-            _scanRun.ErrorMessage = null;
-            _scanRun.LastEvaluatedKey = _lastEvaluatedKey;
-            SyncStatsToRun(_scanRun);
-
-            await ObserveStatusPersistAsync().ConfigureAwait(false);
-            await _scanRunRepo.CompleteAsync(_scanRun, cancellationToken).ConfigureAwait(false);
-            await _scanRunRepo.DeleteCheckpointAsync(_scanRun.Id, cancellationToken).ConfigureAwait(false);
-
-            await LogAsync("INFO", $"Scan run '{_scanRun.Id}' completed successfully: {_scanRun.ObjectsCompared:N0} objects evaluated, {_scanRun.MatchedCount:N0} matched, {_scanRun.TotalDifferences:N0} raw diffs ({_scanRun.FilteredDifferencesCount:N0} confirmed disparities, {_scanRun.InFlightDifferencesCount:N0} in-flight replication).").ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            var status = _isServiceShutdown ? RunStatus.Interrupted : RunStatus.Cancelled;
-            string message = _isServiceShutdown
-                ? "Scan interrupted by service shutdown. Checkpoint saved for automatic recovery."
-                : "Scan was cancelled by user.";
-            await FinalizeRunAsync(status, message).ConfigureAwait(false);
-
-            await LogAsync(
-                _isServiceShutdown ? "RECOVERY" : "WARN",
-                $"Scan run '{_scanRun.Id}' {(_isServiceShutdown ? "interrupted for service shutdown" : "cancelled")}. Checkpoint saved at key '{_lastEvaluatedKey}'.").ConfigureAwait(false);
-            throw;
-        }
-        catch (Exception ex)
-        {
-            await FinalizeRunAsync(RunStatus.Failed, $"{ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
-            await LogAsync("ERROR", $"Scan run '{_scanRun.Id}' failed with error: {ex.Message}", ex.StackTrace).ConfigureAwait(false);
-            throw;
+            lock (_stateLock)
+            {
+                range.Completed = true;
+                _stats.PartitionsCompleted++;
+            }
         }
         finally
         {
-            _stopwatch.Stop();
-            try { if (enumA != null) await enumA.DisposeAsync().ConfigureAwait(false); } catch { }
-            try { if (enumB != null) await enumB.DisposeAsync().ConfigureAwait(false); } catch { }
-            try { clientA?.Dispose(); } catch { }
-            try { clientB?.Dispose(); } catch { }
+            lock (_stateLock) _stats.PartitionsActive--;
+            if (ownsStreams)
+            {
+                lock (_stateLock)
+                {
+                    _aggregateA.Add(enumA);
+                    _aggregateB.Add(enumB);
+                }
+                try { await enumA.DisposeAsync().ConfigureAwait(false); } catch { }
+                try { await enumB.DisposeAsync().ConfigureAwait(false); } catch { }
+            }
         }
+    }
 
-        UpdateLiveStats(includeSystemDiagnostics: true);
-        RaiseProgress();
-        return _scanRun;
+    private async ValueTask ThrottleObjectsAsync(RangeCursor cursor, CancellationToken ct)
+    {
+        if (_objectLimiter == null) return;
+        if (++cursor.Tokens.Pending < _objectTokenBatch) return;
+        await PayObjectTokensAsync(cursor.Tokens, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Pays the keys a worker still owes the object-rate limiter (a full batch, or the remainder when it finishes).</summary>
+    private async ValueTask PayObjectTokensAsync(ObjectTokenAccount account, CancellationToken ct)
+    {
+        if (_objectLimiter == null || account.Pending <= 0) return;
+        int tokens = account.Pending;
+        account.Pending = 0;
+        await _objectLimiter.WaitAsync(tokens, ct).ConfigureAwait(false);
     }
 
     /// <summary>Brings the database in line with how this engine run starts (resume vs. fresh).</summary>
@@ -456,12 +719,12 @@ public class ServiceComparisonEngine
     {
         if (_resumeCheckpoint != null)
         {
-            // Drops differences flushed after the checkpoint (they will be recreated) and, for a legacy
+            // Drops differences flushed after each range's checkpointed key (they will be recreated) and, for a legacy
             // "new run id" resume, adopts the old run's differences and marks the old run superseded.
-            int removed = await _scanRunRepo.PrepareResumeAsync(_scanRun.Id, _resumeCheckpoint.ScanRunId, _lastEvaluatedKey, ct).ConfigureAwait(false);
+            int removed = await _scanRunRepo.PrepareResumeAsync(_scanRun.Id, _resumeCheckpoint.ScanRunId, _resumeRanges!, ct).ConfigureAwait(false);
             if (removed > 0)
             {
-                await LogAsync("INFO", $"Resume: removed {removed} difference(s) recorded after checkpoint key '{_lastEvaluatedKey}' to avoid duplicates.").ConfigureAwait(false);
+                await LogAsync("INFO", $"Resume: removed {removed} difference(s) recorded after the checkpoint (frontier key '{FrontierKey()}', {_resumeRanges!.Count} range(s)) to avoid duplicates.").ConfigureAwait(false);
             }
         }
         else if (_scanRun.ResumeCount > 0 || _scanRun.IsResumedFromCheckpoint || _checkpointDiscarded)
@@ -474,7 +737,7 @@ public class ServiceComparisonEngine
             _scanRun.DifferencesTruncated = false;
             _recordedRows = 0;
             ApplyGraceWindow(); // rebuild the notes without a stale truncation sentence
-            SyncStatsToRun(_scanRun);
+            SyncStatsToRun(_scanRun, CloneStats());
         }
     }
 
@@ -488,6 +751,7 @@ public class ServiceComparisonEngine
     /// <summary>
     /// Writes the terminal state for a cancelled/interrupted/failed run. Never throws: every step is guarded so
     /// CompleteAsync always gets its chance, and the checkpoint is only written if all differences were flushed.
+    /// Runs after every worker has stopped.
     /// </summary>
     private async Task FinalizeRunAsync(RunStatus status, string message)
     {
@@ -496,8 +760,8 @@ public class ServiceComparisonEngine
         _scanRun.Status = status;
         _scanRun.EndTimeUtc = DateTime.UtcNow;
         _scanRun.ErrorMessage = message;
-        _scanRun.LastEvaluatedKey = _lastEvaluatedKey;
-        SyncStatsToRun(_scanRun);
+        _scanRun.LastEvaluatedKey = FrontierKey();
+        SyncStatsToRun(_scanRun, CloneStats());
 
         bool flushed = false;
         try
@@ -508,7 +772,7 @@ public class ServiceComparisonEngine
         catch (Exception ex)
         {
             int lost;
-            lock (_bufferLock) { lost = _differenceBuffer.Count; }
+            lock (_stateLock) { lost = _differenceBuffer.Count; }
             _scanRun.ErrorMessage = $"{message} WARNING: {lost} difference(s) could not be persisted ({ex.Message}); the checkpoint was not advanced.";
             await LogAsync("ERROR", $"Final difference flush failed for run '{_scanRun.Id}': {ex.Message}", ex.StackTrace).ConfigureAwait(false);
         }
@@ -530,39 +794,48 @@ public class ServiceComparisonEngine
         }
     }
 
-    private sealed class MaintenanceState
+    /// <summary>
+    /// Called by every worker after each key. Flushes full difference batches (waiting for the writer: back-pressure), takes a
+    /// periodic checkpoint when the writer is free, and raises progress. Only one worker writes at a time.
+    /// </summary>
+    private async Task PeriodicMaintenanceStepAsync(CancellationToken cancellationToken)
     {
-        public long LastProgressReportTime;
-        public long LastCheckpointTime;
-        public long ItemsSinceLastCheckpoint;
-    }
-
-    private async Task PeriodicMaintenanceStepAsync(MaintenanceState m, CancellationToken cancellationToken)
-    {
-        UpdateLiveStats(includeSystemDiagnostics: false);
-        m.ItemsSinceLastCheckpoint++;
-
+        long items = Interlocked.Increment(ref _itemsSinceLastCheckpoint);
         long elapsedMs = _stopwatch.ElapsedMilliseconds;
 
         int buffered;
-        lock (_bufferLock) { buffered = _differenceBuffer.Count; }
-        if (buffered >= DifferenceBatchSize || (buffered > 0 && elapsedMs - _lastBufferFlushTime > 5000))
+        lock (_stateLock) { buffered = _differenceBuffer.Count; }
+        if (buffered >= DifferenceBatchSize)
         {
-            await FlushDifferencesAsync(cancellationToken).ConfigureAwait(false);
+            await _writerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                lock (_stateLock) { buffered = _differenceBuffer.Count; }
+                if (buffered >= DifferenceBatchSize) await FlushDifferencesCoreAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally { _writerGate.Release(); }
+        }
+        else if (buffered > 0 && elapsedMs - Interlocked.Read(ref _lastBufferFlushTime) > CheckpointIntervalMs && _writerGate.Wait(0))
+        {
+            try { await FlushDifferencesCoreAsync(cancellationToken).ConfigureAwait(false); }
+            finally { _writerGate.Release(); }
         }
 
-        if (elapsedMs - m.LastCheckpointTime > 5000 || m.ItemsSinceLastCheckpoint >= 5000)
+        if ((elapsedMs - Interlocked.Read(ref _lastCheckpointTime) > CheckpointIntervalMs || items >= _checkpointItemThreshold) && _writerGate.Wait(0))
         {
-            m.LastCheckpointTime = elapsedMs;
-            m.ItemsSinceLastCheckpoint = 0;
-            UpdateLiveStats(includeSystemDiagnostics: true);
-            await FlushDifferencesAsync(cancellationToken).ConfigureAwait(false);
-            await SaveCheckpointAsync(cancellationToken, throwOnRepeatedFailure: true).ConfigureAwait(false);
+            try
+            {
+                Interlocked.Exchange(ref _lastCheckpointTime, elapsedMs);
+                Interlocked.Exchange(ref _itemsSinceLastCheckpoint, 0);
+                UpdateLiveStats(includeSystemDiagnostics: true);
+                await SaveCheckpointCoreAsync(cancellationToken, throwOnRepeatedFailure: true).ConfigureAwait(false);
+            }
+            finally { _writerGate.Release(); }
         }
 
-        if (elapsedMs - m.LastProgressReportTime > 250)
+        long lastProgress = Interlocked.Read(ref _lastProgressReportTime);
+        if (elapsedMs - lastProgress > ProgressIntervalMs && Interlocked.CompareExchange(ref _lastProgressReportTime, elapsedMs, lastProgress) == lastProgress)
         {
-            m.LastProgressReportTime = elapsedMs;
             UpdateLiveStats(includeSystemDiagnostics: true);
             RaiseProgress();
         }
@@ -572,7 +845,8 @@ public class ServiceComparisonEngine
     {
         var handler = ProgressUpdated;
         if (handler == null) return;
-        try { handler(CloneStats()); }
+        var snapshot = CloneStats();
+        try { handler(snapshot); }
         catch (Exception ex) { ReportHandlerFailure("ProgressUpdated", ex); }
     }
 
@@ -605,7 +879,7 @@ public class ServiceComparisonEngine
             }
         }
 
-        // Id is intentionally left 0: the database assigns it on insert.
+        // Id is intentionally left 0: the database assigns it on insert. Key is relative to the bucket prefix.
         return new RecordedDifference
         {
             ScanRunId = _scanRun.Id,
@@ -626,6 +900,7 @@ public class ServiceComparisonEngine
         };
     }
 
+    // Caller holds _stateLock.
     private void ApplyDifferenceStats(RecordedDifference diff)
     {
         if (diff.IsWithinGracePeriod)
@@ -643,78 +918,108 @@ public class ServiceComparisonEngine
                 case DifferenceType.ETagMismatch: _stats.ETagMismatchCount++; break;
                 case DifferenceType.ContentMismatch: _stats.ContentMismatchCount++; break;
                 case DifferenceType.PossibleMissingOnBothSides: _stats.SequenceGapCount++; break;
+                case DifferenceType.ContentCheckError: _stats.ContentCheckErrorCount++; break;
             }
         }
         _stats.TotalDifferences++;
     }
 
     /// <summary>
-    /// Atomically (no awaits, no cancellation points) records the outcome of one key: counters, buffered
-    /// differences, consumed-object tallies and finally the evaluated-key marker.
+    /// Atomically (no awaits, no cancellation points, one lock) records the outcome of one key: counters, buffered
+    /// differences, consumed-object tallies and finally the range's completed-key marker.
     /// </summary>
-    private void CommitKey(string relKey, S3ObjectSummary? a, S3ObjectSummary? b, bool matched, RecordedDifference? diff)
+    private void CommitKey(RangeCursor cursor, string relKey, S3ObjectSummary? a, S3ObjectSummary? b, bool matched, RecordedDifference? diff)
     {
-        var toRecord = new List<RecordedDifference>(2);
+        List<RecordedDifference>? toRecord = null;
 
-        if (_gapDetector != null)
+        if (cursor.GapDetector != null)
         {
             long unusedIdCounter = 0; // detector API legacy; ids are assigned by the database
-            toRecord.AddRange(_gapDetector.CheckKey(relKey, _scanRun.Id, ref unusedIdCounter));
+            var gaps = cursor.GapDetector.CheckKey(relKey, _scanRun.Id, ref unusedIdCounter);
+            if (gaps.Count > 0) toRecord = gaps;
         }
-        if (diff != null) toRecord.Add(diff);
+        if (diff != null) (toRecord ??= new List<RecordedDifference>(1)).Add(diff);
 
-        _stats.ObjectsCompared++;
-        if (matched) _stats.MatchedCount++;
-        if (a != null) { _processedA++; _processedBytesA += a.Size; _stats.CurrentKeyA = a.Key; }
-        if (b != null) { _processedB++; _processedBytesB += b.Size; _stats.CurrentKeyB = b.Key; }
-
-        lock (_bufferLock)
+        bool truncatedNow = false;
+        lock (_stateLock)
         {
-            foreach (var d in toRecord)
+            _stats.ObjectsCompared++;
+            if (matched) _stats.MatchedCount++;
+            if (a != null) { _stats.BucketAObjectsRead++; _stats.BucketABytesRead += a.Size; _stats.CurrentKeyA = a.Key; }
+            if (b != null) { _stats.BucketBObjectsRead++; _stats.BucketBBytesRead += b.Size; _stats.CurrentKeyB = b.Key; }
+
+            if (toRecord != null)
             {
-                // Counters always count every difference; rows stop at the cap so one bad run cannot fill the disk.
-                ApplyDifferenceStats(d);
-                if (_maxRecordedDifferences <= 0 || _recordedRows < _maxRecordedDifferences)
+                foreach (var d in toRecord)
                 {
-                    _differenceBuffer.Add(d);
-                    _recordedRows++;
-                }
-                else if (!_scanRun.DifferencesTruncated)
-                {
-                    _scanRun.DifferencesTruncated = true;
-                    AppendTruncationNote();
-                    _ = LogAsync("WARN", $"Scan run '{_scanRun.Id}' reached the limit of {_maxRecordedDifferences:N0} recorded differences; further differences are counted but not stored.");
+                    // Counters always count every difference; rows stop at the cap so one bad run cannot fill the disk.
+                    ApplyDifferenceStats(d);
+                    if (_maxRecordedDifferences <= 0 || _recordedRows < _maxRecordedDifferences)
+                    {
+                        _differenceBuffer.Add(d);
+                        _recordedRows++;
+                    }
+                    else if (!_scanRun.DifferencesTruncated)
+                    {
+                        _scanRun.DifferencesTruncated = true;
+                        AppendTruncationNote();
+                        truncatedNow = true;
+                    }
                 }
             }
+
+            cursor.Range.LastCompletedKey = relKey;
         }
 
-        _lastEvaluatedKey = relKey;
-        _hasLastKey = true;
-
-        foreach (var d in toRecord) RaiseDifferenceFound(d);
+        if (truncatedNow)
+        {
+            _ = LogAsync("WARN", $"Scan run '{_scanRun.Id}' reached the limit of {_maxRecordedDifferences:N0} recorded differences; further differences are counted but not stored.");
+        }
+        if (toRecord != null)
+        {
+            foreach (var d in toRecord) RaiseDifferenceFound(d);
+        }
     }
 
-    /// <summary>
-    /// Persists buffered differences. Entries are removed from the buffer only after the insert succeeded, so a
-    /// failed flush loses nothing and can be retried; the failure propagates to the caller.
-    /// </summary>
+    /// <summary>Persists buffered differences (taking the writer gate). The failure propagates; nothing is lost.</summary>
     private async Task FlushDifferencesAsync(CancellationToken cancellationToken)
     {
+        await _writerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { await FlushDifferencesCoreAsync(cancellationToken).ConfigureAwait(false); }
+        finally { _writerGate.Release(); }
+    }
+
+    /// <summary>Swaps the buffer out and inserts it. On failure the batch goes back to the front of the buffer. Caller holds the writer gate.</summary>
+    private async Task FlushDifferencesCoreAsync(CancellationToken cancellationToken)
+    {
         List<RecordedDifference> batch;
-        lock (_bufferLock)
+        lock (_stateLock)
         {
             if (_differenceBuffer.Count == 0) return;
-            batch = _differenceBuffer.ToList();
+            batch = _differenceBuffer;
+            _differenceBuffer = new List<RecordedDifference>();
         }
 
-        await InsertBatchWithRetryAsync(batch, cancellationToken).ConfigureAwait(false);
+        await InsertOrRestoreAsync(batch, cancellationToken).ConfigureAwait(false);
+        Interlocked.Exchange(ref _lastBufferFlushTime, _stopwatch.ElapsedMilliseconds);
+    }
 
-        lock (_bufferLock)
+    private async Task InsertOrRestoreAsync(List<RecordedDifference> batch, CancellationToken cancellationToken)
+    {
+        if (batch.Count == 0) return;
+        try
         {
-            // Only this loop appends (to the end), so the first batch.Count entries are exactly what we inserted.
-            _differenceBuffer.RemoveRange(0, batch.Count);
+            await InsertBatchWithRetryAsync(batch, cancellationToken).ConfigureAwait(false);
         }
-        _lastBufferFlushTime = _stopwatch.ElapsedMilliseconds;
+        catch
+        {
+            lock (_stateLock)
+            {
+                batch.AddRange(_differenceBuffer);
+                _differenceBuffer = batch;
+            }
+            throw;
+        }
     }
 
     private async Task InsertBatchWithRetryAsync(List<RecordedDifference> batch, CancellationToken cancellationToken)
@@ -739,12 +1044,40 @@ public class ServiceComparisonEngine
 
     private async Task<bool> SaveCheckpointAsync(CancellationToken cancellationToken, bool throwOnRepeatedFailure)
     {
-        if (!_hasLastKey) return true; // nothing processed yet - nothing to resume from
+        await _writerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try { return await SaveCheckpointCoreAsync(cancellationToken, throwOnRepeatedFailure).ConfigureAwait(false); }
+        finally { _writerGate.Release(); }
+    }
 
+    /// <summary>
+    /// Consistent checkpoint (caller holds the writer gate): under the state lock, swap the difference buffer and snapshot the
+    /// plan and counters; insert the swapped differences; then save the snapshot. Keys committed after the snapshot are not
+    /// claimed by it, and every difference of a key it claims is stored before it is written.
+    /// </summary>
+    private async Task<bool> SaveCheckpointCoreAsync(CancellationToken cancellationToken, bool throwOnRepeatedFailure)
+    {
+        List<RecordedDifference> batch;
+        List<PartitionRange> plan;
+        ComparisonStatistics snap;
+        lock (_stateLock)
+        {
+            if (!_ranges.Any(r => r.HasProgress)) return true; // nothing processed yet - nothing to resume from
+            batch = _differenceBuffer;
+            _differenceBuffer = new List<RecordedDifference>();
+            plan = _ranges.Select(r => r.Clone()).ToList();
+            snap = CloneStatsUnlocked();
+        }
+
+        // Propagates (with the batch restored) if the differences cannot be stored: the checkpoint must not advance then.
+        await InsertOrRestoreAsync(batch, cancellationToken).ConfigureAwait(false);
+        Interlocked.Exchange(ref _lastBufferFlushTime, _stopwatch.ElapsedMilliseconds);
+
+        var (hasKey, frontier) = PartitionPlanner.Frontier(plan);
         try
         {
             var cp = new ScanCheckpoint
             {
+                Version = 2,
                 ScanRunId = _scanRun.Id,
                 JobId = _job.Id,
                 CreatedAtUtc = _scanRun.StartTimeUtc,
@@ -756,36 +1089,46 @@ public class ServiceComparisonEngine
                 EndpointB = _job.BucketB.EndpointUrl,
                 PrefixB = _job.BucketB.Prefix ?? string.Empty,
                 Mode = _job.Mode,
-                LastEvaluatedKey = _lastEvaluatedKey,
-                HasLastEvaluatedKey = true,
-                ObjectsCompared = _stats.ObjectsCompared,
-                MatchedCount = _stats.MatchedCount,
-                TotalDifferences = _stats.TotalDifferences,
-                FilteredDifferencesCount = _stats.FilteredDifferencesCount,
-                InFlightDifferencesCount = _stats.InFlightDifferencesCount,
-                MissingInBucketBCount = _stats.MissingInBucketBCount,
-                MissingInBucketACount = _stats.MissingInBucketACount,
-                SizeMismatchCount = _stats.SizeMismatchCount,
-                ETagMismatchCount = _stats.ETagMismatchCount,
-                ContentMismatchCount = _stats.ContentMismatchCount,
-                SequenceGapCount = _stats.SequenceGapCount,
-                BucketAObjectsRead = _stats.BucketAObjectsRead,
-                BucketBObjectsRead = _stats.BucketBObjectsRead,
-                BucketABytesRead = _stats.BucketABytesRead,
-                BucketBBytesRead = _stats.BucketBBytesRead,
-                ElapsedSeconds = _stats.ElapsedTime.TotalSeconds,
+                LastEvaluatedKey = frontier,
+                HasLastEvaluatedKey = hasKey,
+                Partitions = plan,
+                ObjectsCompared = snap.ObjectsCompared,
+                MatchedCount = snap.MatchedCount,
+                TotalDifferences = snap.TotalDifferences,
+                FilteredDifferencesCount = snap.FilteredDifferencesCount,
+                InFlightDifferencesCount = snap.InFlightDifferencesCount,
+                MissingInBucketBCount = snap.MissingInBucketBCount,
+                MissingInBucketACount = snap.MissingInBucketACount,
+                SizeMismatchCount = snap.SizeMismatchCount,
+                ETagMismatchCount = snap.ETagMismatchCount,
+                ContentMismatchCount = snap.ContentMismatchCount,
+                SequenceGapCount = snap.SequenceGapCount,
+                ContentCheckErrorCount = snap.ContentCheckErrorCount,
+                BucketAObjectsRead = snap.BucketAObjectsRead,
+                BucketBObjectsRead = snap.BucketBObjectsRead,
+                BucketABytesRead = snap.BucketABytesRead,
+                BucketBBytesRead = snap.BucketBBytesRead,
+                ElapsedSeconds = ElapsedSeconds(),
                 DetectSequenceGaps = _job.DetectSequenceGaps,
                 MaxSequenceGapThreshold = _job.MaxSequenceGapThreshold
             };
 
             await _scanRunRepo.SaveCheckpointAsync(cp, cancellationToken).ConfigureAwait(false);
 
-            _scanRun.LastEvaluatedKey = _lastEvaluatedKey;
-            SyncStatsToRun(_scanRun);
-            await _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken).ConfigureAwait(false);
+            // The run row carries the same snapshot, so its counters always match the differences stored for it.
+            if (_scanRun.Status is RunStatus.Running or RunStatus.Paused)
+            {
+                _scanRun.LastEvaluatedKey = frontier;
+                snap.ElapsedTime = TimeSpan.FromSeconds(cp.ElapsedSeconds);
+                SyncStatsToRun(_scanRun, snap);
+                await _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken).ConfigureAwait(false);
+            }
 
-            _stats.LastCheckpointKey = _lastEvaluatedKey;
-            _stats.LastCheckpointTime = DateTime.UtcNow;
+            lock (_stateLock)
+            {
+                _stats.LastCheckpointKey = frontier;
+                _stats.LastCheckpointTime = DateTime.UtcNow;
+            }
             _consecutiveCheckpointFailures = 0;
             return true;
         }
@@ -807,36 +1150,61 @@ public class ServiceComparisonEngine
         }
     }
 
-    private async Task RecordBucketMetadataSnapshotsAsync(
-        IAmazonS3? clientA,
-        IAmazonS3? clientB,
-        IS3ObjectStream? enumA,
-        IS3ObjectStream? enumB,
-        CancellationToken cancellationToken)
+    /// <summary>Storage classes and modification-time range of everything one bucket side listed (all partitions).</summary>
+    private sealed class BucketAggregate
+    {
+        public readonly Dictionary<string, long> StorageClassCounts = new(StringComparer.OrdinalIgnoreCase);
+        public DateTime? Oldest;
+        public DateTime? Newest;
+
+        public void Add(IS3ObjectStream s)
+        {
+            foreach (var kv in s.StorageClassCounts)
+            {
+                StorageClassCounts.TryGetValue(kv.Key, out long n);
+                StorageClassCounts[kv.Key] = n + kv.Value;
+            }
+            if (s.OldestLastModifiedUtc is DateTime o && (Oldest == null || o < Oldest)) Oldest = o;
+            if (s.NewestLastModifiedUtc is DateTime n2 && (Newest == null || n2 > Newest)) Newest = n2;
+        }
+    }
+
+    private async Task RecordBucketMetadataSnapshotsAsync(CancellationToken cancellationToken)
     {
         try
         {
             string? versioningA = null;
             string? versioningB = null;
-            if (clientA != null && !string.IsNullOrWhiteSpace(_job.BucketA.BucketName))
+            if (_clientA != null && !string.IsNullOrWhiteSpace(_job.BucketA.BucketName))
             {
                 try
                 {
-                    var verRespA = await clientA.GetBucketVersioningAsync(new GetBucketVersioningRequest { BucketName = _job.BucketA.BucketName }, cancellationToken).ConfigureAwait(false);
+                    var verRespA = await _clientA.GetBucketVersioningAsync(new GetBucketVersioningRequest { BucketName = _job.BucketA.BucketName }, cancellationToken).ConfigureAwait(false);
                     versioningA = verRespA.VersioningConfig?.Status?.Value ?? "Disabled";
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch { versioningA = "Unknown"; }
             }
-            if (clientB != null && !string.IsNullOrWhiteSpace(_job.BucketB.BucketName))
+            if (_clientB != null && !string.IsNullOrWhiteSpace(_job.BucketB.BucketName))
             {
                 try
                 {
-                    var verRespB = await clientB.GetBucketVersioningAsync(new GetBucketVersioningRequest { BucketName = _job.BucketB.BucketName }, cancellationToken).ConfigureAwait(false);
+                    var verRespB = await _clientB.GetBucketVersioningAsync(new GetBucketVersioningRequest { BucketName = _job.BucketB.BucketName }, cancellationToken).ConfigureAwait(false);
                     versioningB = verRespB.VersioningConfig?.Status?.Value ?? "Disabled";
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
                 catch { versioningB = "Unknown"; }
+            }
+
+            ComparisonStatistics stats;
+            string classesA, classesB;
+            DateTime? oldestA, newestA, oldestB, newestB;
+            lock (_stateLock)
+            {
+                stats = CloneStatsUnlocked();
+                classesA = JsonSerializer.Serialize(_aggregateA.StorageClassCounts);
+                classesB = JsonSerializer.Serialize(_aggregateB.StorageClassCounts);
+                (oldestA, newestA, oldestB, newestB) = (_aggregateA.Oldest, _aggregateA.Newest, _aggregateB.Oldest, _aggregateB.Newest);
             }
 
             var snapA = new BucketMetadataSnapshot
@@ -848,12 +1216,12 @@ public class ServiceComparisonEngine
                 Region = _job.BucketA.Region,
                 Prefix = _job.BucketA.Prefix,
                 SnapshotTimeUtc = DateTime.UtcNow,
-                TotalObjects = enumA?.TotalObjectsRead ?? _stats.BucketAObjectsRead,
-                TotalBytes = enumA?.TotalBytesRead ?? _stats.BucketABytesRead,
+                TotalObjects = stats.BucketAObjectsRead,
+                TotalBytes = stats.BucketABytesRead,
                 VersioningStatus = versioningA,
-                StorageClassesJson = enumA != null ? JsonSerializer.Serialize(enumA.StorageClassCounts) : "{}",
-                OldestLastModifiedUtc = enumA?.OldestLastModifiedUtc,
-                NewestLastModifiedUtc = enumA?.NewestLastModifiedUtc
+                StorageClassesJson = classesA,
+                OldestLastModifiedUtc = oldestA,
+                NewestLastModifiedUtc = newestA
             };
 
             var snapB = new BucketMetadataSnapshot
@@ -865,12 +1233,12 @@ public class ServiceComparisonEngine
                 Region = _job.BucketB.Region,
                 Prefix = _job.BucketB.Prefix,
                 SnapshotTimeUtc = DateTime.UtcNow,
-                TotalObjects = enumB?.TotalObjectsRead ?? _stats.BucketBObjectsRead,
-                TotalBytes = enumB?.TotalBytesRead ?? _stats.BucketBBytesRead,
+                TotalObjects = stats.BucketBObjectsRead,
+                TotalBytes = stats.BucketBBytesRead,
                 VersioningStatus = versioningB,
-                StorageClassesJson = enumB != null ? JsonSerializer.Serialize(enumB.StorageClassCounts) : "{}",
-                OldestLastModifiedUtc = enumB?.OldestLastModifiedUtc,
-                NewestLastModifiedUtc = enumB?.NewestLastModifiedUtc
+                StorageClassesJson = classesB,
+                OldestLastModifiedUtc = oldestB,
+                NewestLastModifiedUtc = newestB
             };
 
             await _scanRunRepo.SaveMetadataSnapshotAsync(snapA, cancellationToken).ConfigureAwait(false);
@@ -888,8 +1256,6 @@ public class ServiceComparisonEngine
     }
 
     private async Task<(bool Matched, RecordedDifference? Diff)> CompareSameKeyAsync(
-        IAmazonS3? clientA,
-        IAmazonS3? clientB,
         string relativeKey,
         S3ObjectSummary itemA,
         S3ObjectSummary itemB,
@@ -912,7 +1278,7 @@ public class ServiceComparisonEngine
         }
 
         // 3. ETags Differ
-        if (_job.Mode == ComparisonMode.ListingOnly || clientA == null || clientB == null)
+        if (_job.Mode == ComparisonMode.ListingOnly || _readerA == null || _readerB == null)
         {
             return (false, MakeDifference(
                 relativeKey,
@@ -921,45 +1287,125 @@ public class ServiceComparisonEngine
                 itemA, itemB));
         }
 
-        // Full Data stream compare using each bucket's full key
-        bool contentMatches = await StreamCompareObjectsAsync(clientA, clientB, itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
-        if (contentMatches)
+        // Full Data stream compare using each bucket's full key; bounded across all partitions.
+        await _contentChecks.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            return (true, null);
+            return await ContentCheckAsync(relativeKey, itemA, itemB, cancellationToken).ConfigureAwait(false);
         }
+        finally
+        {
+            _contentChecks.Release();
+        }
+    }
 
-        return (false, MakeDifference(
-            relativeKey,
-            DifferenceType.ContentMismatch,
-            $"Content byte mismatch! Size is identical ({itemA.FormattedSize}) but data stream differs.",
-            itemA, itemB));
+    /// <summary>
+    /// Compares the content of one key. A read failure affects only this key: it becomes a <see cref="DifferenceType.ContentCheckError"/>
+    /// (after one retry for transient errors), or an in-flight one when the object disappeared during the scan. Only the scan's
+    /// own cancellation propagates.
+    /// </summary>
+    private async Task<(bool Matched, RecordedDifference? Diff)> ContentCheckAsync(string relativeKey, S3ObjectSummary itemA, S3ObjectSummary itemB, CancellationToken cancellationToken)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                bool contentMatches = await StreamCompareObjectsAsync(itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+                if (contentMatches) return (true, null);
+                return (false, MakeDifference(
+                    relativeKey,
+                    DifferenceType.ContentMismatch,
+                    $"Content byte mismatch! Size is identical ({itemA.FormattedSize}) but data stream differs.",
+                    itemA, itemB));
+            }
+            catch (ContentReadException ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                if (IsNoSuchKey(ex.InnerException))
+                {
+                    // Listed, then gone before it could be read: the bucket changed during the scan. Recorded as in-flight
+                    // (like a change inside the replication grace window), not as a confirmed disparity.
+                    var gone = MakeDifference(
+                        relativeKey,
+                        DifferenceType.ContentCheckError,
+                        $"Object was deleted or replaced in bucket {ex.Side} during the scan (NoSuchKey); content not compared.",
+                        itemA, itemB);
+                    gone.IsWithinGracePeriod = true;
+                    return (false, gone);
+                }
+                if (attempt == 1 && IsTransient(ex.InnerException))
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+                return (false, MakeDifference(
+                    relativeKey,
+                    DifferenceType.ContentCheckError,
+                    $"Content of bucket {ex.Side} could not be read{(attempt > 1 ? " (also after one retry)" : string.Empty)}: {Describe(ex.InnerException)}. The object was not verified.",
+                    itemA, itemB));
+            }
+        }
+    }
+
+    /// <summary>A failure to open or read one side's object content (wraps the original exception).</summary>
+    private sealed class ContentReadException : Exception
+    {
+        public ContentReadException(string side, Exception inner) : base($"Bucket {side}: {inner.Message}", inner) { Side = side; }
+        public string Side { get; }
+        public new Exception InnerException => base.InnerException!;
+    }
+
+    private static bool IsNoSuchKey(Exception ex) =>
+        ex is AmazonS3Exception s3 && (string.Equals(s3.ErrorCode, "NoSuchKey", StringComparison.Ordinal) || s3.StatusCode == System.Net.HttpStatusCode.NotFound);
+
+    /// <summary>Errors worth one retry: throttling, 5xx, and transport failures (network, timeouts). Not 403 or InvalidObjectState.</summary>
+    private static bool IsTransient(Exception ex) => ex switch
+    {
+        Amazon.Runtime.AmazonServiceException s => (int)s.StatusCode >= 500 || (int)s.StatusCode == 429
+            || string.Equals(s.ErrorCode, "SlowDown", StringComparison.Ordinal) || string.Equals(s.ErrorCode, "RequestTimeout", StringComparison.Ordinal)
+            || s.StatusCode == 0,
+        Amazon.Runtime.AmazonClientException => true,
+        IOException or HttpRequestException or TimeoutException or OperationCanceledException => true,
+        _ => false
+    };
+
+    private static string Describe(Exception ex) => ex switch
+    {
+        Amazon.Runtime.AmazonServiceException s when !string.IsNullOrEmpty(s.ErrorCode) => $"{s.ErrorCode} ({(int)s.StatusCode}) {s.Message}",
+        OperationCanceledException => "request timed out",
+        _ => $"{ex.GetType().Name}: {ex.Message}"
+    };
+
+    /// <summary>Runs one side's S3 call; any failure except the scan's own cancellation is wrapped with the side.</summary>
+    private static async Task<T> OnSideAsync<T>(string side, Func<Task<T>> call, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await call().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not ContentReadException && !(ex is OperationCanceledException && cancellationToken.IsCancellationRequested))
+        {
+            throw new ContentReadException(side, ex);
+        }
     }
 
     private async Task<bool> StreamCompareObjectsAsync(
-        IAmazonS3 clientA,
-        IAmazonS3 clientB,
         string keyA,
         string keyB,
         CancellationToken cancellationToken)
     {
         if (_limiterA != null) await _limiterA.WaitAsync(cancellationToken).ConfigureAwait(false);
         if (_limiterB != null) await _limiterB.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var getA = new GetObjectRequest { BucketName = _job.BucketA.BucketName, Key = keyA };
-        var getB = new GetObjectRequest { BucketName = _job.BucketB.BucketName, Key = keyB };
 
-        using var respA = await clientA.GetObjectAsync(getA, cancellationToken).ConfigureAwait(false);
-        using var respB = await clientB.GetObjectAsync(getB, cancellationToken).ConfigureAwait(false);
-
-        await using var streamA = respA.ResponseStream;
-        await using var streamB = respB.ResponseStream;
+        await using var streamA = await OnSideAsync("A", () => _readerA!.OpenReadAsync(_job.BucketA.BucketName, keyA, cancellationToken), cancellationToken).ConfigureAwait(false);
+        await using var streamB = await OnSideAsync("B", () => _readerB!.OpenReadAsync(_job.BucketB.BucketName, keyB, cancellationToken), cancellationToken).ConfigureAwait(false);
 
         byte[] bufA = new byte[65536];
         byte[] bufB = new byte[65536];
 
         while (true)
         {
-            int bytesReadA = await ReadFullBufferAsync(streamA, bufA, cancellationToken).ConfigureAwait(false);
-            int bytesReadB = await ReadFullBufferAsync(streamB, bufB, cancellationToken).ConfigureAwait(false);
+            int bytesReadA = await OnSideAsync("A", () => ReadFullBufferAsync(streamA, bufA, cancellationToken), cancellationToken).ConfigureAwait(false);
+            int bytesReadB = await OnSideAsync("B", () => ReadFullBufferAsync(streamB, bufB, cancellationToken), cancellationToken).ConfigureAwait(false);
 
             if (bytesReadA != bytesReadB)
                 return false;
@@ -1002,47 +1448,53 @@ public class ServiceComparisonEngine
         }
     }
 
+    private double ElapsedSeconds() => _stopwatch.Elapsed.TotalSeconds + _baselineElapsedSeconds;
+
     private void UpdateLiveStats(bool includeSystemDiagnostics = false)
     {
-        double totalSeconds = _stopwatch.Elapsed.TotalSeconds + _baselineElapsedSeconds;
-        _stats.ElapsedTime = TimeSpan.FromSeconds(totalSeconds);
-        _stats.ItemsPerSecond = totalSeconds > 0 ? _stats.ObjectsCompared / totalSeconds : 0;
-
-        if (includeSystemDiagnostics)
+        double totalSeconds = ElapsedSeconds();
+        double workingSet = includeSystemDiagnostics ? Environment.WorkingSet / (1024.0 * 1024.0) : 0;
+        double gcTotal = includeSystemDiagnostics ? GC.GetTotalMemory(false) / (1024.0 * 1024.0) : 0;
+        lock (_stateLock)
         {
-            _stats.WorkingSetMB = Environment.WorkingSet / (1024.0 * 1024.0);
-            _stats.GCTotalMemoryMB = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
+            _stats.ElapsedTime = TimeSpan.FromSeconds(totalSeconds);
+            _stats.ItemsPerSecond = totalSeconds > 0 ? _stats.ObjectsCompared / totalSeconds : 0;
+            if (includeSystemDiagnostics)
+            {
+                _stats.WorkingSetMB = workingSet;
+                _stats.GCTotalMemoryMB = gcTotal;
+            }
         }
-
-        // Only objects the merge loop has fully consumed - never the look-ahead item - so a resume that
-        // re-reads from the checkpoint key does not double count.
-        _stats.BucketAObjectsRead = _processedA;
-        _stats.BucketBObjectsRead = _processedB;
-        _stats.BucketABytesRead = _processedBytesA;
-        _stats.BucketBBytesRead = _processedBytesB;
     }
 
-    private void SyncStatsToRun(ScanRun run)
+    private static void SyncStatsToRun(ScanRun run, ComparisonStatistics s)
     {
-        run.ObjectsCompared = _stats.ObjectsCompared;
-        run.MatchedCount = _stats.MatchedCount;
-        run.TotalDifferences = _stats.TotalDifferences;
-        run.FilteredDifferencesCount = _stats.FilteredDifferencesCount;
-        run.InFlightDifferencesCount = _stats.InFlightDifferencesCount;
-        run.MissingInBucketBCount = _stats.MissingInBucketBCount;
-        run.MissingInBucketACount = _stats.MissingInBucketACount;
-        run.SizeMismatchCount = _stats.SizeMismatchCount;
-        run.ETagMismatchCount = _stats.ETagMismatchCount;
-        run.ContentMismatchCount = _stats.ContentMismatchCount;
-        run.SequenceGapCount = _stats.SequenceGapCount;
-        run.BucketAObjectsRead = _stats.BucketAObjectsRead;
-        run.BucketBObjectsRead = _stats.BucketBObjectsRead;
-        run.BucketABytesRead = _stats.BucketABytesRead;
-        run.BucketBBytesRead = _stats.BucketBBytesRead;
-        run.DurationSeconds = _stats.ElapsedTime.TotalSeconds;
+        run.ObjectsCompared = s.ObjectsCompared;
+        run.MatchedCount = s.MatchedCount;
+        run.TotalDifferences = s.TotalDifferences;
+        run.FilteredDifferencesCount = s.FilteredDifferencesCount;
+        run.InFlightDifferencesCount = s.InFlightDifferencesCount;
+        run.MissingInBucketBCount = s.MissingInBucketBCount;
+        run.MissingInBucketACount = s.MissingInBucketACount;
+        run.SizeMismatchCount = s.SizeMismatchCount;
+        run.ETagMismatchCount = s.ETagMismatchCount;
+        run.ContentMismatchCount = s.ContentMismatchCount;
+        run.SequenceGapCount = s.SequenceGapCount;
+        run.ContentCheckErrorCount = s.ContentCheckErrorCount;
+        run.BucketAObjectsRead = s.BucketAObjectsRead;
+        run.BucketBObjectsRead = s.BucketBObjectsRead;
+        run.BucketABytesRead = s.BucketABytesRead;
+        run.BucketBBytesRead = s.BucketBBytesRead;
+        run.DurationSeconds = s.ElapsedTime.TotalSeconds;
     }
 
     private ComparisonStatistics CloneStats()
+    {
+        lock (_stateLock) return CloneStatsUnlocked();
+    }
+
+    // Caller holds _stateLock.
+    private ComparisonStatistics CloneStatsUnlocked()
     {
         return new ComparisonStatistics
         {
@@ -1057,6 +1509,7 @@ public class ServiceComparisonEngine
             ETagMismatchCount = _stats.ETagMismatchCount,
             ContentMismatchCount = _stats.ContentMismatchCount,
             SequenceGapCount = _stats.SequenceGapCount,
+            ContentCheckErrorCount = _stats.ContentCheckErrorCount,
             BucketAObjectsRead = _stats.BucketAObjectsRead,
             BucketBObjectsRead = _stats.BucketBObjectsRead,
             BucketABytesRead = _stats.BucketABytesRead,
@@ -1068,7 +1521,10 @@ public class ServiceComparisonEngine
             WorkingSetMB = _stats.WorkingSetMB,
             GCTotalMemoryMB = _stats.GCTotalMemoryMB,
             LastCheckpointKey = _stats.LastCheckpointKey,
-            LastCheckpointTime = _stats.LastCheckpointTime
+            LastCheckpointTime = _stats.LastCheckpointTime,
+            PartitionsTotal = _stats.PartitionsTotal,
+            PartitionsCompleted = _stats.PartitionsCompleted,
+            PartitionsActive = _stats.PartitionsActive
         };
     }
 }

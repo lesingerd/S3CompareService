@@ -12,6 +12,7 @@ It runs continuous comparisons on automated schedules (interval or cron), captur
 
 - **Continuous Comparison Engine**:
   - Resilient streaming scanner using continuation tokens without caching millions of objects in memory.
+  - **Parallel scanning**: the keyspace is split into key ranges that are compared at the same time, and every bucket listing fetches its next pages in the background, with throttles for list requests, compared objects and content checks (see "Parallel scanning and throughput" below).
   - Supports **Listing Only** (metadata, size, and ETag comparison) and **Full Data** (64KB streaming byte-by-byte comparison).
   - Sequence gap detection for numeric filename series (e.g. `log_001.csv`, `log_003.csv`).
 - **Replication Lag Grace Period (In-Flight Replication Shield)**:
@@ -33,7 +34,7 @@ It runs continuous comparisons on automated schedules (interval or cron), captur
   - Built-in test buttons in the UI and REST API (`/api/alerts/test-smtp`, `/api/alerts/test-azure-webhook`) for instant connectivity verification.
 - **Crash Recovery & Ephemeral Data Resilience**:
   - Continuous incremental checkpointing to database every 5 seconds.
-  - Service automatically detects interrupted scans upon startup, recovers state, and can resume from `LastEvaluatedKey`.
+  - Service automatically detects interrupted scans upon startup, recovers state, and resumes each key range from its last checkpointed key (older single-key checkpoints still resume).
   - Windows Service configured with automated failure recovery actions (`restart/60000`).
 - **Portable SQL Database**:
   - Self-contained SQLite database (`s3compareservice.db`) with Write-Ahead Logging (`WAL` mode) and busy-timeout handling.
@@ -142,13 +143,14 @@ dotnet run --project S3CompareService.UI
 
 The Windows UI (`S3CompareService.UI`) provides complete control:
 
-1. **Dashboard**: Live status badge, system memory, active scan monitor with real-time speed (`obj/sec`), progress, and pause/resume/cancel controls.
+1. **Dashboard**: Live status badge, system memory, active scan monitor with real-time speed (`obj/sec`), objects read per bucket, key ranges done / total, progress, and pause/resume/cancel controls.
 2. **Comparison Jobs**: Add, edit, clone, and configure jobs:
    - S3 credentials for Bucket A and Bucket B (with Wasabi & AWS endpoint presets).
    - "Test Connection" buttons with instant connectivity and object counts feedback.
    - Schedule configuration (Interval minutes or Cron expression).
    - **Replication Lag Shield**: Set grace period in minutes (e.g. 15 minutes) to shield against in-flight replication disparities.
    - Sequence gap detection toggles.
+   - **Performance / Throttling**: per-job overrides of the parallel-scan settings (empty = service default), with tooltips.
 3. **Audit Runs & History**: Timeline of historical scans, durations, objects evaluated, matched counts, confirmed disparities, and bucket metadata snapshots at scan time.
 4. **Disparity Explorer**:
    - Filter by difference type (Missing in B, Missing in A, Size mismatch, ETag mismatch, Content mismatch, Sequence gap).
@@ -205,7 +207,7 @@ The service is built to run for months without attention. These settings live in
 
 A run is deleted together with its differences and bucket snapshots. These are **never** deleted, whatever the settings say: the newest run of a job; the newest **completed** run of a job (IdleMon reporting reads it, even when later runs failed or it is older than `KeepDays`); any run that is Pending, Running, Paused or Interrupted (it can still be resumed); and any run that has a checkpoint. If the system clock is more than `KeepDays` (or `AuditLogDays`) ahead of the newest data, the age rules are skipped with a warning in the log, so a clock set years ahead cannot wipe the history; the count rule still applies.
 
-**Disk space.** After each pass the WAL is checkpointed and truncated (it also has a 64 MB size limit), and free pages are returned to the file with `PRAGMA incremental_vacuum` in small steps. New databases are created with `auto_vacuum = INCREMENTAL`. A database created by an older version cannot switch modes without a full `VACUUM`, which locks writers while it runs. The service therefore converts an old database **once, only if the file is at most `AutoVacuumConvertMaxMegabytes` and no scan is running** (and there is room on disk for a temporary copy). A larger database is left alone and a warning in the log says so; deleted history then frees pages inside the file for reuse, but the file does not shrink. To convert a large database: stop the service, back up `s3compareservice.db`, run `sqlite3 s3compareservice.db "PRAGMA auto_vacuum = INCREMENTAL; VACUUM;"`, start the service. Schema version 3 also adds the `(JobId, StartTimeUtc)` run index and drops the redundant `JobId` index; this happens automatically at start.
+**Disk space.** After each pass the WAL is checkpointed and truncated (it also has a 64 MB size limit), and free pages are returned to the file with `PRAGMA incremental_vacuum` in small steps. New databases are created with `auto_vacuum = INCREMENTAL`. A database created by an older version cannot switch modes without a full `VACUUM`, which locks writers while it runs. The service therefore converts an old database **once, only if the file is at most `AutoVacuumConvertMaxMegabytes` and no scan is running** (and there is room on disk for a temporary copy). A larger database is left alone and a warning in the log says so; deleted history then frees pages inside the file for reuse, but the file does not shrink. To convert a large database: stop the service, back up `s3compareservice.db`, run `sqlite3 s3compareservice.db "PRAGMA auto_vacuum = INCREMENTAL; VACUUM;"`, start the service. Schema version 3 also adds the `(JobId, StartTimeUtc)` run index and drops the redundant `JobId` index; schema version 4 adds the checkpoint partition plan (`Checkpoints.PartitionPlanJson`) the per-job throughput overrides (`Jobs.Performance_Json`) and the Full Data read-error counter (`ScanRuns.ContentCheckErrorCount`). Both happen automatically at start.
 
 **Differences per run** (`S3Compare:MaxRecordedDifferencesPerRun`, default `100000`). A bucket pair that diverges completely could otherwise store millions of rows in one run. Past the limit the scan continues and **every counter stays exact** (total, confirmed, in-flight, per type), but no more difference rows are stored. The run is flagged `DifferencesTruncated` (`differencesTruncated` in the API and in the JSON export), its `ScanWindowNotes` say so (the "Clipped Window" column in the UI), and the CSV export carries a `# TRUNCATED` header line. The paged difference list and the exports then hold the first N differences, not all of them. `0` = unlimited. 100,000 rows with their indexes are roughly 100 MB; that is far more than anyone reads in a UI, and enough to find the pattern of a large divergence.
 
@@ -214,9 +216,9 @@ A run is deleted together with its differences and bucket snapshots. These are *
 | Setting | Default | Meaning |
 |---|---|---|
 | `S3Compare:ProcessPriority` | `BelowNormal` | Priority class of the service process, set at start: `Idle`, `BelowNormal`, `Normal`, `AboveNormal` or `High`. `RealTime` is refused. The service then yields CPU to everything else on the server. |
-| `S3Compare:MaxListRequestsPerSecond` | `20` | A token bucket (monotonic clock, burst of one second's worth) that paces every S3 request a scan sends: list pages, and in Full Data mode the object reads. It applies per scan and per bucket side. `0` = unlimited. |
+| `S3Compare:MaxListRequestsPerSecond` | `20` | A token bucket (monotonic clock, burst of one second's worth) that paces every S3 request a scan sends: list pages, and in Full Data mode the object reads. It applies per scan and per bucket side, and is **shared** by all partitions of the scan, the partition planner and the Full Data object reads, so raising `MaxParallelPartitions` never raises the request rate past this limit. `0` = unlimited. Can be overridden per job. |
 
-Why 20: one list request returns 1,000 keys, so 20 requests per second is 20,000 keys per second per side. A scan makes its list requests one after another and normally manages 5 to 10 per second against a public cloud endpoint, so the default does not slow a normal scan. It only matters when the endpoint answers very quickly (an on-premises S3 on a fast network), where an unthrottled scan would hammer it. Lower it (for example `2`) for a fragile on-premises object store; a 100-million-object bucket then takes about 14 hours instead of the 3 to 6 hours it takes at the usual 5 to 10 requests per second.
+Why 20: one list request returns 1,000 keys, so 20 requests per second is 20,000 keys per second per side. One listing stream (one partition) normally manages 5 to 10 requests per second against a public cloud endpoint; with the default 8 partitions a scan reaches the limit, so the limit, not the latency, then sets the speed (about 20,000 objects per second, a 100-million-object bucket in about 1.5 hours). Raise it if the endpoint and your request budget allow (see "Parallel scanning and throughput" below). Lower it (for example `2`) for a fragile on-premises object store; a 100-million-object bucket then takes about 14 hours.
 
 Scan threads do not use Windows background I/O mode (`THREAD_MODE_BACKGROUND_BEGIN`): scans are async tasks that move between thread pool threads, so a per-thread mode would not be reliable. The below-normal process priority and the rate limit do the job instead.
 
@@ -241,12 +243,71 @@ Scan threads do not use Windows background I/O mode (`THREAD_MODE_BACKGROUND_BEG
   "S3Compare": {
     "ProcessPriority": "BelowNormal",
     "MaxListRequestsPerSecond": 20,
+    "MaxParallelPartitions": 8,
+    "PrefetchPages": 2,
+    "MaxObjectsPerSecond": 0,
+    "MaxConcurrentContentChecks": 8,
+    "MaxDiscoveryRequests": 500,
     "MaxRecordedDifferencesPerRun": 100000,
     "Retention": { "KeepRunsPerJob": 500, "KeepDays": 180, "AuditLogDays": 90 },
     "Notifications": { "DeliveryTimeoutSeconds": 30 }
   }
 }
 ```
+
+---
+
+## Parallel scanning and throughput
+
+A scan compares two sorted listings (merge join). A single listing stream is limited by the round trip of one ListObjectsV2 request (1,000 keys per page): at 100 to 200 ms per page that is 5,000 to 10,000 objects per second, about 3 to 6 hours for 100 million objects. Two mechanisms remove that limit.
+
+**1. Prefetch.** Every listing (bucket A and bucket B, for every key range) has a background producer that requests the next pages while the comparison works on the current one, and puts them in a bounded queue of `PrefetchPages` pages. The A and B listings run at the same time. Memory stays bounded: at most `PrefetchPages + 1` pages (about 1,000 objects each) per listing.
+
+**2. Key-range partitioning.** Before the scan, a planner splits the keyspace into ranges that tile it exactly (no gaps, no overlap), using both buckets:
+
+- **Delimiter discovery**: lists the "folders" (`Delimiter = "/"`) level by level, down to `MaxDiscoveryDepth` levels, until there are enough boundaries.
+- **Probe fallback** for flat keyspaces (no folders) or too few folders, inside the deepest folder level found: first it skips the part of the names that all keys share (`file_00001.dat`, `IMG_0001.jpg`, `logs-2024-...` are split where they differ, not at `f`), then single-key requests (`MaxKeys = 1`, `StartAfter = prefix + probe`) at evenly spaced characters find real keys to use as boundaries, coarse to fine over up to 4 rounds. The budget is split evenly over the rounds, the folders and the two buckets, so a small budget still spreads its probes over the whole alphabet.
+- Both stop at `MaxDiscoveryRequests` requests. If the planner fails or finds nothing, the scan runs as one range, exactly as before.
+
+The plan has about `MaxParallelPartitions × PartitionOversubscription` ranges. `MaxParallelPartitions` workers take ranges from a queue, so a large range does not leave the other workers idle. Each range is a separate merge join over the two listings with `StartAfter` at its lower bound; it stops at its upper bound. One database writer stores differences in batches; the statistics, the difference cap (`MaxRecordedDifferencesPerRun`), the events, pause and cancel are shared by all workers.
+
+| Setting | Default | Range | Meaning |
+|---|---|---|---|
+| `S3Compare:MaxParallelPartitions` | `8` | 1 to 256 | Key ranges compared at the same time. `1` = one listing per bucket (still with prefetch). |
+| `S3Compare:PrefetchPages` | `2` | 1 to 64 | Pages each listing fetches ahead. Lowered automatically so that `MaxParallelPartitions × (PrefetchPages + 1)` stays at most 512 pages per bucket (memory, see below). |
+| `S3Compare:MaxListRequestsPerSecond` | `20` | 0 to 100000 | See above; shared per bucket by everything the scan sends. `0` = unlimited. |
+| `S3Compare:MaxObjectsPerSecond` | `0` | 0 to 100000000 | Limits compared **keys** per second, all partitions together. A key present in both buckets counts once, like a key present in only one, so it is the same unit as `ObjectsCompared` and the `obj/sec` speed. `0` = unlimited. |
+| `S3Compare:MaxConcurrentContentChecks` | `8` | 1 to 256 | Full Data mode: object content comparisons running at the same time. |
+| `S3Compare:MaxDiscoveryRequests` | `500` | 0 to 100000 | Request budget of the planner (both buckets). `0` = no planning, one range. |
+| `S3Compare:PartitionOversubscription` | `4` | 1 to 64 | Ranges planned per worker. |
+| `S3Compare:MaxDiscoveryDepth` | `3` | 0 to 10 | Folder levels the planner lists. |
+
+In `appsettings.json`, a value above its range is clamped to the maximum, and a value that is not a number or is below the range falls back to the default; both are written to the service's error output at start. The S3 client's connection limit is raised to fit the scan (at least 16, otherwise `2 × partitions + content checks + 4`).
+
+**Per-job overrides.** `MaxParallelPartitions`, `PrefetchPages`, `MaxListRequestsPerSecond`, `MaxObjectsPerSecond`, `MaxConcurrentContentChecks` and `MaxDiscoveryRequests` can be set per job: in the UI job editor under "Performance / Throttling", or in the API as `performance: { ... }` on the job. An empty (null) value uses the service setting. A value outside the range above, or a job that sets both `MaxParallelPartitions` and `PrefetchPages` with `partitions × (PrefetchPages + 1)` above 512, is refused with `400 Bad Request`. When only one of the two is set, `PrefetchPages` is lowered at scan start if needed.
+
+**Sizing.**
+
+- Throughput per bucket ≈ `MaxParallelPartitions × 1,000 / page latency (s)`, capped at `MaxListRequestsPerSecond × 1,000`. With 150 ms pages, 8 partitions give about 53,000 objects per second unthrottled; with the default limit of 20 requests per second it is 20,000. In the test suite (simulated 25 ms pages, no rate limit), 8 partitions finish several times faster than one.
+- To go faster, raise `MaxListRequestsPerSecond` first (for example `100` for 100,000 objects per second), then `MaxParallelPartitions` until `partitions × 1,000 / latency` exceeds it. More than 32 partitions rarely helps.
+- Partitioning needs structure to split: a bucket with few keys, or with all keys under one very long common prefix, may get fewer ranges than planned.
+- Memory: about `2 × partitions × (PrefetchPages + 1) × 1,000` object summaries in flight (8 partitions, 2 pages: about 48,000 objects, a few tens of MB). The 512-page cap per bucket bounds this at about 1 million summaries (a few hundred MB) whatever the settings.
+- For a fragile on-premises store, keep `MaxListRequestsPerSecond` low (or set `MaxParallelPartitions` to `1`); the limit applies however many partitions there are.
+
+**Cost.** AWS charges LIST requests (S3 Standard: about USD 0.005 per 1,000 requests; check your region and storage class). A full scan of 100 million objects needs about 100,000 list requests per bucket, about USD 0.50 per bucket and run, whatever the number of partitions. Partitioning adds the planner (at most `MaxDiscoveryRequests`, default 500) and up to one extra page per range (a range reads past its upper bound until the page ends). Running the scan hourly multiplies this by 24 per day. Full Data mode adds GET requests for every compared object.
+
+**Checkpoint and resume.** The checkpoint stores the partition plan with the last completed key of every range (`Checkpoints.PartitionPlanJson`) and, for compatibility, the lowest unfinished key as `LastEvaluatedKey`. A resumed scan keeps the plan: finished ranges are skipped, the others continue after their last key, and differences stored past a range's checkpoint are removed first so nothing is counted twice. A checkpoint from an older version (one key, no plan) keeps everything up to its key as done, and the rest of the keyspace is planned and scanned in parallel. Pause also holds the planner: no planning request is sent while a scan is paused.
+
+**Full Data read errors.** A failure to read one object's content no longer stops the scan. Throttling (429, `SlowDown`), 5xx errors, network and I/O errors and request timeouts are retried once. If the read still fails (or fails with `AccessDenied`, `InvalidObjectState` or another permanent error), the key is recorded as a **Content Check Error** difference with the error in its details: the object was not verified. It counts as a confirmed disparity (so the overall threshold alerts on it), has its own counter (`ContentCheckErrorCount`, in the run, the CSV breakdown and the UI type filter) and its own per-job threshold `MaxContentCheckErrorThreshold` (0 = disabled, like the other per-type thresholds). An object that was listed but is gone when it is read (`NoSuchKey`) changed during the scan: it is recorded as an in-flight Content Check Error, like a change inside the replication grace window, and does not count as a confirmed disparity. Only the scan's own cancellation stops the scan.
+
+**Sequence gaps.** Each range's gap detector starts with the key just before the range (its lower boundary, or on resume the last key done), so a numbered series that crosses a range boundary is checked as in a single listing and the gap counts match a one-partition scan. They can differ only if a key the planner used as a boundary is deleted between planning and listing.
+
+**Order of differences and events.** Ranges are compared at the same time, so differences are found out of key order. The difference list and the CSV/JSON exports are ordered by key. When the difference cap is reached, which differences are stored depends on timing; the counters stay exact. `DifferenceFound` handlers run on the worker that found the difference, without an engine lock, and can run concurrently on several workers; a slow handler slows only its own worker.
+
+**Limitations.**
+
+- "(Tail)" in a difference refers to the end of a range, not of the whole bucket.
+- The planner probes ASCII characters; keys that start with other characters are compared, but in the neighbouring ranges.
 
 ---
 

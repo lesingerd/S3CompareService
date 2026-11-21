@@ -13,7 +13,10 @@ public enum DifferenceType
     SizeMismatch,
     ETagMismatch,
     ContentMismatch,
-    PossibleMissingOnBothSides
+    PossibleMissingOnBothSides,
+
+    /// <summary>Full Data mode: the object content could not be read (access denied, service or network error after one retry). Not a proven difference, but the object is unverified.</summary>
+    ContentCheckError
 }
 
 public enum JobScheduleType

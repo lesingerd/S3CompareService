@@ -51,7 +51,7 @@ public static class ReportExporter
         await writer.WriteLineAsync($"# Scan Window Clipped     : {run.IsScanWindowClipped} - {run.ScanWindowNotes}").ConfigureAwait(false);
         if (run.DifferencesTruncated)
             await writer.WriteLineAsync("# TRUNCATED              : Yes - the run hit the recorded-differences limit; the counters above are complete but the rows below are only the first ones stored.").ConfigureAwait(false);
-        await writer.WriteLineAsync($"# Breakdown               : MissingInB={run.MissingInBucketBCount:N0}, MissingInA={run.MissingInBucketACount:N0}, SizeMismatch={run.SizeMismatchCount:N0}, ETagMismatch={run.ETagMismatchCount:N0}, ContentMismatch={run.ContentMismatchCount:N0}, SequenceGaps={run.SequenceGapCount:N0}").ConfigureAwait(false);
+        await writer.WriteLineAsync($"# Breakdown               : MissingInB={run.MissingInBucketBCount:N0}, MissingInA={run.MissingInBucketACount:N0}, SizeMismatch={run.SizeMismatchCount:N0}, ETagMismatch={run.ETagMismatchCount:N0}, ContentMismatch={run.ContentMismatchCount:N0}, SequenceGaps={run.SequenceGapCount:N0}, ContentCheckErrors={run.ContentCheckErrorCount:N0}").ConfigureAwait(false);
         await writer.WriteLineAsync().ConfigureAwait(false);
 
         await writer.WriteLineAsync("Id,Key,Type,ScanWindowTag,IsWithinGracePeriod,Details,BucketASizeBytes,BucketBSizeBytes,BucketAETag,BucketBETag,BucketALastModifiedUtc,BucketBLastModifiedUtc,BucketAStorageClass,BucketBStorageClass,MetadataSummary,DetectedAtUtc").ConfigureAwait(false);

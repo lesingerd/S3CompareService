@@ -47,6 +47,13 @@ public interface IScanRunRepository
     /// </summary>
     Task<int> PrepareResumeAsync(string runId, string? fromRunId, string lastEvaluatedKey, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Per-range form of <see cref="PrepareResumeAsync(string, string?, string, CancellationToken)"/> for a partitioned
+    /// checkpoint: for every incomplete range deletes the differences whose (relative) Key lies in
+    /// (LastCompletedKey ?? Lower, Upper] (a null bound is open). Completed ranges are untouched. Same old-run adoption.
+    /// </summary>
+    Task<int> PrepareResumeAsync(string runId, string? fromRunId, IReadOnlyList<PartitionRange> ranges, CancellationToken cancellationToken = default);
+
     /// <summary>Deletes all differences, snapshots and the checkpoint of a run and zeroes its counters (fresh start).</summary>
     Task ResetRunDataAsync(string runId, CancellationToken cancellationToken = default);
 
@@ -97,6 +104,7 @@ public class ScanRunRepository : IScanRunRepository
         run.ETagMismatchCount,
         run.ContentMismatchCount,
         run.SequenceGapCount,
+        run.ContentCheckErrorCount,
         run.BucketAObjectsRead,
         run.BucketBObjectsRead,
         run.BucketABytesRead,
@@ -116,7 +124,7 @@ public class ScanRunRepository : IScanRunRepository
                 ResumeCount, SupersededByRunId, DifferencesTruncated,
                 ObjectsCompared, MatchedCount, TotalDifferences, FilteredDifferencesCount,
                 InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
-                SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount,
+                SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, ContentCheckErrorCount,
                 BucketAObjectsRead, BucketBObjectsRead, BucketABytesRead, BucketBBytesRead,
                 DurationSeconds, ErrorMessage
             ) VALUES (
@@ -126,7 +134,7 @@ public class ScanRunRepository : IScanRunRepository
                 @ResumeCount, @SupersededByRunId, @DifferencesTruncated,
                 @ObjectsCompared, @MatchedCount, @TotalDifferences, @FilteredDifferencesCount,
                 @InFlightDifferencesCount, @MissingInBucketBCount, @MissingInBucketACount,
-                @SizeMismatchCount, @ETagMismatchCount, @ContentMismatchCount, @SequenceGapCount,
+                @SizeMismatchCount, @ETagMismatchCount, @ContentMismatchCount, @SequenceGapCount, @ContentCheckErrorCount,
                 @BucketAObjectsRead, @BucketBObjectsRead, @BucketABytesRead, @BucketBBytesRead,
                 @DurationSeconds, @ErrorMessage
             );
@@ -159,6 +167,7 @@ public class ScanRunRepository : IScanRunRepository
                 ETagMismatchCount = @ETagMismatchCount,
                 ContentMismatchCount = @ContentMismatchCount,
                 SequenceGapCount = @SequenceGapCount,
+                ContentCheckErrorCount = @ContentCheckErrorCount,
                 BucketAObjectsRead = @BucketAObjectsRead,
                 BucketBObjectsRead = @BucketBObjectsRead,
                 BucketABytesRead = @BucketABytesRead,
@@ -199,7 +208,7 @@ public class ScanRunRepository : IScanRunRepository
         ReplicationGracePeriodMinutes, GracePeriodCutoffUtc, IsScanWindowClipped, IsResumedFromCheckpoint,
         ResumeCount, SupersededByRunId, DifferencesTruncated, ObjectsCompared, MatchedCount, TotalDifferences,
         FilteredDifferencesCount, InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
-        SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, BucketAObjectsRead,
+        SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, ContentCheckErrorCount, BucketAObjectsRead,
         BucketBObjectsRead, BucketABytesRead, BucketBBytesRead, DurationSeconds, ErrorMessage";
 
     private const string AllRunColumns = SummaryRunColumns + ", ScanWindowNotes, LastEvaluatedKey, ResumedFromKey";
@@ -272,7 +281,10 @@ public class ScanRunRepository : IScanRunRepository
         return await GetByIdAsync(runId, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<int> PrepareResumeAsync(string runId, string? fromRunId, string lastEvaluatedKey, CancellationToken cancellationToken = default)
+    public Task<int> PrepareResumeAsync(string runId, string? fromRunId, string lastEvaluatedKey, CancellationToken cancellationToken = default)
+        => PrepareResumeAsync(runId, fromRunId, new[] { new PartitionRange { LastCompletedKey = lastEvaluatedKey ?? string.Empty } }, cancellationToken);
+
+    public async Task<int> PrepareResumeAsync(string runId, string? fromRunId, IReadOnlyList<PartitionRange> ranges, CancellationToken cancellationToken = default)
     {
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var trans = await conn.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
@@ -290,10 +302,19 @@ public class ScanRunRepository : IScanRunRepository
                 new { Old = fromRunId }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
         }
 
-        // SQLite's default BINARY collation compares UTF-8 bytes, i.e. the same order S3 lists keys in.
-        int deleted = await conn.ExecuteAsync(new CommandDefinition(
-            "DELETE FROM RecordedDifferences WHERE ScanRunId = @RunId AND Key > @Key",
-            new { RunId = runId, Key = lastEvaluatedKey }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        // SQLite's default BINARY collation compares UTF-8 bytes, i.e. the same order S3 lists keys in. Difference keys are
+        // relative to the bucket prefix, like the range bounds.
+        int deleted = 0;
+        foreach (var range in ranges)
+        {
+            if (range.Completed) continue;
+            string? after = range.ResumeAfter;
+            string sql = "DELETE FROM RecordedDifferences WHERE ScanRunId = @RunId"
+                + (after != null ? " AND Key > @After" : string.Empty)
+                + (range.Upper != null ? " AND Key <= @Upper" : string.Empty);
+            deleted += await conn.ExecuteAsync(new CommandDefinition(
+                sql, new { RunId = runId, After = after, Upper = range.Upper }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        }
 
         await trans.CommitAsync(cancellationToken).ConfigureAwait(false);
         return deleted;
@@ -313,7 +334,7 @@ public class ScanRunRepository : IScanRunRepository
                 LastEvaluatedKey = '', IsResumedFromCheckpoint = 0, ResumedFromKey = NULL, DifferencesTruncated = 0,
                 ObjectsCompared = 0, MatchedCount = 0, TotalDifferences = 0, FilteredDifferencesCount = 0,
                 InFlightDifferencesCount = 0, MissingInBucketBCount = 0, MissingInBucketACount = 0,
-                SizeMismatchCount = 0, ETagMismatchCount = 0, ContentMismatchCount = 0, SequenceGapCount = 0,
+                SizeMismatchCount = 0, ETagMismatchCount = 0, ContentMismatchCount = 0, SequenceGapCount = 0, ContentCheckErrorCount = 0,
                 BucketAObjectsRead = 0, BucketBObjectsRead = 0, BucketABytesRead = 0, BucketBBytesRead = 0,
                 DurationSeconds = 0
             WHERE Id = @Id", p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
@@ -390,12 +411,15 @@ public class ScanRunRepository : IScanRunRepository
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         checkpoint.LastUpdatedAtUtc = DateTime.UtcNow;
         string json = JsonSerializer.Serialize(checkpoint);
+        string? planJson = checkpoint.Partitions is { Count: > 0 } plan ? JsonSerializer.Serialize(plan) : null;
 
+        // One statement: the checkpoint and its partition plan are always written together.
         string sql = @"
-            INSERT INTO Checkpoints (ScanRunId, JobId, CheckpointJson, LastUpdatedAtUtc)
-            VALUES (@ScanRunId, @JobId, @CheckpointJson, @LastUpdatedAtUtc)
+            INSERT INTO Checkpoints (ScanRunId, JobId, CheckpointJson, PartitionPlanJson, LastUpdatedAtUtc)
+            VALUES (@ScanRunId, @JobId, @CheckpointJson, @PartitionPlanJson, @LastUpdatedAtUtc)
             ON CONFLICT(ScanRunId) DO UPDATE SET
                 CheckpointJson = excluded.CheckpointJson,
+                PartitionPlanJson = excluded.PartitionPlanJson,
                 LastUpdatedAtUtc = excluded.LastUpdatedAtUtc;
         ";
 
@@ -404,6 +428,7 @@ public class ScanRunRepository : IScanRunRepository
             checkpoint.ScanRunId,
             checkpoint.JobId,
             CheckpointJson = json,
+            PartitionPlanJson = planJson,
             LastUpdatedAtUtc = DbDateTime.ToDb(checkpoint.LastUpdatedAtUtc)
         };
 
@@ -413,15 +438,18 @@ public class ScanRunRepository : IScanRunRepository
     public async Task<ScanCheckpoint?> GetCheckpointAsync(string scanRunId, CancellationToken cancellationToken = default)
     {
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        string sql = "SELECT CheckpointJson FROM Checkpoints WHERE ScanRunId = @ScanRunId";
-        var json = await conn.QuerySingleOrDefaultAsync<string>(new CommandDefinition(sql, new { ScanRunId = scanRunId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
-        if (string.IsNullOrWhiteSpace(json)) return null;
+        string sql = "SELECT CheckpointJson, PartitionPlanJson FROM Checkpoints WHERE ScanRunId = @ScanRunId";
+        var row = await conn.QuerySingleOrDefaultAsync<(string? Json, string? PlanJson)>(new CommandDefinition(sql, new { ScanRunId = scanRunId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(row.Json)) return null;
 
-        var cp = JsonSerializer.Deserialize<ScanCheckpoint>(json);
+        var cp = JsonSerializer.Deserialize<ScanCheckpoint>(row.Json);
         if (cp != null)
         {
             cp.CreatedAtUtc = DbDateTime.ToUtc(cp.CreatedAtUtc);
             cp.LastUpdatedAtUtc = DbDateTime.ToUtc(cp.LastUpdatedAtUtc);
+            // NULL plan = version 1 checkpoint (single key); the engine resumes it as one range after LastEvaluatedKey.
+            if (!string.IsNullOrWhiteSpace(row.PlanJson))
+                cp.Partitions = JsonSerializer.Deserialize<List<PartitionRange>>(row.PlanJson);
         }
         return cp;
     }
@@ -471,6 +499,7 @@ public class ScanRunRepository : IScanRunRepository
             ETagMismatchCount = Num("ETagMismatchCount"),
             ContentMismatchCount = Num("ContentMismatchCount"),
             SequenceGapCount = Num("SequenceGapCount"),
+            ContentCheckErrorCount = Num("ContentCheckErrorCount"),
             BucketAObjectsRead = Num("BucketAObjectsRead"),
             BucketBObjectsRead = Num("BucketBObjectsRead"),
             BucketABytesRead = Num("BucketABytesRead"),

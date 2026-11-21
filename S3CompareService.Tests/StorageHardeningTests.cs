@@ -312,7 +312,7 @@ public class StorageHardeningTests : TestDbBase
         // UTF-8 order: a < b < z < U+FF01 < emoji  => only the emoji is after the checkpoint (UTF-16 order would also drop z).
         Assert.AreEqual(1, removed);
         var left = (await DiffRepo.GetAllForRunAsync(run.Id)).Select(d => d.Key).ToList();
-        CollectionAssert.AreEqual(new[] { "a", "b", "！", "z" }, left);
+        CollectionAssert.AreEqual(new[] { "a", "b", "z", "！" }, left, "GetAllForRunAsync returns key (UTF-8) order");
     }
 
     // ---------- 6. Run metadata persisted ----------

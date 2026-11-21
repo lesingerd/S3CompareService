@@ -30,7 +30,8 @@ public interface IDifferenceRepository
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Streams all differences of a run (optionally excluding in-flight ones) without buffering them in memory.
+    /// Streams all differences of a run (optionally excluding in-flight ones) without buffering them in memory, in key order
+    /// (a parallel scan inserts them out of key order; the (ScanRunId, Key) index serves the sort).
     /// The underlying connection stays open until enumeration completes or is disposed.
     /// </summary>
     IAsyncEnumerable<RecordedDifference> StreamAllForRunAsync(
@@ -111,7 +112,7 @@ public class DifferenceRepository : IDifferenceRepository
         string sql = $@"
             SELECT * FROM RecordedDifferences
             {whereSql}
-            ORDER BY Id ASC
+            ORDER BY Key ASC, Id ASC
             LIMIT @Take OFFSET @Skip;
         ";
 
@@ -147,7 +148,7 @@ public class DifferenceRepository : IDifferenceRepository
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
 
         var (whereSql, dp) = BuildFilter(scanRunId, null, withinGracePeriodFilter, null);
-        string sql = $"SELECT * FROM RecordedDifferences {whereSql} ORDER BY Id ASC;";
+        string sql = $"SELECT * FROM RecordedDifferences {whereSql} ORDER BY Key ASC, Id ASC;";
 
         var rows = await conn.QueryAsync(new CommandDefinition(sql, dp, cancellationToken: cancellationToken)).ConfigureAwait(false);
         var list = new List<RecordedDifference>();
@@ -166,7 +167,7 @@ public class DifferenceRepository : IDifferenceRepository
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
 
         var (whereSql, dp) = BuildFilter(scanRunId, null, withinGracePeriodFilter, null);
-        string sql = $"SELECT * FROM RecordedDifferences {whereSql} ORDER BY Id ASC;";
+        string sql = $"SELECT * FROM RecordedDifferences {whereSql} ORDER BY Key ASC, Id ASC;";
 
         await foreach (var r in conn.QueryUnbufferedAsync(sql, dp).ConfigureAwait(false))
         {
