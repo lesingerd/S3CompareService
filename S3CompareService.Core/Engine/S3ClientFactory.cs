@@ -7,6 +7,17 @@ namespace S3CompareService.Core.Engine;
 
 public static class S3ClientFactory
 {
+    /// <summary>
+    /// Time limit of one HTTP attempt. With the retries it bounds how long one S3 call can stall (the SDK settings used before were
+    /// 45 s x (1 + 3 retries) = 3 minutes and more with back-off). A scan creates its clients with <c>maxErrorRetry: 0</c> and retries
+    /// list calls itself (<see cref="S3Lister"/>), so every attempt shows in the diagnostics panel; the partition planner also gives
+    /// each request its own 15 s limit.
+    /// </summary>
+    public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>SDK retries for clients that do not retry themselves (connection tests, bucket discovery).</summary>
+    public const int DefaultMaxErrorRetry = 2;
+
     public static List<S3EndpointPreset> GetWasabiEndpoints()
     {
         return new List<S3EndpointPreset>
@@ -34,15 +45,16 @@ public static class S3ClientFactory
     /// Creates a client for one bucket. <paramref name="maxConnections"/> sets the HTTP connections the client may open to the
     /// endpoint; a parallel scan passes enough for all its partitions (two listings in flight each) plus the content checks.
     /// </summary>
-    public static AmazonS3Client CreateClient(S3BucketConfig config, int? maxConnections = null)
+    public static AmazonS3Client CreateClient(S3BucketConfig config, int? maxConnections = null, int maxErrorRetry = DefaultMaxErrorRetry)
     {
         var credentials = new BasicAWSCredentials(config.AccessKey.Trim(), config.SecretKey.Trim());
         
         var s3Config = new AmazonS3Config
         {
             ForcePathStyle = true,
-            Timeout = TimeSpan.FromSeconds(45),
-            MaxErrorRetry = 3
+            Timeout = RequestTimeout,
+            MaxErrorRetry = Math.Max(0, maxErrorRetry),
+            RetryMode = RequestRetryMode.Standard
         };
 
         if (maxConnections is int connections && connections > 0)

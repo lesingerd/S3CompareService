@@ -95,9 +95,15 @@ public class IdleMonHeartbeatIsolationTests : TestDbBase
         await service.StartAsync(CancellationToken.None);
         try
         {
-            await Task.Delay(TimeSpan.FromSeconds(3.3));
-            var heartbeats = reporter.Messages.Count(m => m.Kind == "heartbeat");
-            Assert.IsTrue(heartbeats >= 3, $"{heartbeats} heartbeats in 3.3 s with a 1 s interval");
+            // Wait for the heartbeats instead of a fixed 3.3 s, so a loaded machine cannot fail the test; the collection
+            // pass stays blocked the whole time, so 3 heartbeats still prove they run on their own task.
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int heartbeats;
+            while ((heartbeats = reporter.Messages.Count(m => m.Kind == "heartbeat")) < 3 && sw.Elapsed < TimeSpan.FromSeconds(20))
+            {
+                await Task.Delay(50);
+            }
+            Assert.IsTrue(heartbeats >= 3, $"{heartbeats} heartbeats in {sw.Elapsed.TotalSeconds:F1} s with a 1 s interval");
             Assert.IsTrue(jobs.BlockedCalls >= 1, "the collection did start and is stuck");
             Assert.IsFalse(reporter.Messages.Any(m => m.Kind == "metric"), "no metrics: the pass never finished");
         }

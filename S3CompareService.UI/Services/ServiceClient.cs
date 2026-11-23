@@ -3,6 +3,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text.Json;
+using S3CompareService.Core.Engine;
 using S3CompareService.Core.IdleMon;
 using S3CompareService.Core.Models;
 using S3CompareService.Core.Storage;
@@ -43,6 +44,53 @@ public class ActiveScanDto
     public int PartitionsCompleted { get; set; }
     public int PartitionsActive { get; set; }
     public string PartitionsDisplay => PartitionsTotal > 0 ? $"{PartitionsCompleted}/{PartitionsTotal} ({PartitionsActive} active)" : "-";
+
+    // Live phase information (service 1.1+; empty when talking to an older service)
+    public string Phase { get; set; } = string.Empty;
+    public string PhaseText { get; set; } = string.Empty;
+    public string Operation { get; set; } = string.Empty;
+    public string? LastError { get; set; }
+    public double? CancelRequestedSeconds { get; set; }
+    public int PartitionsQueued { get; set; }
+    public PlannerStats? Planner { get; set; }
+    public InFlightInfo? OldestS3 { get; set; }
+    public InFlightInfo? OldestDb { get; set; }
+
+    public bool HasPhaseText => !string.IsNullOrEmpty(PhaseText);
+    public bool HasLastError => !string.IsNullOrEmpty(LastError);
+    public bool IsCancelling => CancelRequestedSeconds != null;
+    /// <summary>The oldest S3 request and database call in flight, with their age; empty when none.</summary>
+    public string InFlightText
+    {
+        get
+        {
+            var parts = new List<string>();
+            if (OldestS3 != null) parts.Add("S3 " + OldestS3.ToString().Substring(4));
+            if (OldestDb != null) parts.Add("DB " + OldestDb.ToString().Substring(4));
+            return parts.Count == 0 ? string.Empty : "Oldest in flight - " + string.Join("   |   ", parts);
+        }
+    }
+    public bool HasInFlight => OldestS3 != null || OldestDb != null;
+}
+
+/// <summary>The effective service-wide scan settings; an empty per-job override falls back to them. Defaults are the ScanOptions constants, used when the service cannot be asked.</summary>
+public class ScanDefaultsDto
+{
+    public int MaxParallelPartitions { get; set; } = ScanOptions.DefaultMaxParallelPartitions;
+    public int PrefetchPages { get; set; } = ScanOptions.DefaultPrefetchPages;
+    public double MaxListRequestsPerSecond { get; set; } = ScanOptions.DefaultMaxListRequestsPerSecond;
+    public double MaxObjectsPerSecond { get; set; } = ScanOptions.DefaultMaxObjectsPerSecond;
+    public int MaxConcurrentContentChecks { get; set; } = ScanOptions.DefaultMaxConcurrentContentChecks;
+    public int MaxDiscoveryRequests { get; set; } = ScanOptions.DefaultMaxDiscoveryRequests;
+    public int MaxPlanningSeconds { get; set; } = ScanOptions.DefaultMaxPlanningSeconds;
+
+    public string MaxParallelPartitionsHint => $"default: {MaxParallelPartitions}";
+    public string PrefetchPagesHint => $"default: {PrefetchPages}";
+    public string MaxListRequestsPerSecondHint => MaxListRequestsPerSecond > 0 ? $"default: {MaxListRequestsPerSecond:0.##}" : "default: unlimited";
+    public string MaxObjectsPerSecondHint => MaxObjectsPerSecond > 0 ? $"default: {MaxObjectsPerSecond:0.##}" : "default: unlimited";
+    public string MaxConcurrentContentChecksHint => $"default: {MaxConcurrentContentChecks}";
+    public string MaxDiscoveryRequestsHint => $"default: {MaxDiscoveryRequests}";
+    public string MaxPlanningSecondsHint => MaxPlanningSeconds > 0 ? $"default: {MaxPlanningSeconds}" : "default: no limit";
 }
 
 public class DifferencePageResult
@@ -283,6 +331,20 @@ public class ServiceClient
     }
 
     // ---------- Status / presets ----------
+
+    /// <summary>Live diagnostics of an active scan, or null when it is not active (or the service is unreachable).</summary>
+    public async Task<ScanDiagnosticsSnapshot?> GetDiagnosticsAsync(string runId)
+    {
+        try { return await GetJsonAsync<ScanDiagnosticsSnapshot>($"/api/runs/{Uri.EscapeDataString(runId)}/diagnostics").ConfigureAwait(false); }
+        catch (Exception ex) when (ex is ServiceOfflineException or ServiceApiException) { return null; }
+    }
+
+    /// <summary>The effective scan settings of the service; the built-in defaults when it is offline or too old to know the endpoint.</summary>
+    public async Task<ScanDefaultsDto> GetScanDefaultsAsync()
+    {
+        try { return await GetJsonAsync<ScanDefaultsDto>("/api/settings/scan-defaults").ConfigureAwait(false); }
+        catch (Exception ex) when (ex is ServiceOfflineException or ServiceApiException) { return new ScanDefaultsDto(); }
+    }
 
     public async Task<ServiceStatusDto> GetStatusAsync()
     {

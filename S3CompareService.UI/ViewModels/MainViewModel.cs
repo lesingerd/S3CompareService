@@ -34,6 +34,38 @@ public class MainViewModel : ViewModelBase
         private set => SetField(ref _idleMon, value);
     }
 
+    // Scan Diagnostics tab (polled with the status while a scan is active)
+    private ScanDiagnosticsSnapshot? _diagnostics;
+    public ScanDiagnosticsSnapshot? Diagnostics
+    {
+        get => _diagnostics;
+        private set
+        {
+            if (SetField(ref _diagnostics, value))
+            {
+                OnPropertyChanged(nameof(DiagnosticsSummary));
+                OnPropertyChanged(nameof(DiagnosticsPartitionsNote));
+            }
+        }
+    }
+    public string DiagnosticsSummary => _diagnostics == null
+        ? "No scan is active. Start a scan (Comparison Jobs, Run Now) and this tab shows its phase, planner, request rates, partitions and in-flight operations."
+        : ScanDiagnosticsFormatter.Summary(_diagnostics);
+    public string DiagnosticsPartitionsNote => _diagnostics == null || _diagnostics.PartitionsOmitted <= 0
+        ? string.Empty
+        : $"Showing {_diagnostics.Partitions.Count} of {_diagnostics.PartitionsTotal} partitions (active first, then queued, then the most recently finished); {_diagnostics.PartitionsOmitted} not shown.";
+    public ObservableCollection<PartitionRow> DiagnosticsPartitions { get; } = new();
+
+    // Effective service defaults, shown as grey hints in empty job performance boxes
+    private ScanDefaultsDto _scanDefaults = new();
+    public ScanDefaultsDto ScanDefaults
+    {
+        get => _scanDefaults;
+        private set => SetField(ref _scanDefaults, value);
+    }
+    private bool _scanDefaultsFromService;
+    private int _logRefreshTicks;
+
     private ActiveScanDto? _currentActiveScan;
     public ActiveScanDto? CurrentActiveScan
     {
@@ -394,6 +426,8 @@ public class MainViewModel : ViewModelBase
             await RefreshStatusAsync();
             var active = CurrentActiveScan;
             bool isScanActiveNow = active != null;
+            await SafeAsync(() => RefreshDiagnosticsAsync(active), "refresh diagnostics");
+            if (active != null && ++_logRefreshTicks % 4 == 0) await SafeAsync(LoadLogsAsync, "refresh logs");
 
             if (active != null)
             {
@@ -431,12 +465,36 @@ public class MainViewModel : ViewModelBase
         }
     }
 
+    private async Task RefreshDiagnosticsAsync(ActiveScanDto? active)
+    {
+        if (active == null)
+        {
+            if (Diagnostics != null) { Diagnostics = null; DiagnosticsPartitions.Clear(); }
+            return;
+        }
+        var d = await _client.GetDiagnosticsAsync(active.ScanRunId);
+        if (d == null) return;
+        Diagnostics = d;
+        // Replace the rows in place so the grid keeps its scroll position and selection.
+        for (int i = 0; i < d.Partitions.Count; i++)
+        {
+            if (i < DiagnosticsPartitions.Count) DiagnosticsPartitions[i] = d.Partitions[i];
+            else DiagnosticsPartitions.Add(d.Partitions[i]);
+        }
+        while (DiagnosticsPartitions.Count > d.Partitions.Count) DiagnosticsPartitions.RemoveAt(DiagnosticsPartitions.Count - 1);
+    }
+
     private ServiceStatusDto? _lastStatusForScan;
 
     public async Task RefreshStatusAsync()
     {
         var status = await _client.GetStatusAsync();
         ServiceStatus = status;
+        if (!_scanDefaultsFromService && status.Status == "Running")
+        {
+            ScanDefaults = await _client.GetScanDefaultsAsync();
+            _scanDefaultsFromService = true;
+        }
         // Do not ask a second time when the service is already known to be unreachable.
         var idleMon = status.Status == "Running" ? await _client.GetIdleMonStatusAsync() : null;
         IdleMon = IdleMonCardView.From(idleMon, DateTime.UtcNow);

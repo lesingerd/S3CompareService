@@ -88,7 +88,7 @@ public class NotificationDispatcherTests : TestDbBase
 
     private static ScanRun FailedRun(string jobId) => new() { Id = Guid.NewGuid().ToString(), JobId = jobId, Status = RunStatus.Failed, StartTimeUtc = DateTime.UtcNow };
 
-    private static async Task WaitForAsync(Func<bool> condition, int timeoutMs = 8000)
+    private static async Task WaitForAsync(Func<bool> condition, int timeoutMs = 20000)
     {
         var sw = Stopwatch.StartNew();
         while (!condition())
@@ -123,10 +123,10 @@ public class NotificationDispatcherTests : TestDbBase
 
         await RunningAsync(dispatcher, async () =>
         {
-            // Every pass must finish (a pass that waited for the hung send would hit the 10 s guard) while the digest send is still pending.
+            // Every pass must finish (a pass that waited for the hung send would hit the 30 s guard; generous so a loaded machine cannot trip it) while the digest send is still pending.
             for (int i = 0; i < 5; i++)
             {
-                using var guard = new CancellationTokenSource(10000);
+                using var guard = new CancellationTokenSource(30000);
                 await scheduler.EvaluateSchedulesAsync(guard.Token);
                 if (i == 0) await WaitForAsync(() => alerts.DigestCalls == 1);
             }

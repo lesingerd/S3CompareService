@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using S3CompareService.Core.Models;
 
 namespace S3CompareService.Core.Engine;
@@ -7,7 +8,7 @@ namespace S3CompareService.Core.Engine;
 /// any sorted set of boundary strings over the keys RELATIVE to each bucket's prefix (A and B prefixes may differ) cuts both
 /// listings at the same places.
 ///
-/// Boundary candidates are found in two steps, within a request budget:
+/// Boundary candidates are found in two steps, within a request budget and a time box:
 /// <list type="number">
 /// <item>Delimiter discovery: "/" listings under the prefix on both buckets; the union of the common prefixes is the candidate
 /// set. It descends level by level (up to <c>maxDiscoveryDepth</c>) until there are at least <c>targetPartitions</c> candidates.</item>
@@ -19,16 +20,28 @@ namespace S3CompareService.Core.Engine;
 /// </list>
 /// The candidates are sorted and <c>targetPartitions - 1</c> of them, evenly spaced, become the boundaries. Correctness never
 /// depends on the quality of the plan: <see cref="BuildRanges"/> always returns ranges that tile the whole keyspace exactly.
+///
+/// Robustness: every planner request has its own timeout (default 15 s, counted after the rate limiter and the concurrency
+/// gate, so throttling is not a timeout). A request that fails or times out is logged as a warning and skipped; it never
+/// aborts planning. If a shared-prefix check (StartAfter = p + U+10FFFF) fails, the jump is switched off for the rest of the
+/// plan and probing continues. When <c>maxPlanningTime</c> is used up, no more requests are issued (those in flight are
+/// cancelled) and the ranges are built from the candidates found so far. Only the scan's own cancellation propagates.
+/// At most <see cref="MaxConcurrentPlannerRequests"/> requests are in flight at once, across everything the planner does.
 /// </summary>
 public sealed class PartitionPlanner
 {
     /// <summary>The characters probed (space through tilde). Keys with other first characters land in the neighbouring range.</summary>
     public const string ProbeAlphabet = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
-    private const int MaxPagesPerPrefixListing = 10;
-    private const int MaxConcurrentPlannerRequests = 8;
-    private const int MaxProbeRounds = 4;
+    /// <summary>The default time limit of one planner request.</summary>
+    public static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(15);
 
+    private const int MaxPagesPerPrefixListing = 10;
+    /// <summary>Planner requests in flight at once (all buckets together). The per-bucket rate limiter still applies.</summary>
+    public const int MaxConcurrentPlannerRequests = 16;
+    private const int MaxProbeRounds = 4;
+    private const int JumpFanout = 3;
+    private const int MaxLoggedErrors = 20;
 
     /// <summary>Characters probed when the budget does not allow the whole alphabet (ASCII order).</summary>
     private const string CommonKeyChars = "-./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
@@ -41,8 +54,25 @@ public sealed class PartitionPlanner
     private int _requestsUsed;
     private List<string>? _deepestLevel;
     private readonly Func<CancellationToken, Task>? _pauseGate;
+    private readonly TimeSpan _maxPlanningTime;
+    private readonly TimeSpan _requestTimeout;
+    private readonly Action<string, string>? _log;
+    private readonly SemaphoreSlim _gate = new(MaxConcurrentPlannerRequests);
+    private readonly CancellationTokenSource _deadline = new();
+    private readonly Stopwatch _clock = new();
 
-    private sealed record Side(IS3Lister Lister, string Bucket, string Prefix, IRequestRateLimiter? Limiter);
+    // 0 = StartAfter marker U+10FFFF, 1 = fallback marker "~" (after the first failed), 2 = jump off (after the fallback failed too)
+    private int _jumpState;
+    private bool JumpOff => Volatile.Read(ref _jumpState) >= 2;
+    private volatile bool _timedOut;
+    private volatile string _step = string.Empty;
+    private volatile string? _lastError;
+    private volatile bool _started, _finished;
+    private int _errors;
+    private int _rangeCount;
+    private SortedSet<string>? _liveCandidates;
+
+    private sealed record Side(IS3Lister Lister, string Bucket, string Prefix, IRequestRateLimiter? Limiter, string Name);
 
     public PartitionPlanner(
         IS3Lister listerA, string bucketA, string? prefixA, IRequestRateLimiter? limiterA,
@@ -50,14 +80,20 @@ public sealed class PartitionPlanner
         int targetPartitions,
         int maxDiscoveryDepth = ScanOptions.DefaultMaxDiscoveryDepth,
         int maxRequests = ScanOptions.DefaultMaxDiscoveryRequests,
-        Func<CancellationToken, Task>? pauseGate = null)
+        Func<CancellationToken, Task>? pauseGate = null,
+        TimeSpan? maxPlanningTime = null,
+        TimeSpan? requestTimeout = null,
+        Action<string, string>? log = null)
     {
-        _a = new Side(listerA ?? throw new ArgumentNullException(nameof(listerA)), bucketA, prefixA ?? string.Empty, limiterA);
-        _b = new Side(listerB ?? throw new ArgumentNullException(nameof(listerB)), bucketB, prefixB ?? string.Empty, limiterB);
+        _a = new Side(listerA ?? throw new ArgumentNullException(nameof(listerA)), bucketA, prefixA ?? string.Empty, limiterA, "A");
+        _b = new Side(listerB ?? throw new ArgumentNullException(nameof(listerB)), bucketB, prefixB ?? string.Empty, limiterB, "B");
         _targetPartitions = Math.Max(1, targetPartitions);
         _maxDepth = Math.Max(0, maxDiscoveryDepth);
         _maxRequests = Math.Max(0, maxRequests);
         _pauseGate = pauseGate;
+        _maxPlanningTime = maxPlanningTime is { } t && t > TimeSpan.Zero ? t : TimeSpan.Zero;
+        _requestTimeout = requestTimeout is { } r && r > TimeSpan.Zero ? r : DefaultRequestTimeout;
+        _log = log;
     }
 
     /// <summary>S3 requests sent by <see cref="PlanAsync"/>.</summary>
@@ -69,34 +105,168 @@ public sealed class PartitionPlanner
     /// <summary>Distinct boundary candidates found by the last <see cref="PlanAsync"/>.</summary>
     public int CandidateCount { get; private set; }
 
-    private bool TryTakeRequest() => Interlocked.Increment(ref _requestsUsed) <= _maxRequests;
+    /// <summary>True when the planning time limit ended the search early.</summary>
+    public bool TimedOut => _timedOut;
+
+    /// <summary>True when the shared-prefix jump was switched off after failed requests (see <see cref="JumpMode"/>).</summary>
+    public bool JumpDisabled => JumpOff;
+
+    /// <summary>"U+10FFFF" (normal), "~ fallback" (the first marker was rejected) or "disabled".</summary>
+    public string JumpMode => Volatile.Read(ref _jumpState) switch { 0 => "U+10FFFF", 1 => "~ fallback", _ => "disabled" };
+
+    /// <summary>Planner requests that failed or timed out (the time limit cancelling a request does not count).</summary>
+    public int RequestErrors => Volatile.Read(ref _errors);
+
+    /// <summary>The most recent request error, or null.</summary>
+    public string? LastError => _lastError;
+
+    /// <summary>Live numbers for the banner and diagnostics panel. Safe to call from any thread at any time.</summary>
+    public PlannerStats GetStats() => new()
+    {
+        Started = _started,
+        Finished = _finished,
+        RequestsUsed = RequestsUsed,
+        RequestBudget = _maxRequests,
+        Candidates = _finished ? CandidateCount : LiveCandidateCount(),
+        TargetPartitions = _targetPartitions,
+        Step = _step,
+        ElapsedSeconds = _clock.Elapsed.TotalSeconds,
+        TimeLimitSeconds = _maxPlanningTime.TotalSeconds,
+        TimedOut = _timedOut,
+        JumpDisabled = JumpOff,
+        JumpMode = JumpMode,
+        RequestErrors = RequestErrors,
+        LastError = _lastError,
+        Method = Method,
+        Ranges = _rangeCount
+    };
+
+    private int LiveCandidateCount()
+    {
+        var set = _liveCandidates;
+        if (set == null) return 0;
+        lock (set) return set.Count;
+    }
+
+    private bool TimeUp => _deadline.IsCancellationRequested;
+
+    private bool TryTakeRequest()
+    {
+        if (TimeUp) { _timedOut = true; return false; }
+        return Interlocked.Increment(ref _requestsUsed) <= _maxRequests;
+    }
+
+    private void SetStep(string step)
+    {
+        if (_step == step) return;
+        _step = step;
+        _log?.Invoke("INFO", $"Planner step: {step} ({RequestsUsed}/{_maxRequests} requests, {LiveCandidateCount()} candidates, {_clock.Elapsed.TotalSeconds:0} s).");
+    }
 
     /// <summary>Finds boundaries and returns the ranges (one range when no planning is wanted or possible).</summary>
     public async Task<List<PartitionRange>> PlanAsync(CancellationToken cancellationToken)
     {
+        _started = true;
+        _clock.Restart();
         if (_targetPartitions <= 1 || _maxRequests <= 0)
         {
             CandidateCount = 0;
+            _finished = true;
+            _rangeCount = 1;
             return BuildRanges(Array.Empty<string>(), 1);
         }
 
+        if (_maxPlanningTime > TimeSpan.Zero) _deadline.CancelAfter(_maxPlanningTime);
         var candidates = new SortedSet<string>(Utf8OrdinalComparer.Instance);
-        bool usedDelimiter = await DiscoverByDelimiterAsync(candidates, cancellationToken).ConfigureAwait(false);
-        bool usedProbe = false;
-        if (candidates.Count < _targetPartitions)
+        _liveCandidates = candidates;
+        try
         {
-            usedProbe = await ProbeAsync(candidates, cancellationToken).ConfigureAwait(false);
-        }
+            bool usedDelimiter = await DiscoverByDelimiterAsync(candidates, cancellationToken).ConfigureAwait(false);
+            bool usedProbe = false;
+            if (LiveCandidateCount() < _targetPartitions && !TimeUp)
+            {
+                usedProbe = await ProbeAsync(candidates, cancellationToken).ConfigureAwait(false);
+            }
+            if (TimeUp) _timedOut = true;
 
-        Method = (usedDelimiter, usedProbe) switch
+            Method = (usedDelimiter, usedProbe) switch
+            {
+                (true, true) => "delimiter+probe",
+                (true, false) => "delimiter",
+                (false, true) => "probe",
+                _ => "none"
+            };
+            List<PartitionRange> ranges;
+            lock (candidates)
+            {
+                CandidateCount = candidates.Count;
+                ranges = BuildRanges(candidates.ToList(), _targetPartitions);
+            }
+            _rangeCount = ranges.Count;
+            if (_errors > MaxLoggedErrors) _log?.Invoke("WARN", $"Planner: {_errors - MaxLoggedErrors} further request error(s) were not logged individually ({_errors} in total).");
+            if (_timedOut) _log?.Invoke("WARN", $"Planner: the {_maxPlanningTime.TotalSeconds:0} s planning time limit was reached; using the {CandidateCount} candidate(s) found so far ({RequestsUsed}/{_maxRequests} requests). The scan is still complete, only the range balance may be worse.");
+            return ranges;
+        }
+        finally
         {
-            (true, true) => "delimiter+probe",
-            (true, false) => "delimiter",
-            (false, true) => "probe",
-            _ => "none"
-        };
-        CandidateCount = candidates.Count;
-        return BuildRanges(candidates, _targetPartitions);
+            _finished = true;
+            _clock.Stop();
+        }
+    }
+
+    // ---------------- request plumbing ----------------
+
+    /// <summary>
+    /// One planner list request with its own timeout. Returns null when it failed, timed out, or the time limit cancelled it;
+    /// throws only when the scan itself is cancelled. The caller has taken the budget.
+    /// </summary>
+    private async Task<S3ListPage?> RequestAsync(Side side, string? prefix, string? startAfter, string? token, string? delimiter, int maxKeys, int jumpState, string what, CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct, _deadline.Token);
+        bool gateHeld = false;
+        try
+        {
+            if (_pauseGate != null) await _pauseGate(ct).ConfigureAwait(false);
+            await _gate.WaitAsync(cts.Token).ConfigureAwait(false);
+            gateHeld = true;
+            if (side.Limiter != null) await side.Limiter.WaitAsync(cts.Token).ConfigureAwait(false);
+            // The timeout starts here, after any throttling or queueing.
+            cts.CancelAfter(_requestTimeout);
+            return await side.Lister.ListPageAsync(side.Bucket, prefix, startAfter, token, delimiter, maxKeys, cts.Token)
+                .WaitUnlessDoneAsync(_requestTimeout, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (TimeUp)
+            {
+                _timedOut = true; // cut short by the time limit: not an error
+                return null;
+            }
+            string reason = ex is TimeoutException or OperationCanceledException
+                ? $"timed out after {_requestTimeout.TotalSeconds:0} s"
+                : $"{ex.GetType().Name}: {ex.Message}";
+            ReportError(side, what, reason, jumpState);
+            return null;
+        }
+        finally
+        {
+            if (gateHeld) _gate.Release();
+        }
+    }
+
+    private void ReportError(Side side, string what, string reason, int jumpState)
+    {
+        int n = Interlocked.Increment(ref _errors);
+        string msg = $"bucket {side.Name} {what}: {reason}";
+        _lastError = msg;
+        if (n <= MaxLoggedErrors) _log?.Invoke("WARN", $"Planner request failed ({msg}); it is skipped and planning continues.");
+        if (jumpState >= 0 && Interlocked.CompareExchange(ref _jumpState, jumpState + 1, jumpState) == jumpState)
+        {
+            _log?.Invoke("WARN", jumpState == 0
+                ? $"Planner: the shared-prefix check (StartAfter = prefix + U+10FFFF) failed on bucket {side.Name} ({reason}); falling back to the '~' marker for the rest of this plan."
+                : $"Planner: the shared-prefix check also failed with the '~' marker on bucket {side.Name} ({reason}); the jump is disabled for the rest of this plan and probing continues without it.");
+        }
     }
 
     // ---------------- 1. delimiter discovery ----------------
@@ -105,8 +275,9 @@ public sealed class PartitionPlanner
     {
         bool any = false;
         var level = new List<string> { string.Empty };
-        for (int depth = 1; depth <= _maxDepth && level.Count > 0; depth++)
+        for (int depth = 1; depth <= _maxDepth && level.Count > 0 && !TimeUp; depth++)
         {
+            SetStep($"delimiter depth {depth}");
             var found = new SortedSet<string>(Utf8OrdinalComparer.Instance);
             var gate = new object();
             await Parallel.ForEachAsync(level, new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentPlannerRequests, CancellationToken = ct }, async (rel, token) =>
@@ -122,9 +293,9 @@ public sealed class PartitionPlanner
 
             if (found.Count == 0) break;
             any = true;
-            candidates.UnionWith(found);
+            lock (candidates) candidates.UnionWith(found);
             _deepestLevel = found.ToList();
-            if (candidates.Count >= _targetPartitions || RequestsUsed >= _maxRequests) break;
+            if (LiveCandidateCount() >= _targetPartitions || RequestsUsed >= _maxRequests) break;
             level = _deepestLevel;
         }
         return any;
@@ -139,13 +310,16 @@ public sealed class PartitionPlanner
         for (int page = 0; page < MaxPagesPerPrefixListing; page++)
         {
             if (!TryTakeRequest()) break;
-            await BeforeRequestAsync(side, ct).ConfigureAwait(false);
-            var response = await side.Lister.ListPageAsync(side.Bucket, listPrefix, null, token, "/", 1000, ct).ConfigureAwait(false);
+            var response = await RequestAsync(side, listPrefix, null, token, "/", 1000, -1, $"delimiter listing prefix='{InstrumentedLister.Clip(listPrefix)}' page {page + 1}", ct).ConfigureAwait(false);
+            if (response == null) break;
             foreach (var cp in response.CommonPrefixes)
             {
                 if (cp.StartsWith(side.Prefix, StringComparison.Ordinal)) result.Add(cp.Substring(side.Prefix.Length));
             }
             if (!response.IsTruncated || string.IsNullOrEmpty(response.NextContinuationToken)) break;
+            // A full first page of plain objects and no folder at all: a flat namespace. Paging on would cost up to 9 more
+            // sequential requests (9 s at 1 s latency) for nothing in the usual case, so stop; probing splits flat namespaces.
+            if (page == 0 && response.CommonPrefixes.Count == 0) break;
             token = response.NextContinuationToken;
         }
         return result;
@@ -159,6 +333,9 @@ public sealed class PartitionPlanner
     /// </summary>
     private sealed record ProbeBase(string Prefix, string? FirstKey, bool OnA, bool OnB);
 
+    /// <summary>First key after a probe. Unknown = the request failed, timed out or got no budget: "no key" is then not proven.</summary>
+    private readonly record struct ProbeResult(string? Key, bool Unknown);
+
     /// <summary>
     /// Probes within the budget, coarse to fine. The bases are the deepest "/" level discovery found (or the start of the
     /// keyspace). Each base first jumps to the longest prefix all of its keys share (cheap, not a probe round), so names
@@ -166,22 +343,25 @@ public sealed class PartitionPlanner
     /// evenly spaced characters after every base (MaxKeys=1, StartAfter = prefix + base + char, one bucket per probe,
     /// alternating), and the next round refines one character below the prefixes it found (again jumping over shared
     /// prefixes). Each round may spend half of the remaining budget (the last round all of it), shared evenly by its bases.
+    /// All probes of a round run concurrently (bounded by the planner's concurrency gate and the rate limiters).
     /// </summary>
     private async Task<bool> ProbeAsync(SortedSet<string> candidates, CancellationToken ct)
     {
-        int before = candidates.Count;
+        int before = LiveCandidateCount();
         var roots = _deepestLevel is { Count: > 0 } level ? level.ToList() : new List<string> { string.Empty };
         int maxRoots = Math.Max(1, Remaining / 4);
         if (roots.Count > maxRoots) roots = EvenlySpaced(roots, maxRoots);
 
         // Shared-prefix jump for the roots: at most half of the budget, split evenly.
+        SetStep("shared-prefix jump");
         int jumpBudget = Math.Max(2, Remaining / (2 * roots.Count));
         var bases = await JumpAllAsync(roots.Select(r => new ProbeBase(r, null, true, true)).ToList(), jumpBudget, candidates, ct).ConfigureAwait(false);
 
-        for (int round = 0; round < MaxProbeRounds && bases.Count > 0 && candidates.Count < _targetPartitions; round++)
+        for (int round = 0; round < MaxProbeRounds && bases.Count > 0 && LiveCandidateCount() < _targetPartitions && !TimeUp; round++)
         {
             int remaining = Remaining;
             if (remaining <= 0) break;
+            SetStep($"probe round {round + 1}");
             int roundsLeft = MaxProbeRounds - round;
             int spend = roundsLeft == 1 ? remaining : Math.Max(1, remaining / 2);
             if (bases.Count > spend) bases = EvenlySpaced(bases, spend);
@@ -215,12 +395,13 @@ public sealed class PartitionPlanner
             bases = next.Values.OrderBy(p => p.Prefix, Utf8OrdinalComparer.Instance).ToList();
 
             // Jump over shared prefixes below the new bases too, when the budget easily allows it (a check costs 1-2 requests).
-            if (bases.Count > 0 && Remaining >= bases.Count * 8)
+            if (bases.Count > 0 && !JumpOff && !TimeUp && Remaining >= bases.Count * 8)
             {
+                SetStep($"shared-prefix jump (after round {round + 1})");
                 bases = await JumpAllAsync(bases, Math.Max(2, Remaining / (4 * bases.Count)), candidates, ct).ConfigureAwait(false);
             }
         }
-        return candidates.Count > before;
+        return LiveCandidateCount() > before;
     }
 
     private int Remaining => Math.Max(0, _maxRequests - Volatile.Read(ref _requestsUsed));
@@ -242,12 +423,14 @@ public sealed class PartitionPlanner
     /// <paramref name="budget"/> requests. Looks up the first key under the base if not known (null result: no keys at all).
     /// A prefix p is shared when the first key after p + U+10FFFF (the highest code point, so past every key starting with
     /// p) no longer starts with the base. The shortest extension is tested first, so a base without a long shared prefix
-    /// costs one check; otherwise a binary search over the first key's length finds the longest one.
+    /// costs one check; otherwise a search over the first key's length finds the longest one. Both buckets are asked at the
+    /// same time, and the search tests up to <see cref="JumpFanout"/> lengths per step concurrently, so a slow endpoint costs
+    /// few round trips in sequence.
     /// </summary>
     private async Task<ProbeBase?> JumpAsync(ProbeBase b, int budget, SortedSet<string> candidates, CancellationToken ct)
     {
         int used = 0;
-        bool Take() => used++ < budget;
+        bool Take() => Interlocked.Increment(ref used) <= budget;
         void Add(string key) { lock (candidates) candidates.Add(key); }
 
         string? first = b.FirstKey;
@@ -255,11 +438,14 @@ public sealed class PartitionPlanner
         string common;
         if (first == null)
         {
-            string? fa = onA && Take() ? await ProbeOneAsync(_a, b.Prefix, ct).ConfigureAwait(false) : null;
-            string? fb = onB && Take() ? await ProbeOneAsync(_b, b.Prefix, ct).ConfigureAwait(false) : null;
+            var ta = onA && Take() ? ProbeOneAsync(_a, b.Prefix, -1, ct) : Task.FromResult(new ProbeResult(null, onA));
+            var tb = onB && Take() ? ProbeOneAsync(_b, b.Prefix, -1, ct) : Task.FromResult(new ProbeResult(null, onB));
+            await Task.WhenAll(ta, tb).ConfigureAwait(false);
+            string? fa = ta.Result.Key, fb = tb.Result.Key;
+            bool unknown = ta.Result.Unknown || tb.Result.Unknown;
             if (fa != null && !fa.StartsWith(b.Prefix, StringComparison.Ordinal)) { Add(fa); fa = null; }
             if (fb != null && !fb.StartsWith(b.Prefix, StringComparison.Ordinal)) { Add(fb); fb = null; }
-            if (fa == null && fb == null) return Remaining > 0 ? null : b; // no keys under it (or no budget to tell)
+            if (fa == null && fb == null) return unknown || Remaining <= 0 ? b : null; // no keys under it (or not proven / no budget)
             onA = fa != null;
             onB = fb != null;
             if (fa != null) Add(fa);
@@ -280,32 +466,59 @@ public sealed class PartitionPlanner
         }
 
         int best = b.Prefix.Length;
-        if (cuts.Count > 0)
+        if (cuts.Count > 0 && !JumpOff)
         {
+            // true = shared, false = not shared, null = unknown (failed, no budget, jump disabled).
             async Task<bool?> SharedAsync(int length)
             {
+                int state = Volatile.Read(ref _jumpState);
+                if (state >= 2) return null;
+                string marker = state == 0 ? MaxCodePoint : "~";
                 string p = common.Substring(0, length);
-                foreach (var side in new[] { (Side: _a, On: onA), (Side: _b, On: onB) })
+                var checks = new List<Task<ProbeResult>>(2);
+                bool incomplete = false;
+                foreach (var (side, on) in new[] { (_a, onA), (_b, onB) })
                 {
-                    if (!side.On) continue;
-                    if (!Take()) return null;
-                    var after = await ProbeOneAsync(side.Side, p + MaxCodePoint, ct).ConfigureAwait(false);
-                    if (after == null) continue;
-                    Add(after);
-                    if (after.StartsWith(b.Prefix, StringComparison.Ordinal)) return false;
+                    if (!on) continue;
+                    if (Take()) checks.Add(ProbeOneAsync(side, p + marker, state, ct));
+                    else incomplete = true;
                 }
-                return true;
+                var results = await Task.WhenAll(checks).ConfigureAwait(false);
+                bool notShared = false;
+                foreach (var r in results)
+                {
+                    if (r.Key != null)
+                    {
+                        Add(r.Key);
+                        if (r.Key.StartsWith(b.Prefix, StringComparison.Ordinal)) notShared = true;
+                    }
+                    if (r.Unknown) incomplete = true;
+                }
+                if (notShared) return false;
+                return incomplete ? null : true;
             }
 
             if (await SharedAsync(cuts[0]).ConfigureAwait(false) == true)
             {
                 int lo = 0, hi = cuts.Count - 1; // cuts[lo] is shared; find the last shared cut
-                while (lo < hi)
+                bool stop = false;
+                while (lo < hi && !stop)
                 {
-                    int mid = (lo + hi + 1) / 2;
-                    var shared = await SharedAsync(cuts[mid]).ConfigureAwait(false);
-                    if (shared == null) break;
-                    if (shared.Value) lo = mid; else hi = mid - 1;
+                    int span = hi - lo;
+                    int k = Math.Min(JumpFanout, span);
+                    var points = new List<int>(k);
+                    for (int i = 1; i <= k; i++)
+                    {
+                        int p = lo + (int)Math.Ceiling(span * i / (double)(k + 1));
+                        if (p > lo && p <= hi && (points.Count == 0 || p > points[^1])) points.Add(p);
+                    }
+                    var answers = await Task.WhenAll(points.Select(p => SharedAsync(cuts[p]))).ConfigureAwait(false);
+                    for (int i = 0; i < points.Count; i++)
+                    {
+                        if (answers[i] == null) { stop = true; break; }
+                        if (answers[i] == true) lo = points[i];
+                        else { hi = points[i] - 1; break; }
+                    }
                 }
                 best = cuts[lo];
             }
@@ -381,28 +594,22 @@ public sealed class PartitionPlanner
         var gate = new object();
         await Parallel.ForEachAsync(probes, new ParallelOptions { MaxDegreeOfParallelism = MaxConcurrentPlannerRequests, CancellationToken = ct }, async (p, token) =>
         {
-            var key = await ProbeOneAsync(p.Side, p.Probe, token).ConfigureAwait(false);
-            if (key != null) lock (gate) found.Add((p.Base, key));
+            var r = await ProbeOneAsync(p.Side, p.Probe, -1, token).ConfigureAwait(false);
+            if (r.Key != null) lock (gate) found.Add((p.Base, r.Key));
         }).ConfigureAwait(false);
         return found;
     }
 
-    /// <summary>The first relative key after prefix + probe, or null (none, or out of budget).</summary>
-    private async Task<string?> ProbeOneAsync(Side side, string probe, CancellationToken ct)
+    /// <summary>The first relative key after prefix + probe (Key null = none; Unknown when the request failed or had no budget).</summary>
+    private async Task<ProbeResult> ProbeOneAsync(Side side, string probe, int jumpState, CancellationToken ct)
     {
-        if (!TryTakeRequest()) return null;
-        await BeforeRequestAsync(side, ct).ConfigureAwait(false);
-        var page = await side.Lister.ListPageAsync(side.Bucket, side.Prefix, side.Prefix + probe, null, null, 1, ct).ConfigureAwait(false);
+        if (!TryTakeRequest()) return new ProbeResult(null, true);
+        var page = await RequestAsync(side, side.Prefix, side.Prefix + probe, null, null, 1, jumpState,
+            $"{(jumpState >= 0 ? "shared-prefix check" : "probe")} startAfter='{InstrumentedLister.Clip(side.Prefix + probe)}'", ct).ConfigureAwait(false);
+        if (page == null) return new ProbeResult(null, true);
         var key = page.Objects.FirstOrDefault()?.Key;
-        if (key == null || !key.StartsWith(side.Prefix, StringComparison.Ordinal)) return null;
-        return key.Substring(side.Prefix.Length);
-    }
-
-    /// <summary>Honours the scan's pause and the bucket's request rate before every planner request.</summary>
-    private async Task BeforeRequestAsync(Side side, CancellationToken ct)
-    {
-        if (_pauseGate != null) await _pauseGate(ct).ConfigureAwait(false);
-        if (side.Limiter != null) await side.Limiter.WaitAsync(ct).ConfigureAwait(false);
+        if (key == null || !key.StartsWith(side.Prefix, StringComparison.Ordinal)) return new ProbeResult(null, false);
+        return new ProbeResult(key.Substring(side.Prefix.Length), false);
     }
 
     /// <summary>

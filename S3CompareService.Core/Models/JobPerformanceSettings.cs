@@ -24,8 +24,12 @@ public class JobPerformanceSettings
     /// <summary>Most S3 requests the partition planner may send (per scan, both buckets together). 0 = no planning (one range).</summary>
     public int? MaxDiscoveryRequests { get; set; }
 
+    /// <summary>Time box of the partition planner in seconds (service default 60). 0 = no limit.</summary>
+    public int? MaxPlanningSeconds { get; set; }
+
     /// <summary>True when no override is set.</summary>
     public bool IsEmpty =>
         MaxParallelPartitions is null && PrefetchPages is null && MaxListRequestsPerSecond is null
-        && MaxObjectsPerSecond is null && MaxConcurrentContentChecks is null && MaxDiscoveryRequests is null;
+        && MaxObjectsPerSecond is null && MaxConcurrentContentChecks is null && MaxDiscoveryRequests is null
+        && MaxPlanningSeconds is null;
 }

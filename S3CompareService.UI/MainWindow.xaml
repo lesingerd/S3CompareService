@@ -34,6 +34,22 @@
         <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}" Color="#094771"/>
         <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}" Color="#FFFFFF"/>
 
+
+        <!-- Grey hint shown over an empty per-job override box ("default: 8"); its Tag is bound to the box text -->
+        <Style x:Key="HintText" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#7A7A7A" />
+            <Setter Property="IsHitTestVisible" Value="False" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Margin" Value="9,0,0,0" />
+            <Setter Property="FontStyle" Value="Italic" />
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource Self}}" Value="">
+                    <Setter Property="Visibility" Value="Visible" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
         <Style TargetType="TextBlock">
             <Setter Property="Foreground" Value="#CCCCCC" />
             <Setter Property="FontSize" Value="13" />
@@ -399,14 +415,18 @@
         <Border Grid.Row="1" Background="#1B3828" BorderBrush="#2E7D32" BorderThickness="0,0,0,2" Padding="14,8"
                 Visibility="{Binding HasActiveScan, Converter={StaticResource BoolToVisConverter}}">
             <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
-                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="▶ SCANNING ACTIVE:" FontWeight="Bold" Foreground="#81C784" Margin="0,0,8,0" />
+                <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="▶ ACTIVE SCAN:" FontWeight="Bold" Foreground="#81C784" Margin="0,0,8,0" />
                     <TextBlock Text="{Binding CurrentActiveScan.JobName}" FontWeight="Bold" Foreground="#FFFFFF" Margin="0,0,16,0" />
                     <TextBlock Text="Duration: " Foreground="#A5D6A7" />
                     <TextBlock Text="{Binding CurrentActiveScan.Duration}" FontWeight="SemiBold" Foreground="#FFFFFF" Margin="0,0,16,0" />
@@ -433,12 +453,53 @@
                     <TextBlock Text="{Binding CurrentActiveScan.FilteredDifferencesCount, StringFormat={}{0:N0}}" FontWeight="Bold" Foreground="#FF6B6B" Margin="0,0,16,0" />
                     <TextBlock Text="In-Flight Lag: " Foreground="#A5D6A7" />
                     <TextBlock Text="{Binding CurrentActiveScan.InFlightDifferencesCount, StringFormat={}{0:N0}}" FontWeight="Bold" Foreground="#FFD166" />
-                </StackPanel>
+                </WrapPanel>
 
                 <StackPanel Grid.Column="2" Orientation="Horizontal">
                     <Button Content="Pause" Command="{Binding PauseActiveScanCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,6,0" />
                     <Button Content="Resume" Command="{Binding ResumeActiveScanCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,6,0" />
                     <Button Content="Cancel Scan" Command="{Binding CancelActiveScanCommand}" Style="{StaticResource DangerButton}" />
+                </StackPanel>
+
+                <!-- Phase line: what the scan is doing right now (planner progress, partitions, cancelling...) -->
+                <StackPanel Grid.Row="1" Grid.ColumnSpan="3" Margin="0,6,0,0">
+                    <TextBlock Text="{Binding CurrentActiveScan.PhaseText}" FontWeight="Bold" FontSize="14" TextWrapping="Wrap">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Setter Property="Foreground" Value="#FFD166" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.IsCancelling}" Value="True">
+                                        <Setter Property="Foreground" Value="#FF6B6B" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.HasPhaseText}" Value="False">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <TextBlock Text="{Binding CurrentActiveScan.InFlightText}" Foreground="#A5D6A7" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.HasInFlight}" Value="False">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <TextBlock Text="{Binding CurrentActiveScan.LastError, StringFormat='Last error: {0}'}" Foreground="#FF6B6B" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.HasLastError}" Value="False">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
                 </StackPanel>
             </Grid>
         </Border>
@@ -670,12 +731,18 @@
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Text="Parallel Partitions:" VerticalAlignment="Center"
                                                        ToolTip="Key ranges compared at the same time (default 8). 1 = no partitioning: one listing per bucket, still with prefetch. More partitions = more S3 list requests in flight." />
-                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.Performance.MaxParallelPartitions, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
-                                                     ToolTip="1 to 256. Empty = service default (S3Compare:MaxParallelPartitions, 8)." />
+                                            <Grid Grid.Column="1">
+                                                         <TextBox x:Name="PerfMaxParallelPartitions" Text="{Binding SelectedJob.Performance.MaxParallelPartitions, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                                  ToolTip="1 to 256. Empty = service default (S3Compare:MaxParallelPartitions, 8)." />
+                                                         <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxParallelPartitionsHint}" Tag="{Binding Text, ElementName=PerfMaxParallelPartitions}" />
+                                                     </Grid>
                                             <TextBlock Grid.Column="3" Text="Prefetch Pages:" VerticalAlignment="Center"
                                                        ToolTip="List pages (1,000 keys each) each listing fetches ahead of the comparison, per partition and bucket (default 2). Memory is about pages x partitions x 2 x 1,000 keys." />
-                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.Performance.PrefetchPages, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
-                                                     ToolTip="1 to 64. Empty = service default (S3Compare:PrefetchPages, 2)." />
+                                            <Grid Grid.Column="4">
+                                                         <TextBox x:Name="PerfPrefetchPages" Text="{Binding SelectedJob.Performance.PrefetchPages, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                                  ToolTip="1 to 64. Empty = service default (S3Compare:PrefetchPages, 2)." />
+                                                         <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.PrefetchPagesHint}" Tag="{Binding Text, ElementName=PerfPrefetchPages}" />
+                                                     </Grid>
                                         </Grid>
 
                                         <Grid Margin="0,0,0,8">
@@ -689,12 +756,18 @@
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Text="Max List Requests / sec (per bucket):" VerticalAlignment="Center"
                                                        ToolTip="S3 requests per second per bucket side, shared by all partitions, the planner and Full Data reads (default 20). One list request returns up to 1,000 keys. 0 = unlimited." />
-                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.Performance.MaxListRequestsPerSecond, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
-                                                     ToolTip="0 to 100000 (0 = unlimited). Empty = service default (S3Compare:MaxListRequestsPerSecond, 20)." />
+                                            <Grid Grid.Column="1">
+                                                         <TextBox x:Name="PerfMaxListRequestsPerSecond" Text="{Binding SelectedJob.Performance.MaxListRequestsPerSecond, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                                  ToolTip="0 to 100000 (0 = unlimited). Empty = service default (S3Compare:MaxListRequestsPerSecond, 20)." />
+                                                         <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxListRequestsPerSecondHint}" Tag="{Binding Text, ElementName=PerfMaxListRequestsPerSecond}" />
+                                                     </Grid>
                                             <TextBlock Grid.Column="3" Text="Max Objects / sec (all partitions):" VerticalAlignment="Center"
                                                        ToolTip="Cap on compared keys per second across all partitions, for when a scan is too fast for the endpoint or the server. 0 = unlimited (default)." />
-                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.Performance.MaxObjectsPerSecond, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
-                                                     ToolTip="0 to 100000000 (0 = unlimited). Empty = service default (S3Compare:MaxObjectsPerSecond, 0)." />
+                                            <Grid Grid.Column="4">
+                                                         <TextBox x:Name="PerfMaxObjectsPerSecond" Text="{Binding SelectedJob.Performance.MaxObjectsPerSecond, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                                  ToolTip="0 to 100000000 (0 = unlimited). Empty = service default (S3Compare:MaxObjectsPerSecond, 0)." />
+                                                         <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxObjectsPerSecondHint}" Tag="{Binding Text, ElementName=PerfMaxObjectsPerSecond}" />
+                                                     </Grid>
                                         </Grid>
 
                                         <Grid>
@@ -708,12 +781,35 @@
                                             </Grid.ColumnDefinitions>
                                             <TextBlock Text="Max Content Checks (Full Data):" VerticalAlignment="Center"
                                                        ToolTip="Full Data mode only: object pairs downloaded and compared at the same time across all partitions (default 8)." />
-                                            <TextBox Grid.Column="1" Text="{Binding SelectedJob.Performance.MaxConcurrentContentChecks, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
-                                                     ToolTip="1 to 256. Empty = service default (S3Compare:MaxConcurrentContentChecks, 8)." />
+                                            <Grid Grid.Column="1">
+                                                         <TextBox x:Name="PerfMaxConcurrentContentChecks" Text="{Binding SelectedJob.Performance.MaxConcurrentContentChecks, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                                  ToolTip="1 to 256. Empty = service default (S3Compare:MaxConcurrentContentChecks, 8)." />
+                                                         <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxConcurrentContentChecksHint}" Tag="{Binding Text, ElementName=PerfMaxConcurrentContentChecks}" />
+                                                     </Grid>
                                             <TextBlock Grid.Column="3" Text="Max Planning Requests:" VerticalAlignment="Center"
                                                        ToolTip="Most S3 requests the partition planner may send at scan start to find key-range boundaries (default 500). 0 = no planning: the scan runs as one range." />
-                                            <TextBox Grid.Column="4" Text="{Binding SelectedJob.Performance.MaxDiscoveryRequests, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
-                                                     ToolTip="0 to 100000. Empty = service default (S3Compare:MaxDiscoveryRequests, 500)." />
+                                            <Grid Grid.Column="4">
+                                                         <TextBox x:Name="PerfMaxDiscoveryRequests" Text="{Binding SelectedJob.Performance.MaxDiscoveryRequests, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                                  ToolTip="0 to 100000. Empty = service default (S3Compare:MaxDiscoveryRequests, 500)." />
+                                                         <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxDiscoveryRequestsHint}" Tag="{Binding Text, ElementName=PerfMaxDiscoveryRequests}" />
+                                                     </Grid>
+                                        </Grid>
+
+                                        <Grid Margin="0,8,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="Max Planning Time (s):" VerticalAlignment="Center"
+                                                       ToolTip="Time box of the partition planner at scan start (default 60 s). When it is used up the planner stops and the ranges are built from the boundaries found so far; the scan stays complete. 0 = no limit." />
+                                            <Grid Grid.Column="1">
+                                                <TextBox x:Name="PerfMaxPlanningSeconds" Text="{Binding SelectedJob.Performance.MaxPlanningSeconds, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                         ToolTip="0 to 86400 (0 = no limit). Empty = service default (S3Compare:MaxPlanningSeconds, 60)." />
+                                                <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxPlanningSecondsHint}" Tag="{Binding Text, ElementName=PerfMaxPlanningSeconds}" />
+                                            </Grid>
+                                            <TextBlock Grid.Column="3" Text="Parallel Partitions = 1 skips planning entirely (one key range)." FontSize="11" Foreground="#888888" VerticalAlignment="Center" />
                                         </Grid>
                                     </StackPanel>
                                 </Border>
@@ -1257,6 +1353,34 @@
                             <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130" />
                             <DataGridTextColumn Header="Message" Binding="{Binding Message}" Width="500" />
                             <DataGridTextColumn Header="Details" Binding="{Binding Details}" Width="*" />
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </Grid>
+            </TabItem>
+
+            <!-- TAB 6: SCAN DIAGNOSTICS (live; one screenshot shows phase, planner, request rates, partitions, in-flight operations) -->
+            <TabItem Header="Scan Diagnostics">
+                <Grid Margin="0,10,0,0">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12">
+                        <TextBlock Text="{Binding DiagnosticsSummary}" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" TextWrapping="Wrap" />
+                    </Border>
+
+                    <TextBlock Grid.Row="1" Text="{Binding DiagnosticsPartitionsNote}" Foreground="#888888" FontSize="11" Margin="0,8,0,0" />
+
+                    <DataGrid Grid.Row="2" Margin="0,8,0,0" ItemsSource="{Binding DiagnosticsPartitions}" AutoGenerateColumns="False" IsReadOnly="True">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="55" />
+                            <DataGridTextColumn Header="Lower (exclusive)" Binding="{Binding Lower}" Width="*" />
+                            <DataGridTextColumn Header="Upper (inclusive)" Binding="{Binding Upper}" Width="*" />
+                            <DataGridTextColumn Header="State" Binding="{Binding State}" Width="80" />
+                            <DataGridTextColumn Header="Last completed key" Binding="{Binding LastCompletedKey}" Width="*" />
+                            <DataGridTextColumn Header="Compared" Binding="{Binding ObjectsCompared, StringFormat={}{0:N0}}" Width="100" />
                         </DataGrid.Columns>
                     </DataGrid>
                 </Grid>

@@ -61,7 +61,15 @@ public sealed class PartitionRange
     [System.Text.Json.Serialization.JsonIgnore]
     public bool HasProgress => Completed || LastCompletedKey != null;
 
-    public PartitionRange Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed };
+    /// <summary>True while a worker compares this range (live only; not stored in checkpoints).</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool Active { get; set; }
+
+    /// <summary>Keys compared in this range by the current process (live only; not stored in checkpoints).</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public long ObjectsCompared { get; set; }
+
+    public PartitionRange Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed, Active = Active, ObjectsCompared = ObjectsCompared };
 
     public override string ToString() => $"({Lower ?? "-inf"}, {Upper ?? "+inf"}]{(Completed ? " done" : LastCompletedKey != null ? " @" + LastCompletedKey : string.Empty)}";
 }
