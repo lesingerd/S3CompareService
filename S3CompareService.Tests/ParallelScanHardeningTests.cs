@@ -287,7 +287,9 @@ public class ParallelScanHardeningTests : TestDbBase
         var engine = new ServiceComparisonEngine(job, run, RunRepo, new CancelOnInsertDiffRepo(DiffRepo, cts), AuditRepo, options: Options(3), listerA: new FakeS3Lister(a), listerB: new FakeS3Lister(b));
 
         var ex = await Assert.ThrowsAsync<OperationCanceledException>(() => engine.RunAsync(cts.Token));
-        Assert.IsInstanceOfType<InvalidOperationException>(ex.InnerException);
+        // Usually the final flush hits the failing insert, which surfaces wrapped in the cancellation. On a slow machine the
+        // periodic flush can hit it first inside a worker, which surfaces as a plain cancellation. Either way: Cancelled.
+        if (ex.InnerException != null) Assert.IsInstanceOfType<InvalidOperationException>(ex.InnerException);
         var stored = (await RunRepo.GetByIdAsync(run.Id))!;
         Assert.AreEqual(RunStatus.Cancelled, stored.Status);
     }
