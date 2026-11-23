@@ -228,13 +228,13 @@ public class ScanVisibilityTests : TestDbBase
     [TestMethod]
     public async Task PhaseAndPlannerProgress_AreReported_WhilePlanning_AndLogged()
     {
-        var keys = Enumerable.Range(0, 4000).Select(i => $"file_{i:00000}.dat").ToList();
+        var keys = Enumerable.Range(0, 1500).Select(i => $"file_{i:00000}.dat").ToList();
         var job = NewJob();
         var run = await NewRunAsync(job);
         var options = Options(4);
         options.MaxPlanningSeconds = 0;
         var engine = new ServiceComparisonEngine(job, run, RunRepo, DiffRepo, AuditRepo, options: options,
-            listerA: new FakeS3Lister(keys.Select(Obj), TimeSpan.FromMilliseconds(40)), listerB: new FakeS3Lister(keys.Select(Obj), TimeSpan.FromMilliseconds(40)));
+            listerA: new FakeS3Lister(keys.Select(Obj), TimeSpan.FromMilliseconds(20)), listerB: new FakeS3Lister(keys.Select(Obj), TimeSpan.FromMilliseconds(20)));
 
         var task = Task.Run(() => engine.RunAsync());
         ScanDiagnosticsSnapshot? seen = null;
@@ -251,7 +251,7 @@ public class ScanVisibilityTests : TestDbBase
         StringAssert.Contains(seen.PhaseText, "requests");
         StringAssert.Contains(seen.PhaseText, "candidates");
         Assert.AreEqual(options.MaxDiscoveryRequests, seen.Planner.RequestBudget);
-        Assert.IsTrue(seen.BucketA.Requests > 0 && seen.BucketA.LastLatencyMs >= 30, $"latency {seen.BucketA.LastLatencyMs}");
+        Assert.IsTrue(seen.BucketA.Requests > 0 && seen.BucketA.LastLatencyMs >= 15, $"latency {seen.BucketA.LastLatencyMs}");
 
         var final = engine.GetDiagnostics();
         Assert.AreEqual("Finalizing", final.UnderlyingPhase);
@@ -355,7 +355,7 @@ public class ScanVisibilityTests : TestDbBase
         {
             Behaviour = (_, _, _, _, _) => { release.Wait(); return Task.CompletedTask; } // blocks the calling thread: nothing can cancel it
         };
-        var coordinator = NewCoordinator((j, r, cp) => new ServiceComparisonEngine(j, r, RunRepo, DiffRepo, AuditRepo, cp, options: Options(4), listerA: blocked, listerB: new FakeS3Lister(Array.Empty<S3ObjectSummary>())), TimeSpan.FromSeconds(1));
+        var coordinator = NewCoordinator((j, r, cp) => new ServiceComparisonEngine(j, r, RunRepo, DiffRepo, AuditRepo, cp, options: Options(4), listerA: blocked, listerB: new FakeS3Lister(Array.Empty<S3ObjectSummary>())), TimeSpan.FromMilliseconds(200));
 
         var started = await coordinator.TriggerScanAsync(job.Id);
         var ctx = coordinator.GetActiveScan(started.RunId)!;

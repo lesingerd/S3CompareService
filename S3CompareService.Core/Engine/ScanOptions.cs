@@ -85,6 +85,15 @@ public sealed class ScanOptions
     /// </summary>
     public int MaxPlanningSeconds { get; set; } = DefaultMaxPlanningSeconds;
 
+    /// <summary>Time limit of one partition-planner request (not a configuration setting; tests shorten it).</summary>
+    public TimeSpan PlannerRequestTimeout { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>Longest one database call of the engine may take before it is abandoned (not a configuration setting).</summary>
+    public TimeSpan DbCallTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>How often the scan monitor raises progress and checks for stuck calls (not a configuration setting).</summary>
+    public TimeSpan MonitorInterval { get; set; } = TimeSpan.FromSeconds(1);
+
     /// <summary>Keys per list request. S3 caps it at 1000; smaller values are only useful in tests.</summary>
     public int ListPageSize { get; set; } = 1000;
 

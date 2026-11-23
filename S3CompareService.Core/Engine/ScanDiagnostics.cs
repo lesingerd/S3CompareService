@@ -19,20 +19,24 @@ public enum ScanPhase
 }
 
 /// <summary>An operation that has started and not yet finished (an S3 request or a database call).</summary>
-public sealed class InFlightOp
+public class InFlightOp
 {
-    internal InFlightOp(long id, string kind, string description)
+    private string? _description;
+
+    internal InFlightOp(long id, string kind, string? description)
     {
         Id = id;
         Kind = kind;
-        Description = description;
+        _description = description;
         StartTimestamp = Stopwatch.GetTimestamp();
     }
 
     public long Id { get; }
     /// <summary>"S3" or "DB".</summary>
     public string Kind { get; }
-    public string Description { get; }
+    /// <summary>What the operation is. Built on first use, so a request that finishes quickly never formats it.</summary>
+    public string Description => _description ??= Describe();
+    protected virtual string Describe() => string.Empty;
     internal long StartTimestamp { get; }
     internal int Warned;
     private int _attempt = 1;
@@ -74,6 +78,13 @@ public sealed class InFlightTracker
     public Scope Begin(string kind, string description)
     {
         var op = new InFlightOp(Interlocked.Increment(ref _nextId), kind, description);
+        _ops[op.Id] = op;
+        return new Scope(this, op);
+    }
+
+    internal Scope Begin(Func<long, InFlightOp> factory)
+    {
+        var op = factory(Interlocked.Increment(ref _nextId));
         _ops[op.Id] = op;
         return new Scope(this, op);
     }
@@ -202,9 +213,10 @@ public sealed class InstrumentedLister : IS3Lister
 
     public async Task<S3ListPage> ListPageAsync(string bucket, string? prefix, string? startAfter, string? continuationToken, string? delimiter, int maxKeys, CancellationToken cancellationToken)
     {
-        string desc = $"ListObjectsV2 bucket {_metrics.Side} ({bucket}) prefix='{Clip(prefix)}' startAfter='{Clip(startAfter)}' delimiter='{delimiter}' maxKeys={maxKeys}{(string.IsNullOrEmpty(continuationToken) ? string.Empty : " (continued)")}";
-        using var scope = _tracker.Begin("S3", desc);
-        InFlightTracker.CurrentRequest.Value = scope.Op;
+        using var scope = _tracker.Begin(id => new ListOp(id, _metrics.Side, bucket, prefix, startAfter, delimiter, maxKeys, !string.IsNullOrEmpty(continuationToken)));
+        // Only the real client retries and needs to report attempts; skip the async-local write for everything else.
+        bool reportsAttempts = _inner is S3Lister;
+        if (reportsAttempts) InFlightTracker.CurrentRequest.Value = scope.Op;
         long start = Stopwatch.GetTimestamp();
         _metrics.RequestStarted();
         string? error = null;
@@ -226,12 +238,29 @@ public sealed class InstrumentedLister : IS3Lister
         }
         finally
         {
-            InFlightTracker.CurrentRequest.Value = null;
+            if (reportsAttempts) InFlightTracker.CurrentRequest.Value = null;
             _metrics.RequestFinished(Stopwatch.GetTimestamp() - start, error);
         }
     }
 
     internal static string Clip(string? s) => s == null ? string.Empty : s.Length <= 60 ? s : s.Substring(0, 57) + "...";
+}
+
+/// <summary>An S3 list request in flight; its text is built only when somebody looks at it.</summary>
+internal sealed class ListOp : InFlightOp
+{
+    private readonly string _side, _bucket;
+    private readonly string? _prefix, _startAfter, _delimiter;
+    private readonly int _maxKeys;
+    private readonly bool _continued;
+
+    public ListOp(long id, string side, string bucket, string? prefix, string? startAfter, string? delimiter, int maxKeys, bool continued) : base(id, "S3", null)
+    {
+        _side = side; _bucket = bucket; _prefix = prefix; _startAfter = startAfter; _delimiter = delimiter; _maxKeys = maxKeys; _continued = continued;
+    }
+
+    protected override string Describe() =>
+        $"ListObjectsV2 bucket {_side} ({_bucket}) prefix='{InstrumentedLister.Clip(_prefix)}' startAfter='{InstrumentedLister.Clip(_startAfter)}' delimiter='{_delimiter}' maxKeys={_maxKeys}{(_continued ? " (continued)" : string.Empty)}";
 }
 
 /// <summary>Records how long callers wait in the rate limiter.</summary>
@@ -442,5 +471,8 @@ internal static class AbandonableTask
 {
     /// <summary>Waits for the task but gives up on timeout or cancellation. A task that already finished keeps its own outcome (its real error, not a cancellation).</summary>
     public static Task<T> WaitUnlessDoneAsync<T>(this Task<T> task, TimeSpan timeout, CancellationToken ct) =>
+        task.IsCompleted ? task : task.WaitAsync(timeout, ct);
+
+    public static Task WaitUnlessDoneAsync(this Task task, TimeSpan timeout, CancellationToken ct) =>
         task.IsCompleted ? task : task.WaitAsync(timeout, ct);
 }

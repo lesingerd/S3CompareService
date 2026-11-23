@@ -92,7 +92,6 @@ public class ServiceComparisonEngine
     // ---- diagnostics (live view for the UI; see ScanDiagnostics.cs) ----
     private const double SlowDbCallSeconds = 5;
     private const double SlowS3CallSeconds = 20;
-    private static readonly TimeSpan DbCallTimeout = TimeSpan.FromSeconds(60);
     private readonly ScanDiagnostics _diag = new();
     private volatile bool _detached;
     private volatile PartitionPlanner? _planner;
@@ -205,7 +204,7 @@ public class ServiceComparisonEngine
         try
         {
             // WaitAsync: a call that blocks or ignores its token must not hold up a cancel; it is abandoned after the timeout.
-            return await work().WaitUnlessDoneAsync(DbCallTimeout, ct).ConfigureAwait(false);
+            return await work().WaitUnlessDoneAsync(_options.DbCallTimeout, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -217,7 +216,19 @@ public class ServiceComparisonEngine
 
     private async Task DbAsync(string operation, Func<Task> work, CancellationToken ct)
     {
-        await DbAsync<bool>(operation, async () => { await work().ConfigureAwait(false); return true; }, ct).ConfigureAwait(false);
+        if (_detached) throw new OperationCanceledException("The run was detached after a cancel timeout; it writes nothing more.");
+        using var scope = _diag.InFlight.Begin("DB", operation);
+        long start = Stopwatch.GetTimestamp();
+        try
+        {
+            await work().WaitUnlessDoneAsync(_options.DbCallTimeout, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
+            if (seconds >= SlowDbCallSeconds && Volatile.Read(ref scope.Op.Warned) == 0)
+                _ = LogAsync("WARN", $"Database call '{operation}' took {seconds:0.0} s.");
+        }
     }
 
     /// <summary>
@@ -228,7 +239,7 @@ public class ServiceComparisonEngine
     {
         try
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+            using var timer = new PeriodicTimer(_options.MonitorInterval > TimeSpan.Zero ? _options.MonitorInterval : TimeSpan.FromSeconds(1));
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
             {
                 UpdateLiveStats();
@@ -689,6 +700,7 @@ public class ServiceComparisonEngine
             _options.TargetPartitions, _options.MaxDiscoveryDepth, _options.MaxDiscoveryRequests,
             pauseGate: CheckPauseAsync,
             maxPlanningTime: limit,
+            requestTimeout: _options.PlannerRequestTimeout,
             log: (level, message) => _ = LogAsync(level, message));
         _planner = planner;
         SetPhase(ScanPhase.Planning);
