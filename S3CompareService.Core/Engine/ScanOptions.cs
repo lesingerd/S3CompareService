@@ -23,6 +23,7 @@ public sealed class ScanOptions
     public const int DefaultMaxDiscoveryRequests = 500;
     public const int DefaultPartitionOversubscription = 4;
     public const int DefaultMaxDiscoveryDepth = 3;
+    public const int DefaultMaxPlanningSeconds = 60;
 
     // Accepted ranges (API validation; configuration values outside them fall back to the default).
     public const int MaxParallelPartitionsLimit = 256;
@@ -33,6 +34,7 @@ public sealed class ScanOptions
     public const int MaxDiscoveryRequestsLimit = 100_000;
     public const int PartitionOversubscriptionLimit = 64;
     public const int MaxDiscoveryDepthLimit = 10;
+    public const int MaxPlanningSecondsLimit = 86_400;
 
     /// <summary>
     /// Memory bound: list pages one bucket side may hold at once, <c>MaxParallelPartitions x (PrefetchPages + 1)</c> (each
@@ -77,6 +79,12 @@ public sealed class ScanOptions
     /// <summary>How many "/" levels below the prefix the planner explores looking for boundaries.</summary>
     public int MaxDiscoveryDepth { get; set; } = DefaultMaxDiscoveryDepth;
 
+    /// <summary>
+    /// Time box of the partition planner in seconds. When it is used up the planner stops sending requests and builds the ranges
+    /// from the candidates found so far (the scan stays complete; only the balance of the ranges may be worse). 0 = no limit.
+    /// </summary>
+    public int MaxPlanningSeconds { get; set; } = DefaultMaxPlanningSeconds;
+
     /// <summary>Keys per list request. S3 caps it at 1000; smaller values are only useful in tests.</summary>
     public int ListPageSize { get; set; } = 1000;
 
@@ -102,6 +110,7 @@ public sealed class ScanOptions
         if (p.MaxObjectsPerSecond is double ob) o.MaxObjectsPerSecond = ob;
         if (p.MaxConcurrentContentChecks is int cc) o.MaxConcurrentContentChecks = cc;
         if (p.MaxDiscoveryRequests is int dr) o.MaxDiscoveryRequests = dr;
+        if (p.MaxPlanningSeconds is int ps) o.MaxPlanningSeconds = ps;
         o.ApplyMemoryCap();
         return o;
     }
@@ -130,6 +139,7 @@ public sealed class ScanOptions
             ?? CheckDouble(p.MaxObjectsPerSecond, nameof(p.MaxObjectsPerSecond), MaxObjectsPerSecondLimit)
             ?? CheckInt(p.MaxConcurrentContentChecks, nameof(p.MaxConcurrentContentChecks), 1, MaxConcurrentContentChecksLimit)
             ?? CheckInt(p.MaxDiscoveryRequests, nameof(p.MaxDiscoveryRequests), 0, MaxDiscoveryRequestsLimit)
+            ?? CheckInt(p.MaxPlanningSeconds, nameof(p.MaxPlanningSeconds), 0, MaxPlanningSecondsLimit)
             ?? (p.MaxParallelPartitions is int mp && p.PrefetchPages is int pf && (long)mp * (pf + 1) > MaxBufferedPagesPerBucket
                 ? $"MaxParallelPartitions x (PrefetchPages + 1) must not exceed {MaxBufferedPagesPerBucket} (list pages held in memory per bucket)."
                 : null);

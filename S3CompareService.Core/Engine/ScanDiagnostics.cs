@@ -1,0 +1,446 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+
+namespace S3CompareService.Core.Engine;
+
+/// <summary>Where a scan is: shown in the UI banner and in /api/status.</summary>
+public enum ScanPhase
+{
+    /// <summary>Opening the database state, creating S3 clients.</summary>
+    Preparing,
+    /// <summary>The partition planner is looking for key-range boundaries.</summary>
+    Planning,
+    /// <summary>Workers are comparing key ranges.</summary>
+    Scanning,
+    /// <summary>All ranges are done; flushing differences, writing metadata and the final run state.</summary>
+    Finalizing
+}
+
+/// <summary>An operation that has started and not yet finished (an S3 request or a database call).</summary>
+public sealed class InFlightOp
+{
+    internal InFlightOp(long id, string kind, string description)
+    {
+        Id = id;
+        Kind = kind;
+        Description = description;
+        StartTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    public long Id { get; }
+    /// <summary>"S3" or "DB".</summary>
+    public string Kind { get; }
+    public string Description { get; }
+    internal long StartTimestamp { get; }
+    internal int Warned;
+    private int _attempt = 1;
+
+    /// <summary>1 for the first try, higher while the request is being retried.</summary>
+    public int Attempt { get => Volatile.Read(ref _attempt); set => Volatile.Write(ref _attempt, value); }
+
+    public double AgeSeconds => Stopwatch.GetElapsedTime(StartTimestamp).TotalSeconds;
+}
+
+/// <summary>A copy of an in-flight operation for the API.</summary>
+public sealed class InFlightInfo
+{
+    public string Kind { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public double AgeSeconds { get; set; }
+    public int Attempt { get; set; } = 1;
+
+    public override string ToString() => $"{Kind}: {Description} (in flight {ScanDiagnosticsFormatter.Seconds(AgeSeconds)}{(Attempt > 1 ? $", attempt {Attempt}" : string.Empty)})";
+}
+
+/// <summary>Registry of the operations in flight right now. Thread-safe.</summary>
+public sealed class InFlightTracker
+{
+    private readonly ConcurrentDictionary<long, InFlightOp> _ops = new();
+    private long _nextId;
+
+    /// <summary>The S3 request running on the current async flow (set by <see cref="InstrumentedLister"/>), so retry loops can report attempts.</summary>
+    public static readonly AsyncLocal<InFlightOp?> CurrentRequest = new();
+
+    public sealed class Scope : IDisposable
+    {
+        private readonly InFlightTracker _owner;
+        public InFlightOp Op { get; }
+        internal Scope(InFlightTracker owner, InFlightOp op) { _owner = owner; Op = op; }
+        public void Dispose() => _owner._ops.TryRemove(Op.Id, out _);
+    }
+
+    public Scope Begin(string kind, string description)
+    {
+        var op = new InFlightOp(Interlocked.Increment(ref _nextId), kind, description);
+        _ops[op.Id] = op;
+        return new Scope(this, op);
+    }
+
+    public List<InFlightOp> Current() => _ops.Values.OrderByDescending(o => o.AgeSeconds).ToList();
+
+    public List<InFlightInfo> Snapshot(int max = 8) =>
+        Current().Take(max).Select(o => new InFlightInfo { Kind = o.Kind, Description = o.Description, AgeSeconds = o.AgeSeconds, Attempt = o.Attempt }).ToList();
+
+    public InFlightInfo? Oldest(string kind)
+    {
+        var o = Current().FirstOrDefault(x => x.Kind == kind);
+        return o == null ? null : new InFlightInfo { Kind = o.Kind, Description = o.Description, AgeSeconds = o.AgeSeconds, Attempt = o.Attempt };
+    }
+
+    /// <summary>Operations older than <paramref name="seconds"/> that were not reported before (each is returned once).</summary>
+    public List<InFlightOp> TakeNewlyOverdue(string kind, double seconds) =>
+        _ops.Values.Where(o => o.Kind == kind && o.AgeSeconds >= seconds && !o.Description.StartsWith("Audit", StringComparison.Ordinal) && Interlocked.Exchange(ref o.Warned, 1) == 0).ToList();
+}
+
+/// <summary>Request statistics of one bucket side, fed by <see cref="InstrumentedLister"/> and <see cref="InstrumentedLimiter"/>.</summary>
+public sealed class BucketMetrics
+{
+    private const double RateWindowSeconds = 10;
+    private readonly object _gate = new();
+    private readonly Queue<long> _recent = new();
+    private readonly long _created = Stopwatch.GetTimestamp();
+    private long _requests, _errors, _completed, _latencyTicks, _lastLatencyTicks, _maxLatencyTicks, _throttleTicks;
+    private int _inFlight;
+    private string? _lastError;
+    private readonly Action<string>? _onError;
+
+    public BucketMetrics(string side, string bucket, double rateLimitPerSecond, Action<string>? onError = null)
+    {
+        Side = side;
+        Bucket = bucket;
+        RateLimit = rateLimitPerSecond;
+        _onError = onError;
+    }
+
+    public string Side { get; }
+    public string Bucket { get; }
+    public double RateLimit { get; }
+
+    internal void RequestStarted()
+    {
+        Interlocked.Increment(ref _requests);
+        Interlocked.Increment(ref _inFlight);
+        lock (_gate)
+        {
+            _recent.Enqueue(Stopwatch.GetTimestamp());
+            Trim();
+        }
+    }
+
+    internal void RequestFinished(long ticks, string? error)
+    {
+        Interlocked.Decrement(ref _inFlight);
+        if (error == null)
+        {
+            Interlocked.Increment(ref _completed);
+            Interlocked.Add(ref _latencyTicks, ticks);
+            Interlocked.Exchange(ref _lastLatencyTicks, ticks);
+            long seen;
+            while (ticks > (seen = Interlocked.Read(ref _maxLatencyTicks)) && Interlocked.CompareExchange(ref _maxLatencyTicks, ticks, seen) != seen) { }
+        }
+        else
+        {
+            Interlocked.Increment(ref _errors);
+            _lastError = error;
+            _onError?.Invoke($"Bucket {Side}: {error}");
+        }
+    }
+
+    internal void AddThrottle(long ticks) => Interlocked.Add(ref _throttleTicks, ticks);
+
+    private void Trim()
+    {
+        long limit = Stopwatch.GetTimestamp() - (long)(RateWindowSeconds * Stopwatch.Frequency);
+        while (_recent.Count > 0 && _recent.Peek() < limit) _recent.Dequeue();
+    }
+
+    private static double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+
+    public BucketRequestStats Snapshot()
+    {
+        double rate;
+        lock (_gate)
+        {
+            Trim();
+            double window = Math.Min(RateWindowSeconds, Math.Max(1, Stopwatch.GetElapsedTime(_created).TotalSeconds));
+            rate = _recent.Count / window;
+        }
+        long completed = Interlocked.Read(ref _completed);
+        return new BucketRequestStats
+        {
+            Side = Side,
+            Bucket = Bucket,
+            Requests = Interlocked.Read(ref _requests),
+            Errors = Interlocked.Read(ref _errors),
+            InFlight = Volatile.Read(ref _inFlight),
+            RequestsPerSecond = Math.Round(rate, 1),
+            RateLimitPerSecond = RateLimit,
+            AvgLatencyMs = completed > 0 ? Math.Round(Ms(Interlocked.Read(ref _latencyTicks)) / completed, 0) : 0,
+            LastLatencyMs = Math.Round(Ms(Interlocked.Read(ref _lastLatencyTicks)), 0),
+            MaxLatencyMs = Math.Round(Ms(Interlocked.Read(ref _maxLatencyTicks)), 0),
+            ThrottleWaitSeconds = Math.Round(Interlocked.Read(ref _throttleTicks) / (double)Stopwatch.Frequency, 1),
+            LastError = _lastError
+        };
+    }
+}
+
+/// <summary>Counts, times and tracks every request through an <see cref="IS3Lister"/>. Lets a request that ignores its cancellation token be abandoned.</summary>
+public sealed class InstrumentedLister : IS3Lister
+{
+    private readonly IS3Lister _inner;
+    private readonly BucketMetrics _metrics;
+    private readonly InFlightTracker _tracker;
+
+    public InstrumentedLister(IS3Lister inner, BucketMetrics metrics, InFlightTracker tracker)
+    {
+        _inner = inner;
+        _metrics = metrics;
+        _tracker = tracker;
+    }
+
+    public async Task<S3ListPage> ListPageAsync(string bucket, string? prefix, string? startAfter, string? continuationToken, string? delimiter, int maxKeys, CancellationToken cancellationToken)
+    {
+        string desc = $"ListObjectsV2 bucket {_metrics.Side} ({bucket}) prefix='{Clip(prefix)}' startAfter='{Clip(startAfter)}' delimiter='{delimiter}' maxKeys={maxKeys}{(string.IsNullOrEmpty(continuationToken) ? string.Empty : " (continued)")}";
+        using var scope = _tracker.Begin("S3", desc);
+        InFlightTracker.CurrentRequest.Value = scope.Op;
+        long start = Stopwatch.GetTimestamp();
+        _metrics.RequestStarted();
+        string? error = null;
+        try
+        {
+            // WaitAsync: a request that does not observe the token (a hung socket, a fake) must not hold up a cancel.
+            return await _inner.ListPageAsync(bucket, prefix, startAfter, continuationToken, delimiter, maxKeys, cancellationToken)
+                .WaitUnlessDoneAsync(Timeout.InfiniteTimeSpan, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            error = null;
+            throw;
+        }
+        catch (Exception ex)
+        {
+            error = $"{ex.GetType().Name}: {ex.Message}";
+            throw;
+        }
+        finally
+        {
+            InFlightTracker.CurrentRequest.Value = null;
+            _metrics.RequestFinished(Stopwatch.GetTimestamp() - start, error);
+        }
+    }
+
+    internal static string Clip(string? s) => s == null ? string.Empty : s.Length <= 60 ? s : s.Substring(0, 57) + "...";
+}
+
+/// <summary>Records how long callers wait in the rate limiter.</summary>
+public sealed class InstrumentedLimiter : IRequestRateLimiter
+{
+    private readonly IRequestRateLimiter _inner;
+    private readonly BucketMetrics _metrics;
+
+    public InstrumentedLimiter(IRequestRateLimiter inner, BucketMetrics metrics)
+    {
+        _inner = inner;
+        _metrics = metrics;
+    }
+
+    public async Task WaitAsync(CancellationToken cancellationToken)
+    {
+        long start = Stopwatch.GetTimestamp();
+        try { await _inner.WaitAsync(cancellationToken).ConfigureAwait(false); }
+        finally { _metrics.AddThrottle(Stopwatch.GetTimestamp() - start); }
+    }
+}
+
+// ---------------- snapshots (JSON payloads) ----------------
+
+/// <summary>Live numbers of the partition planner.</summary>
+public sealed class PlannerStats
+{
+    public bool Started { get; set; }
+    public bool Finished { get; set; }
+    public int RequestsUsed { get; set; }
+    public int RequestBudget { get; set; }
+    public int Candidates { get; set; }
+    public int TargetPartitions { get; set; }
+    public string Step { get; set; } = string.Empty;
+    public double ElapsedSeconds { get; set; }
+    /// <summary>0 = no limit.</summary>
+    public double TimeLimitSeconds { get; set; }
+    public bool TimedOut { get; set; }
+    public bool JumpDisabled { get; set; }
+    /// <summary>"U+10FFFF", "~ fallback" or "disabled".</summary>
+    public string JumpMode { get; set; } = "U+10FFFF";
+    public int RequestErrors { get; set; }
+    public string? LastError { get; set; }
+    public string Method { get; set; } = "none";
+    public int Ranges { get; set; }
+}
+
+public sealed class BucketRequestStats
+{
+    public string Side { get; set; } = string.Empty;
+    public string Bucket { get; set; } = string.Empty;
+    public long Requests { get; set; }
+    public long Errors { get; set; }
+    public int InFlight { get; set; }
+    public double RequestsPerSecond { get; set; }
+    public double RateLimitPerSecond { get; set; }
+    public double AvgLatencyMs { get; set; }
+    public double LastLatencyMs { get; set; }
+    public double MaxLatencyMs { get; set; }
+    public double ThrottleWaitSeconds { get; set; }
+    public string? LastError { get; set; }
+}
+
+public sealed class PartitionRow
+{
+    public int Index { get; set; }
+    public string Lower { get; set; } = string.Empty;
+    public string Upper { get; set; } = string.Empty;
+    /// <summary>queued, active or done.</summary>
+    public string State { get; set; } = "queued";
+    public string LastCompletedKey { get; set; } = string.Empty;
+    public long ObjectsCompared { get; set; }
+}
+
+/// <summary>Everything the diagnostics panel and the banner show about one active scan.</summary>
+public sealed class ScanDiagnosticsSnapshot
+{
+    public string RunId { get; set; } = string.Empty;
+    public string JobName { get; set; } = string.Empty;
+    /// <summary>Preparing, Planning, Scanning, Finalizing, or Paused / Cancelling while those apply.</summary>
+    public string Phase { get; set; } = "Preparing";
+    /// <summary>The phase itself, even while paused or cancelling.</summary>
+    public string UnderlyingPhase { get; set; } = "Preparing";
+    public bool IsPaused { get; set; }
+    /// <summary>Seconds since a cancel was requested, or null.</summary>
+    public double? CancelRequestedSeconds { get; set; }
+    /// <summary>What the engine is doing right now ("Creating S3 clients", "Workers running (8)", ...).</summary>
+    public string Operation { get; set; } = string.Empty;
+    public double ElapsedSeconds { get; set; }
+    public long ObjectsCompared { get; set; }
+    public PlannerStats Planner { get; set; } = new();
+    public BucketRequestStats BucketA { get; set; } = new();
+    public BucketRequestStats BucketB { get; set; } = new();
+    public int PartitionsTotal { get; set; }
+    public int PartitionsCompleted { get; set; }
+    public int PartitionsActive { get; set; }
+    public int PartitionsQueued { get; set; }
+    public int PartitionsOmitted { get; set; }
+    public List<PartitionRow> Partitions { get; set; } = new();
+    public string? LastError { get; set; }
+    public List<InFlightInfo> InFlight { get; set; } = new();
+    public InFlightInfo? OldestS3 { get; set; }
+    public InFlightInfo? OldestDb { get; set; }
+    /// <summary>The banner text, for example "PLANNING: 132/500 requests · 41 candidates · probe round 2 · 0:48".</summary>
+    public string PhaseText { get; set; } = string.Empty;
+}
+
+public static class ScanDiagnosticsFormatter
+{
+    /// <summary>The most partition rows a snapshot carries.</summary>
+    public const int MaxPartitionRows = 256;
+
+    public static string Clock(double seconds)
+    {
+        var t = TimeSpan.FromSeconds(Math.Max(0, seconds));
+        return t.TotalHours >= 1 ? $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}" : $"{t.Minutes}:{t.Seconds:00}";
+    }
+
+    public static string Seconds(double seconds) => seconds < 10 ? $"{seconds:0.0} s" : $"{seconds:0} s";
+
+    public static string PhaseText(ScanDiagnosticsSnapshot s)
+    {
+        var p = s.Planner;
+        string core = s.UnderlyingPhase switch
+        {
+            "Planning" => $"PLANNING: {p.RequestsUsed}/{p.RequestBudget} requests · {p.Candidates} candidates · {(string.IsNullOrEmpty(p.Step) ? "starting" : p.Step)} · {Clock(p.ElapsedSeconds)}"
+                + (p.TimeLimitSeconds > 0 ? $" of {Clock(p.TimeLimitSeconds)}" : string.Empty)
+                + (p.RequestErrors > 0 ? $" · {p.RequestErrors} request error(s)" : string.Empty),
+            "Scanning" => $"SCANNING: {s.PartitionsCompleted}/{s.PartitionsTotal} partitions done · {s.PartitionsActive} active · {s.PartitionsQueued} queued",
+            "Finalizing" => "FINALIZING: writing the final results",
+            _ => "PREPARING: " + (string.IsNullOrEmpty(s.Operation) ? "starting" : s.Operation)
+        };
+        if (s.CancelRequestedSeconds is double c)
+        {
+            string stuck = s.OldestS3 != null || s.OldestDb != null
+                ? " · waiting for " + string.Join(", ", new[] { s.OldestS3, s.OldestDb }.Where(x => x != null).Select(x => $"{x!.Kind} {Seconds(x.AgeSeconds)}"))
+                : string.Empty;
+            return $"CANCELLING… ({c:0} s){stuck} (was {core})";
+        }
+        return s.IsPaused ? $"PAUSED ({core})" : core;
+    }
+
+    /// <summary>Multi-line plain text for the diagnostics panel (monospace friendly, one screenshot).</summary>
+    public static string Summary(ScanDiagnosticsSnapshot s)
+    {
+        var sb = new StringBuilder();
+        string runShort = s.RunId.Length > 8 ? s.RunId.Substring(0, 8) : s.RunId;
+        sb.AppendLine($"RUN {runShort}  JOB {s.JobName}  ELAPSED {Clock(s.ElapsedSeconds)}");
+        sb.AppendLine($"PHASE    {s.PhaseText}");
+        sb.AppendLine($"DOING    {(string.IsNullOrEmpty(s.Operation) ? "-" : s.Operation)}");
+        var p = s.Planner;
+        if (p.Started)
+        {
+            sb.AppendLine($"PLANNER  requests {p.RequestsUsed}/{p.RequestBudget} · candidates {p.Candidates} (target {p.TargetPartitions - 1}+) · step: {(string.IsNullOrEmpty(p.Step) ? "-" : p.Step)} · {(p.Finished ? "finished" : "running")} · elapsed {Clock(p.ElapsedSeconds)}"
+                + (p.TimeLimitSeconds > 0 ? $" / limit {Clock(p.TimeLimitSeconds)}" : " / no limit")
+                + $" · method {p.Method} · ranges {p.Ranges}");
+            sb.AppendLine($"         request errors {p.RequestErrors} · time limit hit: {(p.TimedOut ? "YES" : "no")} · shared-prefix jump: {p.JumpMode}");
+            if (!string.IsNullOrEmpty(p.LastError)) sb.AppendLine($"         last planner error: {p.LastError}");
+        }
+        else
+        {
+            sb.AppendLine("PLANNER  not run (single partition, planning off, or resumed with a stored plan)");
+        }
+        foreach (var b in new[] { s.BucketA, s.BucketB })
+        {
+            sb.AppendLine($"BUCKET {b.Side}  {b.Bucket}: requests {b.Requests:N0} · {b.RequestsPerSecond:0.0}/s (limit {(b.RateLimitPerSecond > 0 ? b.RateLimitPerSecond.ToString("0.#", CultureInfo.InvariantCulture) + "/s" : "none")}) · in flight {b.InFlight} · latency avg {b.AvgLatencyMs:N0} ms, last {b.LastLatencyMs:N0} ms, max {b.MaxLatencyMs:N0} ms · throttle wait {b.ThrottleWaitSeconds:0.0} s · errors {b.Errors}");
+        }
+        sb.AppendLine($"PARTITIONS {s.PartitionsCompleted}/{s.PartitionsTotal} done · {s.PartitionsActive} active · {s.PartitionsQueued} queued · {s.ObjectsCompared:N0} objects compared");
+        sb.AppendLine($"OLDEST IN FLIGHT  S3: {(s.OldestS3 == null ? "none" : s.OldestS3.ToString())}");
+        sb.AppendLine($"                  DB: {(s.OldestDb == null ? "none" : s.OldestDb.ToString())}");
+        sb.Append($"LAST ERROR  {(string.IsNullOrEmpty(s.LastError) ? "none" : s.LastError)}");
+        return sb.ToString();
+    }
+}
+
+/// <summary>Per-scan collector: phase, current operation, last error, in-flight tracking and bucket metrics.</summary>
+public sealed class ScanDiagnostics
+{
+    private string? _lastError;
+    private volatile string _operation = string.Empty;
+    private int _phase;
+
+    public InFlightTracker InFlight { get; } = new();
+    public BucketMetrics BucketA { get; private set; }
+    public BucketMetrics BucketB { get; private set; }
+
+    public ScanDiagnostics()
+    {
+        BucketA = new BucketMetrics("A", string.Empty, 0, RecordError);
+        BucketB = new BucketMetrics("B", string.Empty, 0, RecordError);
+    }
+
+    public void ConfigureBuckets(string bucketA, string bucketB, double rateLimit)
+    {
+        BucketA = new BucketMetrics("A", bucketA, rateLimit, RecordError);
+        BucketB = new BucketMetrics("B", bucketB, rateLimit, RecordError);
+    }
+
+    public ScanPhase Phase { get => (ScanPhase)Volatile.Read(ref _phase); set => Volatile.Write(ref _phase, (int)value); }
+    public string Operation { get => _operation; set => _operation = value; }
+    public string? LastError => Volatile.Read(ref _lastError);
+
+    public void RecordError(string message) => Volatile.Write(ref _lastError, $"{DateTime.UtcNow:HH:mm:ss}Z {message}");
+}
+
+/// <summary>Task helpers for abandoning calls that ignore cancellation.</summary>
+internal static class AbandonableTask
+{
+    /// <summary>Waits for the task but gives up on timeout or cancellation. A task that already finished keeps its own outcome (its real error, not a cancellation).</summary>
+    public static Task<T> WaitUnlessDoneAsync<T>(this Task<T> task, TimeSpan timeout, CancellationToken ct) =>
+        task.IsCompleted ? task : task.WaitAsync(timeout, ct);
+}
