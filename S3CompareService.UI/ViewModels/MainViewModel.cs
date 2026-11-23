@@ -198,10 +198,24 @@ public class MainViewModel : ViewModelBase
         {
             // Ignore the transient null the grid reports while items are replaced.
             if (value == null && _isUpdatingDifferences) return;
-            SetField(ref _selectedDifference, value);
+            if (SetField(ref _selectedDifference, value))
+            {
+                OnPropertyChanged(nameof(SelectedFullKeyA));
+                OnPropertyChanged(nameof(SelectedFullKeyB));
+                OnPropertyChanged(nameof(SelectedBucketNameA));
+                OnPropertyChanged(nameof(SelectedBucketNameB));
+            }
         }
     }
     private bool _isUpdatingDifferences;
+
+    // Differences store keys relative to each bucket's prefix; the detail card shows the full object key per bucket
+    // (the job's current prefix + key) so it can be copied straight into an S3 browser.
+    private ComparisonJob? SelectedRunJob => SelectedRun == null ? null : Jobs.FirstOrDefault(j => j.Id == SelectedRun.JobId);
+    public string SelectedBucketNameA => SelectedRunJob?.BucketA.BucketName ?? string.Empty;
+    public string SelectedBucketNameB => SelectedRunJob?.BucketB.BucketName ?? string.Empty;
+    public string SelectedFullKeyA => SelectedDifference == null ? string.Empty : (SelectedRunJob?.BucketA.Prefix ?? string.Empty) + SelectedDifference.Key;
+    public string SelectedFullKeyB => SelectedDifference == null ? string.Empty : (SelectedRunJob?.BucketB.Prefix ?? string.Empty) + SelectedDifference.Key;
 
     private DifferenceType? _filterType = null;
     public DifferenceType? FilterType

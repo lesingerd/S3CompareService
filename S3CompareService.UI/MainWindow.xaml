@@ -64,6 +64,19 @@
             <Setter Property="VerticalContentAlignment" Value="Center" />
         </Style>
 
+        <!-- Read-only text that looks like a label but can be selected and copied (Ctrl+C) -->
+        <Style x:Key="SelectableText" TargetType="TextBox">
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Foreground" Value="#CCCCCC" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="Cursor" Value="IBeam" />
+            <Setter Property="ToolTip" Value="Select text and press Ctrl+C to copy (double-click selects a word, triple-click all)" />
+        </Style>
+
         <Style TargetType="PasswordBox">
             <Setter Property="Background" Value="#2D2D30" />
             <Setter Property="Foreground" Value="#FFFFFF" />
@@ -1284,9 +1297,22 @@
                             <Border Grid.Column="0" Background="#2A2A2B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="3" Padding="10">
                                 <StackPanel>
                                     <TextBlock Text="BUCKET A OBJECT DETAIL" FontWeight="Bold" Foreground="#4EC9B0" Margin="0,0,0,6" />
-                                    <TextBlock Text="{Binding SelectedDifference.Key, StringFormat='Key: {0}'}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="0,0,0,4" />
+                                    <Grid Margin="0,0,0,4">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock Grid.Row="0" Text="Bucket: " />
+                                        <TextBox Grid.Row="0" Grid.Column="1" Style="{StaticResource SelectableText}" Text="{Binding SelectedBucketNameA, Mode=OneWay}" />
+                                        <TextBlock Grid.Row="1" Text="Key: " FontWeight="SemiBold" />
+                                        <TextBox Grid.Row="1" Grid.Column="1" Style="{StaticResource SelectableText}" FontWeight="SemiBold" Foreground="#FFFFFF" Text="{Binding SelectedFullKeyA, Mode=OneWay}" />
+                                    </Grid>
                                     <TextBlock Text="{Binding SelectedDifference.BucketASizeDisplay, StringFormat='Size: {0}'}" Margin="0,0,0,2" />
-                                    <TextBlock Text="{Binding SelectedDifference.BucketAETag, StringFormat='ETag: {0}'}" Margin="0,0,0,2" Foreground="#9CDCFE" />
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,2"><TextBlock Text="ETag: " Foreground="#9CDCFE" /><TextBox Style="{StaticResource SelectableText}" Foreground="#9CDCFE" Text="{Binding SelectedDifference.BucketAETag, Mode=OneWay}" /></StackPanel>
                                     <TextBlock Text="{Binding SelectedDifference.BucketAStorageClass, StringFormat='Storage Class: {0}'}" Margin="0,0,0,2" />
                                     <TextBlock Text="{Binding SelectedDifference.BucketALastModified, StringFormat='Last Modified: {0:yyyy-MM-dd HH:mm:ss UTC}'}" Foreground="#DCDCAA" />
                                 </StackPanel>
@@ -1296,9 +1322,22 @@
                             <Border Grid.Column="2" Background="#2A2A2B" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="3" Padding="10">
                                 <StackPanel>
                                     <TextBlock Text="BUCKET B OBJECT DETAIL" FontWeight="Bold" Foreground="#9CDCFE" Margin="0,0,0,6" />
-                                    <TextBlock Text="{Binding SelectedDifference.Key, StringFormat='Key: {0}'}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="0,0,0,4" />
+                                    <Grid Margin="0,0,0,4">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto" />
+                                            <RowDefinition Height="Auto" />
+                                        </Grid.RowDefinitions>
+                                        <TextBlock Grid.Row="0" Text="Bucket: " />
+                                        <TextBox Grid.Row="0" Grid.Column="1" Style="{StaticResource SelectableText}" Text="{Binding SelectedBucketNameB, Mode=OneWay}" />
+                                        <TextBlock Grid.Row="1" Text="Key: " FontWeight="SemiBold" />
+                                        <TextBox Grid.Row="1" Grid.Column="1" Style="{StaticResource SelectableText}" FontWeight="SemiBold" Foreground="#FFFFFF" Text="{Binding SelectedFullKeyB, Mode=OneWay}" />
+                                    </Grid>
                                     <TextBlock Text="{Binding SelectedDifference.BucketBSizeDisplay, StringFormat='Size: {0}'}" Margin="0,0,0,2" />
-                                    <TextBlock Text="{Binding SelectedDifference.BucketBETag, StringFormat='ETag: {0}'}" Margin="0,0,0,2" Foreground="#9CDCFE" />
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,2"><TextBlock Text="ETag: " Foreground="#9CDCFE" /><TextBox Style="{StaticResource SelectableText}" Foreground="#9CDCFE" Text="{Binding SelectedDifference.BucketBETag, Mode=OneWay}" /></StackPanel>
                                     <TextBlock Text="{Binding SelectedDifference.BucketBStorageClass, StringFormat='Storage Class: {0}'}" Margin="0,0,0,2" />
                                     <TextBlock Text="{Binding SelectedDifference.BucketBLastModified, StringFormat='Last Modified: {0:yyyy-MM-dd HH:mm:ss UTC}'}" Foreground="#DCDCAA" />
                                 </StackPanel>
