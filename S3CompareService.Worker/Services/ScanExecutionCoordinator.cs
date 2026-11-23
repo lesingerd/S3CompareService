@@ -16,6 +16,14 @@ public class ActiveScanContext
     public CancellationTokenSource Cts { get; set; } = null!;
     public ComparisonStatistics LatestStats { get; set; } = new();
     public Task ExecutionTask { get; set; } = Task.CompletedTask;
+    public ScanRun Run { get; set; } = null!;
+    public ComparisonJob Job { get; set; } = null!;
+    /// <summary>When a cancel (or a service stop) was requested, or null. Set once.</summary>
+    public DateTime? CancelRequestedUtc { get; set; }
+    public bool CancelIsShutdown { get; set; }
+    /// <summary>Completes when the engine task ended or the watchdog gave up on it.</summary>
+    public TaskCompletionSource Settled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public bool Detached { get; set; }
 }
 
 public enum TriggerFailure
@@ -45,6 +53,12 @@ public class ScanExecutionCoordinator
     private readonly ConcurrentDictionary<string, ActiveScanContext> _activeScansByRunId = new();
     private readonly ConcurrentDictionary<string, string> _activeRunIdByJobId = new();
     private volatile bool _stopping;
+
+    /// <summary>How long a cancelled scan may take to stop before the service reports it cancelled itself and detaches from it.</summary>
+    public TimeSpan CancelWatchdogTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>Test hook: builds the engine of a scan (to inject fake S3 listers). Null = the normal engine.</summary>
+    public Func<ComparisonJob, ScanRun, ScanCheckpoint?, ServiceComparisonEngine>? EngineFactory { get; set; }
 
     public ScanExecutionCoordinator(
         IJobRepository jobRepo,
@@ -180,7 +194,8 @@ public class ScanExecutionCoordinator
         var cts = new CancellationTokenSource();
         var token = cts.Token;
         // Service-wide defaults with the job's own throughput overrides (Performance) applied.
-        var engine = new ServiceComparisonEngine(job, run, _scanRunRepo, _diffRepo, _auditLogRepo, checkpoint, options: _scanOptions.ForJob(job));
+        var engine = EngineFactory?.Invoke(job, run, checkpoint)
+            ?? new ServiceComparisonEngine(job, run, _scanRunRepo, _diffRepo, _auditLogRepo, checkpoint, options: _scanOptions.ForJob(job));
 
         var context = new ActiveScanContext
         {
@@ -189,6 +204,8 @@ public class ScanExecutionCoordinator
             JobName = job.Name,
             StartTimeUtc = run.StartTimeUtc,
             Engine = engine,
+            Run = run,
+            Job = job,
             Cts = cts,
             LatestStats = new ComparisonStatistics()
         };
@@ -199,14 +216,14 @@ public class ScanExecutionCoordinator
         context.ExecutionTask = Task.Run(async () =>
         {
             await gate.Task.ConfigureAwait(false);
-            await ExecuteAsync(job, run, engine, cts, token).ConfigureAwait(false);
+            await ExecuteAsync(context, job, run, engine, cts, token).ConfigureAwait(false);
         });
 
         _activeScansByRunId[run.Id] = context;
         gate.SetResult();
     }
 
-    private async Task ExecuteAsync(ComparisonJob job, ScanRun run, ServiceComparisonEngine engine, CancellationTokenSource cts, CancellationToken token)
+    private async Task ExecuteAsync(ActiveScanContext context, ComparisonJob job, ScanRun run, ServiceComparisonEngine engine, CancellationTokenSource cts, CancellationToken token)
     {
         bool completed = false;
         bool failed = false;
@@ -214,7 +231,8 @@ public class ScanExecutionCoordinator
         {
             _logger.LogInformation("Starting scan execution for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
             await engine.RunAsync(token);
-            completed = true;
+            completed = !context.Detached;
+            if (context.Detached) throw new OperationCanceledException(token);
             await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Completed);
             _logger.LogInformation("Scan execution finished for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
             Notify(() => _events.RunCompleted(job, run));
@@ -222,7 +240,12 @@ public class ScanExecutionCoordinator
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             // Only our own token counts as a cancel; an engine-internal timeout falls through to the Failed handler.
-            if (_stopping || run.Status == RunStatus.Interrupted)
+            if (context.Detached)
+            {
+                // The cancel watchdog already reported this run and cleared it; nothing more to record.
+                _logger.LogWarning("Detached scan finally ended for Job {JobName} (RunId: {RunId}).", job.Name, run.Id);
+            }
+            else if (_stopping || run.Status == RunStatus.Interrupted)
             {
                 // Host shutdown: the run stays Interrupted with its checkpoint and is resumed at next startup.
                 // The job's last-run state is deliberately not advanced.
@@ -269,8 +292,10 @@ public class ScanExecutionCoordinator
             }
         }
 
+        // Remove only our own entries: after a detach the job may already run again under another run id.
         _activeScansByRunId.TryRemove(run.Id, out _);
-        _activeRunIdByJobId.TryRemove(job.Id, out _);
+        _activeRunIdByJobId.TryRemove(new KeyValuePair<string, string>(job.Id, run.Id));
+        context.Settled.TrySetResult();
         // Cancel/Stop callers tolerate ObjectDisposedException, so disposing here is safe.
         try { cts.Dispose(); } catch { }
     }
@@ -312,6 +337,7 @@ public class ScanExecutionCoordinator
     {
         if (_activeScansByRunId.TryGetValue(runId, out var ctx))
         {
+            BeginCancel(ctx, shutdown: false);
             try
             {
                 ctx.Engine.Resume();
@@ -324,6 +350,90 @@ public class ScanExecutionCoordinator
             return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// Records that a cancel (or a service stop) was requested, writes it to the audit log at once, and starts the watchdog that
+    /// reports the run itself when the engine does not stop in time. Only the first request counts.
+    /// </summary>
+    private void BeginCancel(ActiveScanContext ctx, bool shutdown)
+    {
+        lock (ctx)
+        {
+            if (ctx.CancelRequestedUtc != null) return;
+            ctx.CancelRequestedUtc = DateTime.UtcNow;
+            ctx.CancelIsShutdown = shutdown;
+        }
+        _ = AuditAsync("INFO", shutdown
+            ? $"Service stop requested: interrupting run '{ctx.ScanRunId}' of job '{ctx.JobName}'."
+            : $"Cancel requested for run '{ctx.ScanRunId}' of job '{ctx.JobName}'.", ctx, null);
+        _ = Task.Run(() => WatchCancelAsync(ctx));
+    }
+
+    /// <summary>
+    /// If the engine task has not ended <see cref="CancelWatchdogTimeout"/> after a cancel, something blocks that does not honour
+    /// cancellation (a hung network call, a locked database). The service then logs what is stuck, marks the run Cancelled (or
+    /// Interrupted on shutdown) itself, clears it from the active scans so the banner goes and the job can run again, and
+    /// detaches the engine so that it cannot write to the run any more.
+    /// </summary>
+    private async Task WatchCancelAsync(ActiveScanContext ctx)
+    {
+        try
+        {
+            await Task.WhenAny(ctx.ExecutionTask, Task.Delay(CancelWatchdogTimeout)).ConfigureAwait(false);
+            if (ctx.ExecutionTask.IsCompleted) return;
+
+            bool shutdown = ctx.CancelIsShutdown;
+            string stuck;
+            try { stuck = string.Join("; ", ctx.Engine.GetInFlight().Select(o => o.ToString())); }
+            catch { stuck = string.Empty; }
+            if (stuck.Length == 0) stuck = "no S3 request or database call is in flight (the engine is blocked somewhere else)";
+            ctx.Detached = true;
+            ctx.Engine.Detach();
+            _logger.LogError("Run {RunId} did not stop within {Seconds:0} s of the {What}; detaching. Stuck: {Stuck}", ctx.ScanRunId, CancelWatchdogTimeout.TotalSeconds, shutdown ? "service stop" : "cancel", stuck);
+            await AuditAsync("ERROR",
+                $"Run '{ctx.ScanRunId}' did not stop within {CancelWatchdogTimeout.TotalSeconds:0} s of the {(shutdown ? "service stop" : "cancel")} request. Stuck operation(s): {stuck}. "
+                + $"The service marks the run {(shutdown ? "Interrupted" : "Cancelled")} itself and detaches from the scan; it can no longer change the run.", ctx, null).ConfigureAwait(false);
+
+            ctx.Engine.SyncRunStats();
+            var run = ctx.Run;
+            run.Status = shutdown ? RunStatus.Interrupted : RunStatus.Cancelled;
+            run.EndTimeUtc = DateTime.UtcNow;
+            run.ErrorMessage = shutdown
+                ? "Scan interrupted by service shutdown (the engine did not stop in time). Checkpoint saved for automatic recovery."
+                : $"Scan was cancelled by user; the engine did not stop within {CancelWatchdogTimeout.TotalSeconds:0} s and was detached. Stuck: {stuck}";
+            try { await _scanRunRepo.CompleteAsync(run, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogError(ex, "Could not store the final state of detached run {RunId}", ctx.ScanRunId); }
+
+            if (!shutdown)
+            {
+                await SafeAsync(() => _jobRepo.UpdateRunScheduleStateAsync(ctx.JobId, DateTime.UtcNow, null, RunStatus.Cancelled).WaitAsync(TimeSpan.FromSeconds(15)), "update job state");
+                Notify(() => _events.RunCancelled(ctx.Job, run));
+            }
+
+            _activeScansByRunId.TryRemove(ctx.ScanRunId, out _);
+            _activeRunIdByJobId.TryRemove(new KeyValuePair<string, string>(ctx.JobId, ctx.ScanRunId));
+            ctx.Settled.TrySetResult();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Cancel watchdog for run {RunId} failed", ctx.ScanRunId);
+            ctx.Settled.TrySetResult();
+        }
+    }
+
+    /// <summary>Writes an audit log line without ever blocking or failing the caller for long.</summary>
+    private async Task AuditAsync(string level, string message, ActiveScanContext ctx, string? details)
+    {
+        try
+        {
+            await _auditLogRepo.LogAsync(level, "ScanCoordinator", message, details: details, scanRunId: ctx.ScanRunId, jobId: ctx.JobId, cancellationToken: CancellationToken.None)
+                .WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Audit log write failed or timed out: {Reason}", ex.Message);
+        }
     }
 
     public async Task StopAllActiveScansAsync(CancellationToken cancellationToken = default, TimeSpan? timeout = null)
@@ -339,6 +449,7 @@ public class ScanExecutionCoordinator
             try
             {
                 ctx.Engine.MarkServiceShutdown();
+                BeginCancel(ctx, shutdown: true);
                 ctx.Cts.Cancel();
             }
             catch (ObjectDisposedException)
@@ -350,7 +461,8 @@ public class ScanExecutionCoordinator
             }
         }
 
-        var tasks = activeContexts.Select(c => c.ExecutionTask).ToArray();
+        // A scan the watchdog gave up on counts as settled, so a stuck scan cannot hold up the shutdown.
+        var tasks = activeContexts.Select(c => c.Settled.Task).ToArray();
         try
         {
             await Task.WhenAll(tasks).WaitAsync(timeout ?? TimeSpan.FromSeconds(45), cancellationToken).ConfigureAwait(false);

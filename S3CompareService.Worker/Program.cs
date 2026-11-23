@@ -205,31 +205,55 @@ static async Task<ComparisonJob> SaveJobFromClientAsync(ComparisonJob job, IJobR
 }
 
 // 1. Status & Health
+static ScanDiagnosticsSnapshot Diagnose(ActiveScanContext s, bool withPartitions)
+{
+    var d = s.Engine.GetDiagnostics(withPartitions);
+    if (s.CancelRequestedUtc is DateTime requested)
+    {
+        d.CancelRequestedSeconds = Math.Max(0, (DateTime.UtcNow - requested).TotalSeconds);
+        d.Phase = "Cancelling";
+        d.PhaseText = ScanDiagnosticsFormatter.PhaseText(d);
+    }
+    return d;
+}
+
 app.MapGet("/api/status", (ScanExecutionCoordinator coordinator, NotificationDispatcher notifications) =>
 {
-    var activeScans = coordinator.GetActiveScans().Select(s => new
+    var activeScans = coordinator.GetActiveScans().Select(s => (Scan: s, Diag: Diagnose(s, false))).Select(x => new
     {
-        s.ScanRunId,
-        s.JobId,
-        s.JobName,
-        s.StartTimeUtc,
-        IsPaused = s.Engine.IsPaused,
-        Duration = (DateTime.UtcNow - s.StartTimeUtc).ToString(@"hh\:mm\:ss"),
-        s.LatestStats.ObjectsCompared,
-        s.LatestStats.MatchedCount,
-        s.LatestStats.TotalDifferences,
-        s.LatestStats.FilteredDifferencesCount,
-        s.LatestStats.InFlightDifferencesCount,
-        s.LatestStats.ItemsPerSecond,
-        s.LatestStats.CurrentKeyA,
-        s.LatestStats.CurrentKeyB,
-        s.LatestStats.BucketAObjectsRead,
-        s.LatestStats.BucketBObjectsRead,
-        s.LatestStats.PartitionsTotal,
-        s.LatestStats.PartitionsCompleted,
-        s.LatestStats.PartitionsActive
+        Phase = x.Diag.Phase,
+        PhaseText = x.Diag.PhaseText,
+        Operation = x.Diag.Operation,
+        LastError = x.Diag.LastError,
+        CancelRequestedSeconds = x.Diag.CancelRequestedSeconds,
+        Planner = x.Diag.Planner,
+        OldestS3 = x.Diag.OldestS3,
+        OldestDb = x.Diag.OldestDb,
+        PartitionsQueued = x.Diag.PartitionsQueued,
+        Scan = x.Scan
+    }).Select(x => new
+    {
+        x.Phase, x.PhaseText, x.Operation, x.LastError, x.CancelRequestedSeconds, x.Planner, x.OldestS3, x.OldestDb, x.PartitionsQueued,
+        x.Scan.ScanRunId,
+        x.Scan.JobId,
+        x.Scan.JobName,
+        x.Scan.StartTimeUtc,
+        IsPaused = x.Scan.Engine.IsPaused,
+        Duration = (DateTime.UtcNow - x.Scan.StartTimeUtc).ToString(@"hh\:mm\:ss"),
+        x.Scan.LatestStats.ObjectsCompared,
+        x.Scan.LatestStats.MatchedCount,
+        x.Scan.LatestStats.TotalDifferences,
+        x.Scan.LatestStats.FilteredDifferencesCount,
+        x.Scan.LatestStats.InFlightDifferencesCount,
+        x.Scan.LatestStats.ItemsPerSecond,
+        x.Scan.LatestStats.CurrentKeyA,
+        x.Scan.LatestStats.CurrentKeyB,
+        x.Scan.LatestStats.BucketAObjectsRead,
+        x.Scan.LatestStats.BucketBObjectsRead,
+        x.Scan.LatestStats.PartitionsTotal,
+        x.Scan.LatestStats.PartitionsCompleted,
+        x.Scan.LatestStats.PartitionsActive
     }).ToList();
-
     return Results.Ok(new
     {
         Service = "S3CompareService",
@@ -449,6 +473,25 @@ app.MapGet("/api/runs/{id}/export/json", async (
         "application/json",
         filename);
 });
+
+// 10b. Live diagnostics of an active scan (phase, planner, per-bucket request stats, partition table, in-flight operations)
+app.MapGet("/api/runs/{id}/diagnostics", (string id, ScanExecutionCoordinator coordinator) =>
+{
+    var ctx = coordinator.GetActiveScan(id);
+    return ctx == null ? Error(404, $"Run '{id}' is not active.") : Results.Ok(Diagnose(ctx, true));
+});
+
+// 1c. The effective service-wide scan settings (what an empty per-job override falls back to)
+app.MapGet("/api/settings/scan-defaults", (ScanOptions options) => Results.Ok(new
+{
+    options.MaxParallelPartitions,
+    options.PrefetchPages,
+    options.MaxListRequestsPerSecond,
+    options.MaxObjectsPerSecond,
+    options.MaxConcurrentContentChecks,
+    options.MaxDiscoveryRequests,
+    options.MaxPlanningSeconds
+}));
 
 // 11. Run Controls (Pause, Resume, Cancel): 404 when the run is not active, 409 when the state does not allow it
 app.MapPost("/api/runs/{id}/pause", (string id, ScanExecutionCoordinator coordinator) =>
