@@ -161,7 +161,7 @@ public class PartitionPlannerTests
 
         Assert.AreEqual("delimiter", planner.Method);
         Assert.AreEqual(8, ranges.Count);
-        Assert.AreEqual(2, planner.RequestsUsed, "one '/' listing per bucket");
+        Assert.AreEqual(82, planner.RequestsUsed, "the root and, since it is affordable, every folder: one listing per bucket each");
         Assert.IsTrue(ranges.Take(7).All(r => r.Upper!.StartsWith('d') && r.Upper.EndsWith('/')));
         AssertTiles(ranges, keys);
     }

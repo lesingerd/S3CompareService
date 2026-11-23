@@ -11,7 +11,9 @@ namespace S3CompareService.Core.Engine;
 /// Boundary candidates are found in two steps, within a request budget and a time box:
 /// <list type="number">
 /// <item>Delimiter discovery: "/" listings under the prefix on both buckets; the union of the common prefixes is the candidate
-/// set. It descends level by level (up to <c>maxDiscoveryDepth</c>) until there are at least <c>targetPartitions</c> candidates.</item>
+/// set. It descends level by level, up to <c>maxDiscoveryDepth</c>, as long as each next level can be listed completely within the
+/// budget (and in any case until there are at least <c>targetPartitions</c> candidates), so big folders get proportionally more
+/// boundaries.</item>
 /// <item>Probe fallback for flat or shallow namespaces, below the deepest "/" level found (or the whole keyspace): each base
 /// first jumps to the longest prefix all its keys share (so <c>file_00001.dat</c> style names split where they differ),
 /// then MaxKeys=1 listings with StartAfter = prefix + base + character find real keys as candidates, coarse to fine: evenly
@@ -108,6 +110,9 @@ public sealed class PartitionPlanner
     /// <summary>Distinct boundary candidates found by the last <see cref="PlanAsync"/>.</summary>
     public int CandidateCount { get; private set; }
 
+    /// <summary>The sorted, distinct boundary candidates found by the last <see cref="PlanAsync"/> (relative keys).</summary>
+    public IReadOnlyList<string> Candidates { get; private set; } = Array.Empty<string>();
+
     /// <summary>True when the planning time limit ended the search early.</summary>
     public bool TimedOut => _timedOut;
 
@@ -203,6 +208,7 @@ public sealed class PartitionPlanner
             lock (candidates)
             {
                 CandidateCount = candidates.Count;
+                Candidates = candidates.ToList();
                 ranges = BuildRanges(candidates.ToList(), _targetPartitions);
             }
             _rangeCount = ranges.Count;
@@ -307,7 +313,13 @@ public sealed class PartitionPlanner
             any = true;
             lock (candidates) candidates.UnionWith(found);
             _deepestLevel = found.ToList();
-            if (LiveCandidateCount() >= _targetPartitions || RequestsUsed >= _maxRequests) break;
+            if (RequestsUsed >= _maxRequests) break;
+            // Keep descending even when there are enough candidates: the ranges are spaced evenly over the candidates, so a
+            // folder with thousands of subfolders must contribute them, or one range ends up holding most of the bucket (a few
+            // near-empty top folders each with one big subfolder). Only stop early when the next level cannot be listed
+            // completely within half of the remaining budget (a partly listed level would skew the plan towards its first
+            // folders, and the probe fallback keeps the other half). Uneven ranges that remain are split while scanning.
+            if (LiveCandidateCount() >= _targetPartitions && (long)found.Count * 2 > Remaining / 2) break;
             level = _deepestLevel;
         }
         return any;

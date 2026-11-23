@@ -380,6 +380,8 @@ public sealed class ScanDiagnosticsSnapshot
     public int PartitionsActive { get; set; }
     public int PartitionsQueued { get; set; }
     public int PartitionsOmitted { get; set; }
+    /// <summary>Running ranges split so an idle worker could take their second half (work stealing).</summary>
+    public int PartitionSplits { get; set; }
     public List<PartitionRow> Partitions { get; set; } = new();
     /// <summary>The text of the last FAILED issue (the scan or a range stopped), or null. Harmless issues never appear here.</summary>
     public string? LastError { get; set; }
@@ -417,7 +419,7 @@ public static class ScanDiagnosticsFormatter
             "Planning" => $"PLANNING: {p.RequestsUsed}/{p.RequestBudget} requests · {p.Candidates} candidates · {(string.IsNullOrEmpty(p.Step) ? "starting" : p.Step)} · {Clock(p.ElapsedSeconds)}"
                 + (p.TimeLimitSeconds > 0 ? $" of {Clock(p.TimeLimitSeconds)}" : string.Empty)
                 + (p.RequestErrors > 0 ? $" · {p.RequestErrors} request(s) skipped" : string.Empty),
-            "Scanning" => $"SCANNING: {s.PartitionsCompleted}/{s.PartitionsTotal} partitions done · {s.PartitionsActive} active · {s.PartitionsQueued} queued",
+            "Scanning" => $"SCANNING: {s.PartitionsCompleted}/{s.PartitionsTotal} partitions done · {s.PartitionsActive} active · {s.PartitionsQueued} queued{(s.PartitionSplits > 0 ? $" · {s.PartitionSplits} split" : string.Empty)}",
             "Finalizing" => "FINALIZING: writing the final results",
             _ => "PREPARING: " + (string.IsNullOrEmpty(s.Operation) ? "starting" : s.Operation)
         };
@@ -456,7 +458,7 @@ public static class ScanDiagnosticsFormatter
         {
             sb.AppendLine($"BUCKET {b.Side}  {b.Bucket}: requests {b.Requests:N0} · {b.RequestsPerSecond:0.0}/s (limit {(b.RateLimitPerSecond > 0 ? b.RateLimitPerSecond.ToString("0.#", CultureInfo.InvariantCulture) + "/s" : "none")}) · in flight {b.InFlight} · latency avg {b.AvgLatencyMs:N0} ms, last {b.LastLatencyMs:N0} ms, max {b.MaxLatencyMs:N0} ms · throttle wait {b.ThrottleWaitSeconds:0.0} s · retried {b.Retried} (recovered {b.Recovered}) · failed {b.Errors}");
         }
-        sb.AppendLine($"PARTITIONS {s.PartitionsCompleted}/{s.PartitionsTotal} done · {s.PartitionsActive} active · {s.PartitionsQueued} queued · {s.ObjectsCompared:N0} objects compared");
+        sb.AppendLine($"PARTITIONS {s.PartitionsCompleted}/{s.PartitionsTotal} done · {s.PartitionsActive} active · {s.PartitionsQueued} queued · {s.PartitionSplits} split by idle workers · {s.ObjectsCompared:N0} objects compared");
         sb.AppendLine($"OLDEST IN FLIGHT  S3: {(s.OldestS3 == null ? "none" : s.OldestS3.ToString())}");
         sb.AppendLine($"                  DB: {(s.OldestDb == null ? "none" : s.OldestDb.ToString())}");
         sb.AppendLine(s.Issues.Text);

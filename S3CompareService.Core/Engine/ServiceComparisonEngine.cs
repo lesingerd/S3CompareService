@@ -163,6 +163,7 @@ public class ServiceComparisonEngine
             s.PartitionsCompleted = _ranges.Count(r => r.Completed);
             s.PartitionsActive = _ranges.Count(r => r.Active && !r.Completed);
             s.PartitionsQueued = s.PartitionsTotal - s.PartitionsCompleted - s.PartitionsActive;
+            s.PartitionSplits = _splitCount;
             if (includePartitions)
             {
                 // All active ranges first, then the next queued ones, then the most recently finished, up to the cap; shown in key order.
@@ -748,12 +749,16 @@ public class ServiceComparisonEngine
         if (pending.Count == 0) return;
 
         var queue = new ConcurrentQueue<PartitionRange>(pending);
-        int workerCount = UsesProvidedStreams ? 1 : Math.Clamp(_options.MaxParallelPartitions, 1, pending.Count);
+        // With work stealing, every configured worker runs even when fewer ranges are left (a resumed plan, a lopsided plan):
+        // the idle ones split the running ranges.
+        bool splitting = SplittingEnabled;
+        int workerCount = UsesProvidedStreams ? 1 : Math.Clamp(_options.MaxParallelPartitions, 1, splitting ? int.MaxValue : pending.Count);
         _checkpointItemThreshold = CheckpointEveryItems * workerCount;
         _diag.Operation = $"Workers running ({workerCount})";
-        await LogAsync("INFO", $"Scan step: Workers started ({workerCount} worker(s) for {pending.Count} unfinished key range(s)).").ConfigureAwait(false);
+        await LogAsync("INFO", $"Scan step: Workers started ({workerCount} worker(s) for {pending.Count} unfinished key range(s){(splitting ? "; idle workers split running ranges" : string.Empty)}).").ConfigureAwait(false);
         using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var errors = new ConcurrentQueue<Exception>();
+        int busyWorkers = 0; // workers holding (or about to hold, or splitting for) a range
 
         async Task WorkerAsync()
         {
@@ -761,9 +766,54 @@ public class ServiceComparisonEngine
             var tokens = new ObjectTokenAccount();
             try
             {
-                while (queue.TryDequeue(out var range))
+                while (true)
                 {
-                    await RunRangeAsync(range, prefixA, prefixB, tokens, workersCts.Token).ConfigureAwait(false);
+                    // Counted before the dequeue, so an idle worker never sees "nothing queued, nobody busy" while a range is
+                    // being handed to a worker that has not marked it active yet. Idle workers are woken only after the count
+                    // drops, or they could see this worker still busy, go back to sleep and delay the end of the scan.
+                    bool ran = false;
+                    Interlocked.Increment(ref busyWorkers);
+                    try
+                    {
+                        if (queue.TryDequeue(out var range))
+                        {
+                            ran = true;
+                            await RunRangeAsync(range, prefixA, prefixB, tokens, workersCts.Token).ConfigureAwait(false);
+                            continue;
+                        }
+                    }
+                    finally
+                    {
+                        // Wake idle workers after a range, and whenever nobody holds one any more (the last check of an idle
+                        // worker may be what kept the count up while the last range ended).
+                        if (Interlocked.Decrement(ref busyWorkers) == 0 || ran) SignalRangeEnded();
+                    }
+                    if (!splitting) break;
+
+                    // Nothing queued: take the second half of a running range, wait for one to become splittable, or finish
+                    // when no worker holds a range any more (then no new range can appear). Looking for a split does not count
+                    // as busy: the range being split is held by its own worker until it ends.
+                    await CheckPauseAsync(workersCts.Token).ConfigureAwait(false);
+                    var wake = Volatile.Read(ref _rangeEnded).Task; // read before the checks, so a range ending meanwhile is not missed
+                    var (stolen, attempted) = await TrySplitRangeAsync(prefixA, prefixB, workersCts.Token).ConfigureAwait(false);
+                    if (stolen != null)
+                    {
+                        Interlocked.Increment(ref busyWorkers);
+                        try
+                        {
+                            await RunRangeAsync(stolen, prefixA, prefixB, tokens, workersCts.Token).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            Interlocked.Decrement(ref busyWorkers);
+                            SignalRangeEnded();
+                        }
+                        continue;
+                    }
+                    if (attempted) SignalRangeEnded(); // a failed attempt backs its range off; others may try a different one
+                    if (Volatile.Read(ref busyWorkers) == 0 && queue.IsEmpty) break;
+                    await Task.WhenAny(wake, Task.Delay(_options.SplitIdlePoll, workersCts.Token)).ConfigureAwait(false);
+                    workersCts.Token.ThrowIfCancellationRequested();
                 }
                 await PayObjectTokensAsync(tokens, workersCts.Token).ConfigureAwait(false);
             }
@@ -790,6 +840,116 @@ public class ServiceComparisonEngine
             var root = errors.FirstOrDefault(e => e is not OperationCanceledException) ?? errors.First();
             ExceptionDispatchInfo.Capture(root).Throw();
         }
+    }
+
+    private bool SplittingEnabled => _options.EnableRangeSplitting && !UsesProvidedStreams && _options.MaxParallelPartitions > 1;
+
+    /// <summary>Split attempts that found no key in a row before a range is left alone for good.</summary>
+    private const int MaxSplitFailures = 6;
+
+    private int _splitCount;
+
+    /// <summary>Completed (and replaced) whenever a worker leaves a range, so idle workers re-check at once instead of at the next poll.</summary>
+    private TaskCompletionSource _rangeEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void SignalRangeEnded() =>
+        Interlocked.Exchange(ref _rangeEnded, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).TrySetResult();
+
+    /// <summary>
+    /// Work stealing: picks the running range left alone longest (running, or last split, at least
+    /// <see cref="ScanOptions.MinRangeAgeForSplit"/> ago), finds a key ahead of its worker that cuts the rest in two, and - under the
+    /// state lock, only if the worker has not reached that key yet - lowers the range's upper bound to it and inserts the
+    /// second half as a new range right after it, which the calling worker then runs. Range is null when nothing was split;
+    /// Attempted is false when no range was eligible (nothing was sent).
+    /// A failed attempt backs off (10 s, doubling, up to 2 min) and after <see cref="MaxSplitFailures"/> in a row the range
+    /// is left alone. Never throws except for cancellation: a split is an optimisation only.
+    /// </summary>
+    private async Task<(PartitionRange? Range, bool Attempted)> TrySplitRangeAsync(string? prefixA, string? prefixB, CancellationToken ct)
+    {
+        PartitionRange? victim;
+        string? position, upper;
+        long now = _stopwatch.ElapsedMilliseconds;
+        long minAge = (long)_options.MinRangeAgeForSplit.TotalMilliseconds;
+        lock (_stateLock)
+        {
+            victim = _ranges
+                .Where(r => r.Active && !r.Completed && !r.Splitting && r.SplitFailures < MaxSplitFailures
+                    && now >= r.NextSplitAttemptMs && now - r.ActiveSinceMs >= minAge)
+                .OrderBy(r => r.ActiveSinceMs) // the range left alone longest: splits rotate over the running ranges
+                .FirstOrDefault();
+            if (victim == null) return (null, false);
+            victim.Splitting = true;
+            position = victim.InFlightKey ?? victim.LastCompletedKey ?? victim.Lower;
+            upper = victim.Upper;
+        }
+
+        var sw = Stopwatch.StartNew();
+        var splitter = new RangeSplitter(
+            new RangeSplitter.Side(_listerA!, _job.BucketA.BucketName, prefixA ?? string.Empty, _limiterA),
+            new RangeSplitter.Side(_listerB!, _job.BucketB.BucketName, prefixB ?? string.Empty, _limiterB),
+            _options.PlannerRequestTimeout);
+        string? key = null;
+        try
+        {
+            key = await splitter.FindSplitAsync(position, upper, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            lock (_stateLock) victim.Splitting = false;
+            throw;
+        }
+        catch (Exception ex)
+        {
+            key = null;
+            await LogAsync("WARN", $"{ScanIssues.Label(IssueOutcome.Skipped)}: splitting a running key range failed ({ex.GetType().Name}: {ex.Message}); the range keeps running on one worker. Results are unaffected.").ConfigureAwait(false);
+        }
+
+        PartitionRange? created = null;
+        string rejected = "no split key found";
+        int index = -1;
+        lock (_stateLock)
+        {
+            victim.Splitting = false;
+            if (key != null)
+            {
+                // Re-check against the live state: the worker kept going while the split key was looked up.
+                string? done = victim.InFlightKey ?? victim.LastCompletedKey ?? victim.Lower;
+                if (victim.Completed || !victim.Active) rejected = "the range finished meanwhile";
+                else if (done != null && Utf8OrdinalComparer.CompareStatic(key, done) <= 0) rejected = "the worker passed the split key meanwhile";
+                else if (victim.Lower != null && Utf8OrdinalComparer.CompareStatic(key, victim.Lower) <= 0) rejected = "split key not inside the range";
+                else if (victim.Upper != null && Utf8OrdinalComparer.CompareStatic(key, victim.Upper) >= 0) rejected = "split key not inside the range";
+                else
+                {
+                    index = _ranges.IndexOf(victim);
+                    created = new PartitionRange { Lower = key, Upper = victim.Upper };
+                    victim.Upper = key;
+                    _ranges.Insert(index + 1, created);
+                    _stats.PartitionsTotal = _ranges.Count;
+                    _splitCount++;
+                    victim.SplitFailures = 0;
+                    victim.ActiveSinceMs = _stopwatch.ElapsedMilliseconds; // both halves now wait MinRangeAgeForSplit before the next split
+                }
+            }
+            if (created == null)
+            {
+                victim.SplitFailures++;
+                long backoff = Math.Min(120_000, 10_000L << Math.Min(victim.SplitFailures - 1, 4));
+                victim.NextSplitAttemptMs = _stopwatch.ElapsedMilliseconds + backoff;
+            }
+        }
+
+        string cost = $"{splitter.RequestsUsed} request(s){(splitter.RequestErrors > 0 ? $", {splitter.RequestErrors} skipped" : string.Empty)}, {sw.ElapsedMilliseconds} ms";
+        if (created != null)
+        {
+            await LogAsync("INFO", $"Split key range #{index}: an idle worker took ({InstrumentedLister.Clip(key)}, {InstrumentedLister.Clip(created.Upper ?? "(end)")}] from the running range, which now ends at '{InstrumentedLister.Clip(key)}' (method {splitter.Method}, {cost}).").ConfigureAwait(false);
+        }
+        else
+        {
+            if (splitter.RequestErrors > 0 && splitter.LastError != null)
+                _diag.Issues.Record(IssueOutcome.Skipped, $"{splitter.LastError} — the running range was not split this time; results are unaffected", log: false);
+            await LogAsync("INFO", $"Split of key range ({InstrumentedLister.Clip(victim.Lower ?? "(start)")}, ...] not done: {rejected} ({cost}); next attempt in {Math.Max(0, (victim.NextSplitAttemptMs - _stopwatch.ElapsedMilliseconds) / 1000)} s{(victim.SplitFailures >= MaxSplitFailures ? " (giving up on this range)" : string.Empty)}.").ConfigureAwait(false);
+        }
+        return (created, true);
     }
 
     /// <summary>Per-worker merge state of one range.</summary>
@@ -833,7 +993,7 @@ public class ServiceComparisonEngine
             long unusedIdCounter = 0;
             cursor.GapDetector.CheckKey(after, _scanRun.Id, ref unusedIdCounter); // primes the series; reports nothing
         }
-        lock (_stateLock) { _stats.PartitionsActive++; range.Active = true; }
+        lock (_stateLock) { _stats.PartitionsActive++; range.Active = true; range.ActiveSinceMs = _stopwatch.ElapsedMilliseconds; range.InFlightKey = after; }
         try
         {
             bool hasA = await enumA.MoveNextAsync(ct).ConfigureAwait(false);
@@ -843,7 +1003,6 @@ public class ServiceComparisonEngine
             {
                 await CheckPauseAsync(ct).ConfigureAwait(false);
                 ct.ThrowIfCancellationRequested();
-                await ThrottleObjectsAsync(cursor, ct).ConfigureAwait(false);
 
                 S3ObjectSummary? itemA = hasA ? enumA.Current : null;
                 S3ObjectSummary? itemB = hasB ? enumB.Current : null;
@@ -854,6 +1013,20 @@ public class ServiceComparisonEngine
                 if (itemA == null) cmp = 1;
                 else if (itemB == null) cmp = -1;
                 else cmp = Utf8OrdinalComparer.CompareStatic(relKeyA, relKeyB);
+
+                // A split may have lowered the range's upper bound (the rest now belongs to another worker). The key about to be
+                // processed is the smaller head, so once it is past the bound, both listings are: the range is finished. The
+                // check and the in-flight key are set under the state lock, which is where a split checks its key against them.
+                string nextKey = cmp <= 0 ? relKeyA! : relKeyB!;
+                bool pastUpper;
+                lock (_stateLock)
+                {
+                    pastUpper = range.Upper != null && Utf8OrdinalComparer.CompareStatic(nextKey, range.Upper) > 0;
+                    if (!pastUpper) range.InFlightKey = nextKey;
+                }
+                if (pastUpper) break;
+
+                await ThrottleObjectsAsync(cursor, ct).ConfigureAwait(false);
 
                 // Phase 1: everything that can be slow or cancelled (S3 data compare) - mutates no state.
                 // Phase 2 (CommitKey): synchronous bookkeeping - the key is either fully recorded or not at all.
