@@ -225,6 +225,9 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator, NotificationDis
         PhaseText = x.Diag.PhaseText,
         Operation = x.Diag.Operation,
         LastError = x.Diag.LastError,
+        Issues = x.Diag.Issues,
+        IssuesText = x.Diag.Issues.Text,
+        TopIssue = x.Diag.TopIssue,
         CancelRequestedSeconds = x.Diag.CancelRequestedSeconds,
         Planner = x.Diag.Planner,
         OldestS3 = x.Diag.OldestS3,
@@ -233,7 +236,7 @@ app.MapGet("/api/status", (ScanExecutionCoordinator coordinator, NotificationDis
         Scan = x.Scan
     }).Select(x => new
     {
-        x.Phase, x.PhaseText, x.Operation, x.LastError, x.CancelRequestedSeconds, x.Planner, x.OldestS3, x.OldestDb, x.PartitionsQueued,
+        x.Phase, x.PhaseText, x.Operation, x.LastError, x.Issues, x.IssuesText, x.TopIssue, x.CancelRequestedSeconds, x.Planner, x.OldestS3, x.OldestDb, x.PartitionsQueued,
         x.Scan.ScanRunId,
         x.Scan.JobId,
         x.Scan.JobName,

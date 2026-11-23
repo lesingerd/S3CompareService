@@ -67,15 +67,31 @@ public sealed class S3Lister : IS3Lister, IS3ObjectReader
         {
             var op = InFlightTracker.CurrentRequest.Value;
             if (op != null) op.Attempt = attempt;
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 return await call().ConfigureAwait(false);
             }
             catch (Exception ex) when (attempt < _maxAttempts && !ct.IsCancellationRequested && IsTransient(ex))
             {
+                if (op != null)
+                {
+                    op.RetryReason = FailureReason(ex, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalSeconds);
+                    op.Retries = attempt;
+                }
                 await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(5000, 400 * Math.Pow(2, attempt - 1))), ct).ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>A short reason for the diagnostics: "timed out after 30 s", "SlowDown (503)" or "TypeName: message".</summary>
+    internal static string FailureReason(Exception ex, double seconds)
+    {
+        if (ex is TaskCanceledException or TimeoutException || ex.InnerException is TaskCanceledException or TimeoutException)
+            return $"timed out after {seconds:0} s";
+        if (ex is AmazonServiceException s && !string.IsNullOrEmpty(s.ErrorCode)) return $"{s.ErrorCode} ({(int)s.StatusCode})";
+        string msg = ex.Message ?? string.Empty;
+        return $"{ex.GetType().Name}: {(msg.Length <= 120 ? msg : msg.Substring(0, 117) + "...")}";
     }
 
     /// <summary>True for failures worth another try: server errors, throttling, timeouts and network errors (not 4xx such as AccessDenied).</summary>

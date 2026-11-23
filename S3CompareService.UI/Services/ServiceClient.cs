@@ -57,7 +57,16 @@ public class ActiveScanDto
     public InFlightInfo? OldestDb { get; set; }
 
     public bool HasPhaseText => !string.IsNullOrEmpty(PhaseText);
-    public bool HasLastError => !string.IsNullOrEmpty(LastError);
+    public IssueSummary? Issues { get; set; }
+    public string? IssuesText { get; set; }
+    public ScanIssueInfo? TopIssue { get; set; }
+    /// <summary>"Issues: 0 failed · 2 recovered · 1 skipped · 0 degraded"; empty from a service that does not classify errors.</summary>
+    public string IssuesLine => Issues?.Text ?? IssuesText ?? string.Empty;
+    public bool HasIssuesLine => Issues != null;
+    /// <summary>The most severe recent issue, with its marker ("✓ RECOVERED (attempt 2): ...").</summary>
+    public string TopIssueText => TopIssue == null ? string.Empty : TopIssue.Glyph + " " + TopIssue.Display;
+    public bool HasTopIssue => TopIssue != null;
+    public string TopIssueOutcome => TopIssue?.Outcome ?? string.Empty;
     public bool IsCancelling => CancelRequestedSeconds != null;
     /// <summary>The oldest S3 request and database call in flight, with their age; empty when none.</summary>
     public string InFlightText

@@ -147,8 +147,12 @@ public class ServiceComparisonEngine
             InFlight = _diag.InFlight.Snapshot(8),
             OldestS3 = _diag.InFlight.Oldest("S3"),
             OldestDb = _diag.InFlight.Oldest("DB"),
-            LastError = _diag.LastError ?? _planner?.LastError ?? _finalPlannerStats?.LastError ?? (string.IsNullOrEmpty(_scanRun.ErrorMessage) ? null : _scanRun.ErrorMessage)
+            Issues = _diag.Issues.Summary(),
+            TopIssue = _diag.Issues.Top(),
+            RecentIssues = _diag.Issues.Recent()
         };
+        // LastError is kept for older clients and only ever holds a FAILED issue: harmless issues must not look like errors.
+        s.LastError = s.TopIssue is { Kind: IssueOutcome.Failed } failed ? failed.Display : null;
         s.Phase = s.IsPaused ? "Paused" : s.UnderlyingPhase;
 
         var rows = new List<PartitionRow>();
@@ -539,6 +543,7 @@ public class ServiceComparisonEngine
         _diag.ConfigureBuckets(_job.BucketA.BucketName, _job.BucketB.BucketName, _options.MaxListRequestsPerSecond);
         _diag.Phase = ScanPhase.Preparing;
         _diag.Operation = "Starting";
+        _diag.Issues.Log = (level, message) => _ = LogAsync(level, message);
         using var monitorCts = new CancellationTokenSource();
         var monitorTask = Task.Run(() => MonitorAsync(monitorCts.Token));
 
@@ -583,8 +588,8 @@ public class ServiceComparisonEngine
                 _limiterA = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
                 _limiterB = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
                 // Every list request and every wait in the limiter is counted and timed for the diagnostics panel.
-                _listerA = new InstrumentedLister(_listerA, _diag.BucketA, _diag.InFlight);
-                _listerB = new InstrumentedLister(_listerB, _diag.BucketB, _diag.InFlight);
+                _listerA = new InstrumentedLister(_listerA, _diag.BucketA, _diag.InFlight, _diag.Issues);
+                _listerB = new InstrumentedLister(_listerB, _diag.BucketB, _diag.InFlight, _diag.Issues);
                 if (_limiterA != null) _limiterA = new InstrumentedLimiter(_limiterA, _diag.BucketA);
                 if (_limiterB != null) _limiterB = new InstrumentedLimiter(_limiterB, _diag.BucketB);
 
@@ -662,9 +667,9 @@ public class ServiceComparisonEngine
         }
         catch (Exception ex)
         {
-            _diag.RecordError($"Run failed: {ex.GetType().Name}: {ex.Message}");
+            _diag.Issues.Record(IssueOutcome.Failed, $"scan run failed and stopped: {ex.GetType().Name}: {ex.Message}", log: false);
             await FinalizeRunAsync(RunStatus.Failed, $"{ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
-            await LogAsync("ERROR", $"Scan run '{_scanRun.Id}' failed with error: {ex.Message}", ex.StackTrace).ConfigureAwait(false);
+            await LogAsync("ERROR", $"FAILED: Scan run '{_scanRun.Id}' failed with error: {ex.Message}", ex.StackTrace).ConfigureAwait(false);
             throw;
         }
         finally
@@ -701,7 +706,8 @@ public class ServiceComparisonEngine
             pauseGate: CheckPauseAsync,
             maxPlanningTime: limit,
             requestTimeout: _options.PlannerRequestTimeout,
-            log: (level, message) => _ = LogAsync(level, message));
+            log: (level, message) => _ = LogAsync(level, message),
+            issues: _diag.Issues);
         _planner = planner;
         SetPhase(ScanPhase.Planning);
         _diag.Operation = "Planning key ranges";
@@ -723,8 +729,8 @@ public class ServiceComparisonEngine
         }
         catch (Exception ex)
         {
-            _diag.RecordError($"Planning failed: {ex.Message}");
-            await LogAsync("WARN", $"Partition planning failed for run '{_scanRun.Id}' ({ex.Message}); scanning as one key range.", ex.StackTrace).ConfigureAwait(false);
+            _diag.Issues.Record(IssueOutcome.Degraded, $"planning failed ({ex.Message}) — scanning as one key range; results are unaffected but the scan is not parallel (slower)", log: false);
+            await LogAsync("WARN", $"DEGRADED: Partition planning failed for run '{_scanRun.Id}' ({ex.Message}); scanning as one key range.", ex.StackTrace).ConfigureAwait(false);
             return PartitionPlanner.BuildRanges(Array.Empty<string>(), 1);
         }
         finally
@@ -986,7 +992,8 @@ public class ServiceComparisonEngine
             int lost;
             lock (_stateLock) { lost = _differenceBuffer.Count; }
             _scanRun.ErrorMessage = $"{message} WARNING: {lost} difference(s) could not be persisted ({ex.Message}); the checkpoint was not advanced.";
-            await LogAsync("ERROR", $"Final difference flush failed for run '{_scanRun.Id}': {ex.Message}", ex.StackTrace).ConfigureAwait(false);
+            _diag.Issues.Record(IssueOutcome.Failed, $"{lost} difference(s) could not be persisted ({ex.Message}); the checkpoint was not advanced", log: false);
+            await LogAsync("ERROR", $"FAILED: Final difference flush failed for run '{_scanRun.Id}': {ex.Message}", ex.StackTrace).ConfigureAwait(false);
         }
 
         if (flushed)
@@ -1002,7 +1009,8 @@ public class ServiceComparisonEngine
         }
         catch (Exception ex)
         {
-            await LogAsync("ERROR", $"Failed to write final state of run '{_scanRun.Id}': {ex.Message}", ex.StackTrace).ConfigureAwait(false);
+            _diag.Issues.Record(IssueOutcome.Failed, $"the final state of the run could not be written: {ex.Message}", log: false);
+            await LogAsync("ERROR", $"FAILED: Failed to write final state of run '{_scanRun.Id}': {ex.Message}", ex.StackTrace).ConfigureAwait(false);
         }
     }
 
@@ -1242,6 +1250,7 @@ public class ServiceComparisonEngine
             try
             {
                 await DbAsync("InsertBatchAsync", () => _diffRepo.InsertBatchAsync(batch, cancellationToken), cancellationToken).ConfigureAwait(false);
+                if (attempt > 1) _diag.Issues.Record(IssueOutcome.Recovered, $"database write of {batch.Count} difference(s) failed, then succeeded — no impact", attempt);
                 return;
             }
             catch (Exception ex) when (attempt < 3 && !cancellationToken.IsCancellationRequested)
@@ -1352,7 +1361,8 @@ public class ServiceComparisonEngine
         catch (Exception ex)
         {
             _consecutiveCheckpointFailures++;
-            await LogAsync("WARN", $"Checkpoint write failed ({_consecutiveCheckpointFailures} consecutive): {ex.Message}", ex.StackTrace).ConfigureAwait(false);
+            _diag.Issues.Record(IssueOutcome.Degraded, $"checkpoint write failed ({_consecutiveCheckpointFailures} consecutive): {ex.Message} — the scan continues; a resume after an interruption would restart from an older position", log: false);
+            await LogAsync("WARN", $"DEGRADED: Checkpoint write failed ({_consecutiveCheckpointFailures} consecutive): {ex.Message}", ex.StackTrace).ConfigureAwait(false);
 
             if (throwOnRepeatedFailure && _consecutiveCheckpointFailures >= MaxConsecutiveCheckpointFailures)
             {
@@ -1524,6 +1534,7 @@ public class ServiceComparisonEngine
             try
             {
                 bool contentMatches = await StreamCompareObjectsAsync(itemA.Key, itemB.Key, cancellationToken).ConfigureAwait(false);
+                if (attempt > 1) _diag.Issues.Record(IssueOutcome.Recovered, $"content read of {InstrumentedLister.Clip(relativeKey)} failed, then succeeded — no impact", attempt);
                 if (contentMatches) return (true, null);
                 return (false, MakeDifference(
                     relativeKey,
@@ -1550,6 +1561,7 @@ public class ServiceComparisonEngine
                     await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken).ConfigureAwait(false);
                     continue;
                 }
+                _diag.Issues.Record(IssueOutcome.Recorded, $"content of bucket {ex.Side} could not be read{(attempt > 1 ? " (also after one retry)" : string.Empty)}: {Describe(ex.InnerException)} — recorded as Content Check Error for {InstrumentedLister.Clip(relativeKey)}; scan continued");
                 return (false, MakeDifference(
                     relativeKey,
                     DifferenceType.ContentCheckError,

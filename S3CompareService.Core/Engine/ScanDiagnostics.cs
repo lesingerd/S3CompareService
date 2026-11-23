@@ -41,6 +41,11 @@ public class InFlightOp
     internal int Warned;
     private int _attempt = 1;
 
+    /// <summary>Failed attempts that were retried (set by <see cref="S3Lister"/>); 0 when the request never needed a retry.</summary>
+    internal int Retries;
+    /// <summary>Why the last retried attempt failed ("timed out after 30 s", ...).</summary>
+    internal string? RetryReason;
+
     /// <summary>1 for the first try, higher while the request is being retried.</summary>
     public int Attempt { get => Volatile.Read(ref _attempt); set => Volatile.Write(ref _attempt, value); }
 
@@ -112,17 +117,15 @@ public sealed class BucketMetrics
     private readonly object _gate = new();
     private readonly Queue<long> _recent = new();
     private readonly long _created = Stopwatch.GetTimestamp();
-    private long _requests, _errors, _completed, _latencyTicks, _lastLatencyTicks, _maxLatencyTicks, _throttleTicks;
+    private long _requests, _errors, _retried, _recovered, _completed, _latencyTicks, _lastLatencyTicks, _maxLatencyTicks, _throttleTicks;
     private int _inFlight;
     private string? _lastError;
-    private readonly Action<string>? _onError;
 
-    public BucketMetrics(string side, string bucket, double rateLimitPerSecond, Action<string>? onError = null)
+    public BucketMetrics(string side, string bucket, double rateLimitPerSecond)
     {
         Side = side;
         Bucket = bucket;
         RateLimit = rateLimitPerSecond;
-        _onError = onError;
     }
 
     public string Side { get; }
@@ -140,9 +143,14 @@ public sealed class BucketMetrics
         }
     }
 
-    internal void RequestFinished(long ticks, string? error)
+    internal void RequestFinished(long ticks, string? error, int retries = 0)
     {
         Interlocked.Decrement(ref _inFlight);
+        if (retries > 0)
+        {
+            Interlocked.Increment(ref _retried);
+            if (error == null) Interlocked.Increment(ref _recovered);
+        }
         if (error == null)
         {
             Interlocked.Increment(ref _completed);
@@ -155,7 +163,6 @@ public sealed class BucketMetrics
         {
             Interlocked.Increment(ref _errors);
             _lastError = error;
-            _onError?.Invoke($"Bucket {Side}: {error}");
         }
     }
 
@@ -185,6 +192,8 @@ public sealed class BucketMetrics
             Bucket = Bucket,
             Requests = Interlocked.Read(ref _requests),
             Errors = Interlocked.Read(ref _errors),
+            Retried = Interlocked.Read(ref _retried),
+            Recovered = Interlocked.Read(ref _recovered),
             InFlight = Volatile.Read(ref _inFlight),
             RequestsPerSecond = Math.Round(rate, 1),
             RateLimitPerSecond = RateLimit,
@@ -203,9 +212,11 @@ public sealed class InstrumentedLister : IS3Lister
     private readonly IS3Lister _inner;
     private readonly BucketMetrics _metrics;
     private readonly InFlightTracker _tracker;
+    private readonly ScanIssues? _issues;
 
-    public InstrumentedLister(IS3Lister inner, BucketMetrics metrics, InFlightTracker tracker)
+    public InstrumentedLister(IS3Lister inner, BucketMetrics metrics, InFlightTracker tracker, ScanIssues? issues = null)
     {
+        _issues = issues;
         _inner = inner;
         _metrics = metrics;
         _tracker = tracker;
@@ -239,7 +250,12 @@ public sealed class InstrumentedLister : IS3Lister
         finally
         {
             if (reportsAttempts) InFlightTracker.CurrentRequest.Value = null;
-            _metrics.RequestFinished(Stopwatch.GetTimestamp() - start, error);
+            int retries = scope.Op.Retries;
+            _metrics.RequestFinished(Stopwatch.GetTimestamp() - start, error, retries);
+            // A failed attempt that a retry then fixed: the request is fine, so it is a Recovered issue, not an error.
+            // (A request that failed for good is classified by its caller: skipped by the planner, fatal in a scan.)
+            if (retries > 0 && error == null && _issues != null)
+                _issues.Record(IssueOutcome.Recovered, $"{scope.Op.Description}: {scope.Op.RetryReason ?? "failed"} — no impact", scope.Op.Attempt);
         }
     }
 
@@ -313,7 +329,12 @@ public sealed class BucketRequestStats
     public string Side { get; set; } = string.Empty;
     public string Bucket { get; set; } = string.Empty;
     public long Requests { get; set; }
+    /// <summary>Requests that failed for good (after all attempts).</summary>
     public long Errors { get; set; }
+    /// <summary>Requests that needed at least one retry.</summary>
+    public long Retried { get; set; }
+    /// <summary>Of those, the ones that then succeeded.</summary>
+    public long Recovered { get; set; }
     public int InFlight { get; set; }
     public double RequestsPerSecond { get; set; }
     public double RateLimitPerSecond { get; set; }
@@ -360,7 +381,14 @@ public sealed class ScanDiagnosticsSnapshot
     public int PartitionsQueued { get; set; }
     public int PartitionsOmitted { get; set; }
     public List<PartitionRow> Partitions { get; set; } = new();
+    /// <summary>The text of the last FAILED issue (the scan or a range stopped), or null. Harmless issues never appear here.</summary>
     public string? LastError { get; set; }
+    /// <summary>Counts per outcome, for the "Issues: 0 failed · 2 recovered · ..." line.</summary>
+    public IssueSummary Issues { get; set; } = new();
+    /// <summary>The most severe recent issue (Failed over Degraded over Recorded over Skipped over Recovered; most recent among equals), or null.</summary>
+    public ScanIssueInfo? TopIssue { get; set; }
+    /// <summary>The last issues, newest first (at most 10).</summary>
+    public List<ScanIssueInfo> RecentIssues { get; set; } = new();
     public List<InFlightInfo> InFlight { get; set; } = new();
     public InFlightInfo? OldestS3 { get; set; }
     public InFlightInfo? OldestDb { get; set; }
@@ -388,7 +416,7 @@ public static class ScanDiagnosticsFormatter
         {
             "Planning" => $"PLANNING: {p.RequestsUsed}/{p.RequestBudget} requests · {p.Candidates} candidates · {(string.IsNullOrEmpty(p.Step) ? "starting" : p.Step)} · {Clock(p.ElapsedSeconds)}"
                 + (p.TimeLimitSeconds > 0 ? $" of {Clock(p.TimeLimitSeconds)}" : string.Empty)
-                + (p.RequestErrors > 0 ? $" · {p.RequestErrors} request error(s)" : string.Empty),
+                + (p.RequestErrors > 0 ? $" · {p.RequestErrors} request(s) skipped" : string.Empty),
             "Scanning" => $"SCANNING: {s.PartitionsCompleted}/{s.PartitionsTotal} partitions done · {s.PartitionsActive} active · {s.PartitionsQueued} queued",
             "Finalizing" => "FINALIZING: writing the final results",
             _ => "PREPARING: " + (string.IsNullOrEmpty(s.Operation) ? "starting" : s.Operation)
@@ -404,7 +432,7 @@ public static class ScanDiagnosticsFormatter
     }
 
     /// <summary>Multi-line plain text for the diagnostics panel (monospace friendly, one screenshot).</summary>
-    public static string Summary(ScanDiagnosticsSnapshot s)
+    public static string Summary(ScanDiagnosticsSnapshot s, bool includeRecentIssues = true)
     {
         var sb = new StringBuilder();
         string runShort = s.RunId.Length > 8 ? s.RunId.Substring(0, 8) : s.RunId;
@@ -417,8 +445,8 @@ public static class ScanDiagnosticsFormatter
             sb.AppendLine($"PLANNER  requests {p.RequestsUsed}/{p.RequestBudget} · candidates {p.Candidates} (target {p.TargetPartitions - 1}+) · step: {(string.IsNullOrEmpty(p.Step) ? "-" : p.Step)} · {(p.Finished ? "finished" : "running")} · elapsed {Clock(p.ElapsedSeconds)}"
                 + (p.TimeLimitSeconds > 0 ? $" / limit {Clock(p.TimeLimitSeconds)}" : " / no limit")
                 + $" · method {p.Method} · ranges {p.Ranges}");
-            sb.AppendLine($"         request errors {p.RequestErrors} · time limit hit: {(p.TimedOut ? "YES" : "no")} · shared-prefix jump: {p.JumpMode}");
-            if (!string.IsNullOrEmpty(p.LastError)) sb.AppendLine($"         last planner error: {p.LastError}");
+            sb.AppendLine($"         skipped requests {p.RequestErrors} · time limit hit: {(p.TimedOut ? "YES" : "no")} · shared-prefix jump: {p.JumpMode}");
+            if (!string.IsNullOrEmpty(p.LastError)) sb.AppendLine($"         last planner issue: {p.LastError}");
         }
         else
         {
@@ -426,12 +454,23 @@ public static class ScanDiagnosticsFormatter
         }
         foreach (var b in new[] { s.BucketA, s.BucketB })
         {
-            sb.AppendLine($"BUCKET {b.Side}  {b.Bucket}: requests {b.Requests:N0} · {b.RequestsPerSecond:0.0}/s (limit {(b.RateLimitPerSecond > 0 ? b.RateLimitPerSecond.ToString("0.#", CultureInfo.InvariantCulture) + "/s" : "none")}) · in flight {b.InFlight} · latency avg {b.AvgLatencyMs:N0} ms, last {b.LastLatencyMs:N0} ms, max {b.MaxLatencyMs:N0} ms · throttle wait {b.ThrottleWaitSeconds:0.0} s · errors {b.Errors}");
+            sb.AppendLine($"BUCKET {b.Side}  {b.Bucket}: requests {b.Requests:N0} · {b.RequestsPerSecond:0.0}/s (limit {(b.RateLimitPerSecond > 0 ? b.RateLimitPerSecond.ToString("0.#", CultureInfo.InvariantCulture) + "/s" : "none")}) · in flight {b.InFlight} · latency avg {b.AvgLatencyMs:N0} ms, last {b.LastLatencyMs:N0} ms, max {b.MaxLatencyMs:N0} ms · throttle wait {b.ThrottleWaitSeconds:0.0} s · retried {b.Retried} (recovered {b.Recovered}) · failed {b.Errors}");
         }
         sb.AppendLine($"PARTITIONS {s.PartitionsCompleted}/{s.PartitionsTotal} done · {s.PartitionsActive} active · {s.PartitionsQueued} queued · {s.ObjectsCompared:N0} objects compared");
         sb.AppendLine($"OLDEST IN FLIGHT  S3: {(s.OldestS3 == null ? "none" : s.OldestS3.ToString())}");
         sb.AppendLine($"                  DB: {(s.OldestDb == null ? "none" : s.OldestDb.ToString())}");
-        sb.Append($"LAST ERROR  {(string.IsNullOrEmpty(s.LastError) ? "none" : s.LastError)}");
+        sb.AppendLine(s.Issues.Text);
+        sb.Append($"MOST SEVERE  {(s.TopIssue == null ? "none" : s.TopIssue.Display)}");
+        if (includeRecentIssues && s.RecentIssues.Count > 0)
+        {
+            sb.AppendLine().AppendLine();
+            sb.AppendLine($"RECENT ISSUES (last {s.RecentIssues.Count}, newest first)");
+            for (int i = 0; i < s.RecentIssues.Count; i++)
+            {
+                sb.Append("  ").Append(s.RecentIssues[i].Line);
+                if (i < s.RecentIssues.Count - 1) sb.AppendLine();
+            }
+        }
         return sb.ToString();
     }
 }
@@ -439,31 +478,28 @@ public static class ScanDiagnosticsFormatter
 /// <summary>Per-scan collector: phase, current operation, last error, in-flight tracking and bucket metrics.</summary>
 public sealed class ScanDiagnostics
 {
-    private string? _lastError;
     private volatile string _operation = string.Empty;
     private int _phase;
 
     public InFlightTracker InFlight { get; } = new();
+    public ScanIssues Issues { get; } = new();
     public BucketMetrics BucketA { get; private set; }
     public BucketMetrics BucketB { get; private set; }
 
     public ScanDiagnostics()
     {
-        BucketA = new BucketMetrics("A", string.Empty, 0, RecordError);
-        BucketB = new BucketMetrics("B", string.Empty, 0, RecordError);
+        BucketA = new BucketMetrics("A", string.Empty, 0);
+        BucketB = new BucketMetrics("B", string.Empty, 0);
     }
 
     public void ConfigureBuckets(string bucketA, string bucketB, double rateLimit)
     {
-        BucketA = new BucketMetrics("A", bucketA, rateLimit, RecordError);
-        BucketB = new BucketMetrics("B", bucketB, rateLimit, RecordError);
+        BucketA = new BucketMetrics("A", bucketA, rateLimit);
+        BucketB = new BucketMetrics("B", bucketB, rateLimit);
     }
 
     public ScanPhase Phase { get => (ScanPhase)Volatile.Read(ref _phase); set => Volatile.Write(ref _phase, (int)value); }
     public string Operation { get => _operation; set => _operation = value; }
-    public string? LastError => Volatile.Read(ref _lastError);
-
-    public void RecordError(string message) => Volatile.Write(ref _lastError, $"{DateTime.UtcNow:HH:mm:ss}Z {message}");
 }
 
 /// <summary>Task helpers for abandoning calls that ignore cancellation.</summary>

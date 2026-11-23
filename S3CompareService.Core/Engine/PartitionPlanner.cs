@@ -57,6 +57,7 @@ public sealed class PartitionPlanner
     private readonly TimeSpan _maxPlanningTime;
     private readonly TimeSpan _requestTimeout;
     private readonly Action<string, string>? _log;
+    private readonly ScanIssues? _issues;
     private readonly SemaphoreSlim _gate = new(MaxConcurrentPlannerRequests);
     private readonly CancellationTokenSource _deadline = new();
     private readonly Stopwatch _clock = new();
@@ -83,7 +84,8 @@ public sealed class PartitionPlanner
         Func<CancellationToken, Task>? pauseGate = null,
         TimeSpan? maxPlanningTime = null,
         TimeSpan? requestTimeout = null,
-        Action<string, string>? log = null)
+        Action<string, string>? log = null,
+        ScanIssues? issues = null)
     {
         _a = new Side(listerA ?? throw new ArgumentNullException(nameof(listerA)), bucketA, prefixA ?? string.Empty, limiterA, "A");
         _b = new Side(listerB ?? throw new ArgumentNullException(nameof(listerB)), bucketB, prefixB ?? string.Empty, limiterB, "B");
@@ -94,6 +96,7 @@ public sealed class PartitionPlanner
         _maxPlanningTime = maxPlanningTime is { } t && t > TimeSpan.Zero ? t : TimeSpan.Zero;
         _requestTimeout = requestTimeout is { } r && r > TimeSpan.Zero ? r : DefaultRequestTimeout;
         _log = log;
+        _issues = issues;
     }
 
     /// <summary>S3 requests sent by <see cref="PlanAsync"/>.</summary>
@@ -203,8 +206,13 @@ public sealed class PartitionPlanner
                 ranges = BuildRanges(candidates.ToList(), _targetPartitions);
             }
             _rangeCount = ranges.Count;
-            if (_errors > MaxLoggedErrors) _log?.Invoke("WARN", $"Planner: {_errors - MaxLoggedErrors} further request error(s) were not logged individually ({_errors} in total).");
-            if (_timedOut) _log?.Invoke("WARN", $"Planner: the {_maxPlanningTime.TotalSeconds:0} s planning time limit was reached; using the {CandidateCount} candidate(s) found so far ({RequestsUsed}/{_maxRequests} requests). The scan is still complete, only the range balance may be worse.");
+            if (_errors > MaxLoggedErrors) _log?.Invoke("WARN", $"Planner: {_errors - MaxLoggedErrors} further skipped request(s) were not logged individually ({_errors} in total).");
+            if (_timedOut)
+            {
+                string degraded = $"planner time limit of {_maxPlanningTime.TotalSeconds:0} s reached — using the {CandidateCount} candidate range boundaries found so far ({RequestsUsed}/{_maxRequests} requests); the scan is still complete and results are unaffected, only the range balance (speed) may be worse";
+                _issues?.Record(IssueOutcome.Degraded, degraded, log: false);
+                _log?.Invoke("WARN", $"{ScanIssues.Label(IssueOutcome.Degraded)}: Planner: the {_maxPlanningTime.TotalSeconds:0} s planning time limit was reached; using the {CandidateCount} candidate(s) found so far ({RequestsUsed}/{_maxRequests} requests). The scan is still complete and results are unaffected, only the range balance (speed) may be worse.");
+            }
             return ranges;
         }
         finally
@@ -258,15 +266,19 @@ public sealed class PartitionPlanner
     private void ReportError(Side side, string what, string reason, int jumpState)
     {
         int n = Interlocked.Increment(ref _errors);
-        string msg = $"bucket {side.Name} {what}: {reason}";
-        _lastError = msg;
-        if (n <= MaxLoggedErrors) _log?.Invoke("WARN", $"Planner request failed ({msg}); it is skipped and planning continues.");
+        string msg = $"planner request bucket {side.Name} {what}: {reason} — planning continued; the plan is still complete and results are unaffected (only split quality may be lower)";
+        string jumpNote = string.Empty;
         if (jumpState >= 0 && Interlocked.CompareExchange(ref _jumpState, jumpState + 1, jumpState) == jumpState)
         {
-            _log?.Invoke("WARN", jumpState == 0
+            jumpNote = jumpState == 0
                 ? $"Planner: the shared-prefix check (StartAfter = prefix + U+10FFFF) failed on bucket {side.Name} ({reason}); falling back to the '~' marker for the rest of this plan."
-                : $"Planner: the shared-prefix check also failed with the '~' marker on bucket {side.Name} ({reason}); the jump is disabled for the rest of this plan and probing continues without it.");
+                : $"Planner: the shared-prefix check also failed with the '~' marker on bucket {side.Name} ({reason}); the jump is disabled for the rest of this plan and probing continues without it.";
+            msg += jumpState == 0 ? "; shared-prefix jump fell back to the '~' marker" : "; shared-prefix jump disabled for this plan";
         }
+        _lastError = ScanIssues.Label(IssueOutcome.Skipped) + ": " + msg;
+        _issues?.Record(IssueOutcome.Skipped, msg, log: false);
+        if (n <= MaxLoggedErrors) _log?.Invoke("WARN", $"{_lastError}.");
+        if (jumpNote.Length > 0) _log?.Invoke("WARN", jumpNote);
     }
 
     // ---------------- 1. delimiter discovery ----------------

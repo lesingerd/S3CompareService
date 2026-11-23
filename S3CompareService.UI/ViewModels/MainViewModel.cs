@@ -45,12 +45,15 @@ public class MainViewModel : ViewModelBase
             {
                 OnPropertyChanged(nameof(DiagnosticsSummary));
                 OnPropertyChanged(nameof(DiagnosticsPartitionsNote));
+                OnPropertyChanged(nameof(DiagnosticsIssuesText));
             }
         }
     }
     public string DiagnosticsSummary => _diagnostics == null
         ? "No scan is active. Start a scan (Comparison Jobs, Run Now) and this tab shows its phase, planner, request rates, partitions and in-flight operations."
-        : ScanDiagnosticsFormatter.Summary(_diagnostics);
+        : ScanDiagnosticsFormatter.Summary(_diagnostics, includeRecentIssues: false);
+    public string DiagnosticsIssuesText => _diagnostics == null ? string.Empty : _diagnostics.Issues.Text;
+    public ObservableCollection<ScanIssueInfo> DiagnosticsRecentIssues { get; } = new();
     public string DiagnosticsPartitionsNote => _diagnostics == null || _diagnostics.PartitionsOmitted <= 0
         ? string.Empty
         : $"Showing {_diagnostics.Partitions.Count} of {_diagnostics.PartitionsTotal} partitions (active first, then queued, then the most recently finished); {_diagnostics.PartitionsOmitted} not shown.";
@@ -469,7 +472,7 @@ public class MainViewModel : ViewModelBase
     {
         if (active == null)
         {
-            if (Diagnostics != null) { Diagnostics = null; DiagnosticsPartitions.Clear(); }
+            if (Diagnostics != null) { Diagnostics = null; DiagnosticsPartitions.Clear(); DiagnosticsRecentIssues.Clear(); }
             return;
         }
         var d = await _client.GetDiagnosticsAsync(active.ScanRunId);
@@ -482,6 +485,12 @@ public class MainViewModel : ViewModelBase
             else DiagnosticsPartitions.Add(d.Partitions[i]);
         }
         while (DiagnosticsPartitions.Count > d.Partitions.Count) DiagnosticsPartitions.RemoveAt(DiagnosticsPartitions.Count - 1);
+        for (int i = 0; i < d.RecentIssues.Count; i++)
+        {
+            if (i < DiagnosticsRecentIssues.Count) DiagnosticsRecentIssues[i] = d.RecentIssues[i];
+            else DiagnosticsRecentIssues.Add(d.RecentIssues[i]);
+        }
+        while (DiagnosticsRecentIssues.Count > d.RecentIssues.Count) DiagnosticsRecentIssues.RemoveAt(DiagnosticsRecentIssues.Count - 1);
     }
 
     private ServiceStatusDto? _lastStatusForScan;
