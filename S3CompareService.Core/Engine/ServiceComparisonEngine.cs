@@ -784,8 +784,9 @@ public class ServiceComparisonEngine
                     }
                     finally
                     {
-                        Interlocked.Decrement(ref busyWorkers);
-                        if (ran) SignalRangeEnded();
+                        // Wake idle workers after a range, and whenever nobody holds one any more (the last check of an idle
+                        // worker may be what kept the count up while the last range ended).
+                        if (Interlocked.Decrement(ref busyWorkers) == 0 || ran) SignalRangeEnded();
                     }
                     if (!splitting) break;
 
