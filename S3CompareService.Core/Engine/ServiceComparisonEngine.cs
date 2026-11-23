@@ -34,6 +34,8 @@ public class ServiceComparisonEngine
     private const long CheckpointIntervalMs = 5000;
     private const long CheckpointEveryItems = 5000; // per worker, so many fast partitions do not checkpoint many times a second
     private const long ProgressIntervalMs = 250;
+    /// <summary>Tries per list request of a scan (SDK retries are off for scan clients; see <see cref="S3Lister"/>).</summary>
+    private const int ScanListAttempts = 3;
 
     private readonly ComparisonJob _job;
     private readonly ScanRun _scanRun;
@@ -86,6 +88,161 @@ public class ServiceComparisonEngine
     private volatile bool _isServiceShutdown = false;
     private TaskCompletionSource<bool>? _pauseTcs;
     private Task _statusPersistTask = Task.CompletedTask;
+
+    // ---- diagnostics (live view for the UI; see ScanDiagnostics.cs) ----
+    private const double SlowDbCallSeconds = 5;
+    private const double SlowS3CallSeconds = 20;
+    private static readonly TimeSpan DbCallTimeout = TimeSpan.FromSeconds(60);
+    private readonly ScanDiagnostics _diag = new();
+    private volatile bool _detached;
+    private volatile PartitionPlanner? _planner;
+    private PlannerStats? _finalPlannerStats;
+
+    /// <summary>
+    /// True once the host gave up on this scan (its cancel did not finish in time) and reported the run as cancelled itself.
+    /// A detached engine writes nothing more to the database: no run state, no checkpoints, no differences, no log lines.
+    /// </summary>
+    public bool IsDetached => _detached;
+
+    /// <summary>Copies the live counters into the run object (used by the host when it has to finish a stuck run itself).</summary>
+    public void SyncRunStats() { try { UpdateLiveStats(); SyncStatsToRun(_scanRun, CloneStats()); } catch { } }
+
+    /// <summary>Marks the engine detached (see <see cref="IsDetached"/>). Call it together with cancelling the scan.</summary>
+    public void Detach()
+    {
+        _detached = true;
+        _diag.Operation = "Detached by the service after a cancel timeout";
+    }
+
+    /// <summary>The operations (S3 requests, database calls) in flight right now, oldest first.</summary>
+    public List<InFlightInfo> GetInFlight() => _diag.InFlight.Snapshot(8);
+
+    private void SetPhase(ScanPhase phase, string? log = null)
+    {
+        var old = _diag.Phase;
+        _diag.Phase = phase;
+        if (old != phase && log != null) _ = LogAsync("INFO", log);
+    }
+
+    /// <summary>Names what the engine is doing and writes it to the audit log, so the log shows where a stuck scan stopped.</summary>
+    private async Task StepAsync(string operation)
+    {
+        _diag.Operation = operation;
+        await LogAsync("INFO", $"Scan step: {operation}").ConfigureAwait(false);
+    }
+
+    /// <summary>A snapshot of the scan for the banner and the diagnostics panel. Safe to call from any thread.</summary>
+    public ScanDiagnosticsSnapshot GetDiagnostics(bool includePartitions = true)
+    {
+        var s = new ScanDiagnosticsSnapshot
+        {
+            RunId = _scanRun.Id,
+            JobName = _job.Name,
+            UnderlyingPhase = _diag.Phase.ToString(),
+            IsPaused = _isPaused,
+            Operation = _diag.Operation,
+            ElapsedSeconds = ElapsedSeconds(),
+            Planner = _planner?.GetStats() ?? _finalPlannerStats ?? new PlannerStats(),
+            BucketA = _diag.BucketA.Snapshot(),
+            BucketB = _diag.BucketB.Snapshot(),
+            InFlight = _diag.InFlight.Snapshot(8),
+            OldestS3 = _diag.InFlight.Oldest("S3"),
+            OldestDb = _diag.InFlight.Oldest("DB"),
+            LastError = _diag.LastError ?? _planner?.LastError ?? _finalPlannerStats?.LastError ?? (string.IsNullOrEmpty(_scanRun.ErrorMessage) ? null : _scanRun.ErrorMessage)
+        };
+        s.Phase = s.IsPaused ? "Paused" : s.UnderlyingPhase;
+
+        var rows = new List<PartitionRow>();
+        lock (_stateLock)
+        {
+            s.ObjectsCompared = _stats.ObjectsCompared;
+            s.PartitionsTotal = _ranges.Count;
+            s.PartitionsCompleted = _ranges.Count(r => r.Completed);
+            s.PartitionsActive = _ranges.Count(r => r.Active && !r.Completed);
+            s.PartitionsQueued = s.PartitionsTotal - s.PartitionsCompleted - s.PartitionsActive;
+            if (includePartitions)
+            {
+                // All active ranges first, then the next queued ones, then the most recently finished, up to the cap; shown in key order.
+                var picked = new HashSet<int>();
+                void Take(IEnumerable<int> idx) { foreach (var i in idx) { if (picked.Count >= ScanDiagnosticsFormatter.MaxPartitionRows) return; picked.Add(i); } }
+                var all = Enumerable.Range(0, _ranges.Count).ToList();
+                Take(all.Where(i => _ranges[i].Active && !_ranges[i].Completed));
+                Take(all.Where(i => !_ranges[i].Active && !_ranges[i].Completed));
+                Take(Enumerable.Reverse(all).Where(i => _ranges[i].Completed));
+                foreach (int i in picked.OrderBy(i => i))
+                {
+                    var r = _ranges[i];
+                    rows.Add(new PartitionRow
+                    {
+                        Index = i,
+                        Lower = r.Lower ?? "(start)",
+                        Upper = r.Upper ?? "(end)",
+                        State = r.Completed ? "done" : r.Active ? "active" : "queued",
+                        LastCompletedKey = r.LastCompletedKey ?? string.Empty,
+                        ObjectsCompared = r.ObjectsCompared
+                    });
+                }
+                s.PartitionsOmitted = _ranges.Count - rows.Count;
+            }
+        }
+        foreach (var r in rows)
+        {
+            r.Lower = InstrumentedLister.Clip(r.Lower);
+            r.Upper = InstrumentedLister.Clip(r.Upper);
+            r.LastCompletedKey = InstrumentedLister.Clip(r.LastCompletedKey);
+        }
+        s.Partitions = rows;
+        s.PhaseText = ScanDiagnosticsFormatter.PhaseText(s);
+        return s;
+    }
+
+    /// <summary>Every database call goes through here: tracked as in flight, bounded, abandoned on cancel, refused once detached, slow calls logged.</summary>
+    private async Task<T> DbAsync<T>(string operation, Func<Task<T>> work, CancellationToken ct)
+    {
+        if (_detached) throw new OperationCanceledException("The run was detached after a cancel timeout; it writes nothing more.");
+        using var scope = _diag.InFlight.Begin("DB", operation);
+        long start = Stopwatch.GetTimestamp();
+        try
+        {
+            // WaitAsync: a call that blocks or ignores its token must not hold up a cancel; it is abandoned after the timeout.
+            return await work().WaitUnlessDoneAsync(DbCallTimeout, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            double seconds = Stopwatch.GetElapsedTime(start).TotalSeconds;
+            if (seconds >= SlowDbCallSeconds && Volatile.Read(ref scope.Op.Warned) == 0)
+                _ = LogAsync("WARN", $"Database call '{operation}' took {seconds:0.0} s.");
+        }
+    }
+
+    private async Task DbAsync(string operation, Func<Task> work, CancellationToken ct)
+    {
+        await DbAsync<bool>(operation, async () => { await work().ConfigureAwait(false); return true; }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs while the scan runs: raises progress about once a second (the workers only do so while comparing, so planning would
+    /// otherwise be silent), and logs S3 requests and database calls that have been in flight too long, once each.
+    /// </summary>
+    private async Task MonitorAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1));
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                UpdateLiveStats();
+                RaiseProgress();
+                foreach (var op in _diag.InFlight.TakeNewlyOverdue("DB", SlowDbCallSeconds))
+                    _ = LogAsync("WARN", $"Database call '{op.Description}' has been running for {op.AgeSeconds:0} s and has not finished.");
+                foreach (var op in _diag.InFlight.TakeNewlyOverdue("S3", SlowS3CallSeconds))
+                    _ = LogAsync("WARN", $"S3 request has been in flight for {op.AgeSeconds:0} s (attempt {op.Attempt}): {op.Description}");
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch { /* diagnostics must never break a scan */ }
+    }
+
 
     /// <summary>
     /// Raised about every 250 ms from whichever worker is due (one at a time), and once at the end. Runs on a worker thread
@@ -267,7 +424,7 @@ public class ServiceComparisonEngine
         {
             try
             {
-                await _scanRunRepo.UpdateProgressAsync(_scanRun, CancellationToken.None).ConfigureAwait(false);
+                await DbAsync("UpdateProgressAsync", () => _scanRunRepo.UpdateProgressAsync(_scanRun, CancellationToken.None), CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -303,10 +460,12 @@ public class ServiceComparisonEngine
 
     private async Task LogAsync(string level, string message, string? details = null)
     {
-        if (_auditLogRepo == null) return;
+        if (_auditLogRepo == null || _detached) return;
         try
         {
-            await _auditLogRepo.LogAsync(level, "ScanEngine", message, details: details, scanRunId: _scanRun.Id, jobId: _job.Id, cancellationToken: CancellationToken.None).ConfigureAwait(false);
+            // Tracked and bounded: a blocked database must not hang the scan through its own log lines.
+            using var scope = _diag.InFlight.Begin("DB", "Audit log write");
+            await _auditLogRepo.LogAsync(level, "ScanEngine", message, details: details, scanRunId: _scanRun.Id, jobId: _job.Id, cancellationToken: CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false);
         }
         catch
         {
@@ -366,12 +525,18 @@ public class ServiceComparisonEngine
 
         string? prefixA = string.IsNullOrEmpty(_job.BucketA.Prefix) ? null : _job.BucketA.Prefix;
         string? prefixB = string.IsNullOrEmpty(_job.BucketB.Prefix) ? null : _job.BucketB.Prefix;
+        _diag.ConfigureBuckets(_job.BucketA.BucketName, _job.BucketB.BucketName, _options.MaxListRequestsPerSecond);
+        _diag.Phase = ScanPhase.Preparing;
+        _diag.Operation = "Starting";
+        using var monitorCts = new CancellationTokenSource();
+        var monitorTask = Task.Run(() => MonitorAsync(monitorCts.Token));
 
         try
         {
+            await StepAsync("Preparing run state").ConfigureAwait(false);
             await PrepareRunStateAsync(cancellationToken).ConfigureAwait(false);
 
-            await _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken).ConfigureAwait(false);
+            await DbAsync("UpdateProgressAsync", () => _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken), cancellationToken).ConfigureAwait(false);
             if (_checkpointDiscarded)
             {
                 await LogAsync("WARN", $"Checkpoint for run '{_scanRun.Id}' was discarded ({CheckpointDiscardReason}); starting a fresh scan.").ConfigureAwait(false);
@@ -387,24 +552,30 @@ public class ServiceComparisonEngine
 
             if (!UsesProvidedStreams)
             {
+                await StepAsync("Creating S3 clients").ConfigureAwait(false);
                 int connections = S3ClientFactory.ConnectionsForScan(_options.MaxParallelPartitions, _job.Mode == ComparisonMode.FullData ? _options.MaxConcurrentContentChecks : 0);
                 _listerA = _providedListerA;
                 _listerB = _providedListerB;
                 if (_listerA == null)
                 {
-                    _clientA = S3ClientFactory.CreateClient(_job.BucketA, connections);
-                    _listerA = new S3Lister(_clientA);
+                    _clientA = S3ClientFactory.CreateClient(_job.BucketA, connections, maxErrorRetry: 0);
+                    _listerA = new S3Lister(_clientA, maxAttempts: ScanListAttempts);
                 }
                 if (_listerB == null)
                 {
-                    _clientB = S3ClientFactory.CreateClient(_job.BucketB, connections);
-                    _listerB = new S3Lister(_clientB);
+                    _clientB = S3ClientFactory.CreateClient(_job.BucketB, connections, maxErrorRetry: 0);
+                    _listerB = new S3Lister(_clientB, maxAttempts: ScanListAttempts);
                 }
                 // One limiter per bucket side for the whole scan: every partition, the planner and content reads share it.
-                _limiterA = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
-                _limiterB = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
                 _readerA = _listerA as IS3ObjectReader;
                 _readerB = _listerB as IS3ObjectReader;
+                _limiterA = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
+                _limiterB = TokenBucketRateLimiter.Create(_options.MaxListRequestsPerSecond);
+                // Every list request and every wait in the limiter is counted and timed for the diagnostics panel.
+                _listerA = new InstrumentedLister(_listerA, _diag.BucketA, _diag.InFlight);
+                _listerB = new InstrumentedLister(_listerB, _diag.BucketB, _diag.InFlight);
+                if (_limiterA != null) _limiterA = new InstrumentedLimiter(_limiterA, _diag.BucketA);
+                if (_limiterB != null) _limiterB = new InstrumentedLimiter(_limiterB, _diag.BucketB);
 
                 if (_resumeRanges == null)
                 {
@@ -426,7 +597,12 @@ public class ServiceComparisonEngine
                 _stats.PartitionsCompleted = _ranges.Count(r => r.Completed);
             }
 
+            SetPhase(ScanPhase.Scanning, $"Scan phase: Scanning ({_stats.PartitionsTotal} key range(s), {_stats.PartitionsCompleted} already done, up to {Math.Min(_options.MaxParallelPartitions, Math.Max(1, _stats.PartitionsTotal - _stats.PartitionsCompleted))} worker(s)).");
+
             await RunPartitionsAsync(prefixA, prefixB, cancellationToken).ConfigureAwait(false);
+
+            SetPhase(ScanPhase.Finalizing, "Scan phase: Finalizing (all key ranges compared; writing the final results).");
+            _diag.Operation = "Finalizing: flushing differences and metadata";
 
             // Flush any remaining differences
             await FlushDifferencesAsync(cancellationToken).ConfigureAwait(false);
@@ -451,8 +627,8 @@ public class ServiceComparisonEngine
             SyncStatsToRun(_scanRun, CloneStats());
 
             await ObserveStatusPersistAsync().ConfigureAwait(false);
-            await _scanRunRepo.CompleteAsync(_scanRun, cancellationToken).ConfigureAwait(false);
-            await _scanRunRepo.DeleteCheckpointAsync(_scanRun.Id, cancellationToken).ConfigureAwait(false);
+            await DbAsync("CompleteAsync", () => _scanRunRepo.CompleteAsync(_scanRun, cancellationToken), cancellationToken).ConfigureAwait(false);
+            await DbAsync("DeleteCheckpointAsync", () => _scanRunRepo.DeleteCheckpointAsync(_scanRun.Id, cancellationToken), cancellationToken).ConfigureAwait(false);
 
             await LogAsync("INFO", $"Scan run '{_scanRun.Id}' completed successfully: {_scanRun.ObjectsCompared:N0} objects evaluated, {_scanRun.MatchedCount:N0} matched, {_scanRun.TotalDifferences:N0} raw diffs ({_scanRun.FilteredDifferencesCount:N0} confirmed disparities, {_scanRun.InFlightDifferencesCount:N0} in-flight replication).").ConfigureAwait(false);
         }
@@ -475,6 +651,7 @@ public class ServiceComparisonEngine
         }
         catch (Exception ex)
         {
+            _diag.RecordError($"Run failed: {ex.GetType().Name}: {ex.Message}");
             await FinalizeRunAsync(RunStatus.Failed, $"{ex.GetType().Name}: {ex.Message}").ConfigureAwait(false);
             await LogAsync("ERROR", $"Scan run '{_scanRun.Id}' failed with error: {ex.Message}", ex.StackTrace).ConfigureAwait(false);
             throw;
@@ -482,6 +659,7 @@ public class ServiceComparisonEngine
         finally
         {
             _stopwatch.Stop();
+            try { monitorCts.Cancel(); await monitorTask.ConfigureAwait(false); } catch { }
             try { if (_providedStreamA != null) await _providedStreamA.DisposeAsync().ConfigureAwait(false); } catch { }
             try { if (_providedStreamB != null) await _providedStreamB.DisposeAsync().ConfigureAwait(false); } catch { }
             try { _clientA?.Dispose(); } catch { }
@@ -498,19 +676,33 @@ public class ServiceComparisonEngine
     {
         if (_options.MaxParallelPartitions <= 1 || _options.MaxDiscoveryRequests <= 0)
         {
+            await LogAsync("INFO", _options.MaxParallelPartitions <= 1
+                ? "Planning skipped: MaxParallelPartitions is 1, so the scan runs as one key range."
+                : "Planning skipped: MaxDiscoveryRequests is 0, so the scan runs as one key range.").ConfigureAwait(false);
             return PartitionPlanner.BuildRanges(Array.Empty<string>(), 1);
         }
 
+        var limit = _options.MaxPlanningSeconds > 0 ? TimeSpan.FromSeconds(_options.MaxPlanningSeconds) : (TimeSpan?)null;
         var planner = new PartitionPlanner(
             _listerA!, _job.BucketA.BucketName, prefixA, _limiterA,
             _listerB!, _job.BucketB.BucketName, prefixB, _limiterB,
             _options.TargetPartitions, _options.MaxDiscoveryDepth, _options.MaxDiscoveryRequests,
-            pauseGate: CheckPauseAsync);
+            pauseGate: CheckPauseAsync,
+            maxPlanningTime: limit,
+            log: (level, message) => _ = LogAsync(level, message));
+        _planner = planner;
+        SetPhase(ScanPhase.Planning);
+        _diag.Operation = "Planning key ranges";
+        await LogAsync("INFO",
+            $"Planning started for run '{_scanRun.Id}': request budget {_options.MaxDiscoveryRequests}, target {_options.TargetPartitions} key range(s) for {_options.MaxParallelPartitions} parallel worker(s), "
+            + $"rate limit {(_options.MaxListRequestsPerSecond > 0 ? _options.MaxListRequestsPerSecond.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + " requests/s per bucket" : "unlimited")}, "
+            + $"time limit {(limit == null ? "none" : _options.MaxPlanningSeconds + " s")}, max depth {_options.MaxDiscoveryDepth}, "
+            + $"prefix A '{prefixA ?? string.Empty}', prefix B '{prefixB ?? string.Empty}', per-request timeout {PartitionPlanner.DefaultRequestTimeout.TotalSeconds:0} s.").ConfigureAwait(false);
         var sw = Stopwatch.StartNew();
         try
         {
             var plan = await planner.PlanAsync(ct).ConfigureAwait(false);
-            await LogAsync("INFO", $"Partition plan for run '{_scanRun.Id}': {plan.Count} key range(s) for {_options.MaxParallelPartitions} parallel worker(s) (method: {planner.Method}, {planner.CandidateCount} candidate boundaries, {planner.RequestsUsed} planning requests, {sw.ElapsedMilliseconds} ms).").ConfigureAwait(false);
+            await LogAsync("INFO", $"Partition plan for run '{_scanRun.Id}': {plan.Count} key range(s) for {_options.MaxParallelPartitions} parallel worker(s) (method: {planner.Method}, {planner.CandidateCount} candidate boundaries, {planner.RequestsUsed} planning requests, {planner.RequestErrors} request error(s){(planner.TimedOut ? ", time limit reached" : string.Empty)}{(planner.JumpDisabled ? ", shared-prefix jump disabled" : string.Empty)}, {sw.ElapsedMilliseconds} ms).").ConfigureAwait(false);
             return plan;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -519,8 +711,14 @@ public class ServiceComparisonEngine
         }
         catch (Exception ex)
         {
+            _diag.RecordError($"Planning failed: {ex.Message}");
             await LogAsync("WARN", $"Partition planning failed for run '{_scanRun.Id}' ({ex.Message}); scanning as one key range.", ex.StackTrace).ConfigureAwait(false);
             return PartitionPlanner.BuildRanges(Array.Empty<string>(), 1);
+        }
+        finally
+        {
+            _finalPlannerStats = planner.GetStats();
+            _planner = null;
         }
     }
 
@@ -534,6 +732,8 @@ public class ServiceComparisonEngine
         var queue = new ConcurrentQueue<PartitionRange>(pending);
         int workerCount = UsesProvidedStreams ? 1 : Math.Clamp(_options.MaxParallelPartitions, 1, pending.Count);
         _checkpointItemThreshold = CheckpointEveryItems * workerCount;
+        _diag.Operation = $"Workers running ({workerCount})";
+        await LogAsync("INFO", $"Scan step: Workers started ({workerCount} worker(s) for {pending.Count} unfinished key range(s)).").ConfigureAwait(false);
         using var workersCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var errors = new ConcurrentQueue<Exception>();
 
@@ -615,7 +815,7 @@ public class ServiceComparisonEngine
             long unusedIdCounter = 0;
             cursor.GapDetector.CheckKey(after, _scanRun.Id, ref unusedIdCounter); // primes the series; reports nothing
         }
-        lock (_stateLock) _stats.PartitionsActive++;
+        lock (_stateLock) { _stats.PartitionsActive++; range.Active = true; }
         try
         {
             bool hasA = await enumA.MoveNextAsync(ct).ConfigureAwait(false);
@@ -684,7 +884,7 @@ public class ServiceComparisonEngine
         }
         finally
         {
-            lock (_stateLock) _stats.PartitionsActive--;
+            lock (_stateLock) { _stats.PartitionsActive--; range.Active = false; }
             if (ownsStreams)
             {
                 lock (_stateLock)
@@ -721,7 +921,7 @@ public class ServiceComparisonEngine
         {
             // Drops differences flushed after each range's checkpointed key (they will be recreated) and, for a legacy
             // "new run id" resume, adopts the old run's differences and marks the old run superseded.
-            int removed = await _scanRunRepo.PrepareResumeAsync(_scanRun.Id, _resumeCheckpoint.ScanRunId, _resumeRanges!, ct).ConfigureAwait(false);
+            int removed = await DbAsync("PrepareResumeAsync", () => _scanRunRepo.PrepareResumeAsync(_scanRun.Id, _resumeCheckpoint.ScanRunId, _resumeRanges!, ct), ct).ConfigureAwait(false);
             if (removed > 0)
             {
                 await LogAsync("INFO", $"Resume: removed {removed} difference(s) recorded after the checkpoint (frontier key '{FrontierKey()}', {_resumeRanges!.Count} range(s)) to avoid duplicates.").ConfigureAwait(false);
@@ -730,7 +930,7 @@ public class ServiceComparisonEngine
         else if (_scanRun.ResumeCount > 0 || _scanRun.IsResumedFromCheckpoint || _checkpointDiscarded)
         {
             // Re-opened run without a usable checkpoint: restart from scratch under the same id.
-            await _scanRunRepo.ResetRunDataAsync(_scanRun.Id, ct).ConfigureAwait(false);
+            await DbAsync("ResetRunDataAsync", () => _scanRunRepo.ResetRunDataAsync(_scanRun.Id, ct), ct).ConfigureAwait(false);
             _scanRun.IsResumedFromCheckpoint = false;
             _scanRun.ResumedFromKey = null;
             _scanRun.LastEvaluatedKey = string.Empty;
@@ -745,7 +945,7 @@ public class ServiceComparisonEngine
     {
         Task t;
         lock (_pauseLock) { t = _statusPersistTask; }
-        try { await t.ConfigureAwait(false); } catch { }
+        try { await t.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false); } catch { }
     }
 
     /// <summary>
@@ -786,7 +986,7 @@ public class ServiceComparisonEngine
 
         try
         {
-            await _scanRunRepo.CompleteAsync(_scanRun, CancellationToken.None).ConfigureAwait(false);
+            await DbAsync("CompleteAsync", () => _scanRunRepo.CompleteAsync(_scanRun, CancellationToken.None), CancellationToken.None).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -969,6 +1169,7 @@ public class ServiceComparisonEngine
             }
 
             cursor.Range.LastCompletedKey = relKey;
+            cursor.Range.ObjectsCompared++;
         }
 
         if (truncatedNow)
@@ -1028,7 +1229,7 @@ public class ServiceComparisonEngine
         {
             try
             {
-                await _diffRepo.InsertBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+                await DbAsync("InsertBatchAsync", () => _diffRepo.InsertBatchAsync(batch, cancellationToken), cancellationToken).ConfigureAwait(false);
                 return;
             }
             catch (Exception ex) when (attempt < 3 && !cancellationToken.IsCancellationRequested)
@@ -1113,7 +1314,7 @@ public class ServiceComparisonEngine
                 MaxSequenceGapThreshold = _job.MaxSequenceGapThreshold
             };
 
-            await _scanRunRepo.SaveCheckpointAsync(cp, cancellationToken).ConfigureAwait(false);
+            await DbAsync("SaveCheckpointAsync", () => _scanRunRepo.SaveCheckpointAsync(cp, cancellationToken), cancellationToken).ConfigureAwait(false);
 
             // The run row carries the same snapshot, so its counters always match the differences stored for it.
             if (_scanRun.Status is RunStatus.Running or RunStatus.Paused)
@@ -1121,7 +1322,7 @@ public class ServiceComparisonEngine
                 _scanRun.LastEvaluatedKey = frontier;
                 snap.ElapsedTime = TimeSpan.FromSeconds(cp.ElapsedSeconds);
                 SyncStatsToRun(_scanRun, snap);
-                await _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken).ConfigureAwait(false);
+                await DbAsync("UpdateProgressAsync", () => _scanRunRepo.UpdateProgressAsync(_scanRun, cancellationToken), cancellationToken).ConfigureAwait(false);
             }
 
             lock (_stateLock)
@@ -1241,8 +1442,8 @@ public class ServiceComparisonEngine
                 NewestLastModifiedUtc = newestB
             };
 
-            await _scanRunRepo.SaveMetadataSnapshotAsync(snapA, cancellationToken).ConfigureAwait(false);
-            await _scanRunRepo.SaveMetadataSnapshotAsync(snapB, cancellationToken).ConfigureAwait(false);
+            await DbAsync("SaveMetadataSnapshotAsync", () => _scanRunRepo.SaveMetadataSnapshotAsync(snapA, cancellationToken), cancellationToken).ConfigureAwait(false);
+            await DbAsync("SaveMetadataSnapshotAsync", () => _scanRunRepo.SaveMetadataSnapshotAsync(snapB, cancellationToken), cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

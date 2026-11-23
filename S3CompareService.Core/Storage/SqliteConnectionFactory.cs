@@ -5,6 +5,9 @@ namespace S3CompareService.Core.Storage;
 
 public class SqliteConnectionFactory
 {
+    /// <summary>The longest a SQLite command may run (also "Default Timeout" in the connection string).</summary>
+    public const int DefaultCommandTimeoutSeconds = 30;
+
     private readonly string _connectionString;
 
     public SqliteConnectionFactory(string? connectionString = null)
@@ -15,6 +18,8 @@ public class SqliteConnectionFactory
     public async Task<SqliteConnection> CreateOpenConnectionAsync(CancellationToken cancellationToken = default)
     {
         var conn = new SqliteConnection(_connectionString);
+        // Waits are finite: a locked database is retried for 10 s (busy_timeout) and a command never runs longer than 30 s.
+        conn.DefaultTimeout = DefaultCommandTimeoutSeconds;
         await conn.OpenAsync(cancellationToken).ConfigureAwait(false);
 
         // Ensure WAL mode and reasonable busy timeout

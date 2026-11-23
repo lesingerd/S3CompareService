@@ -1,3 +1,4 @@
+using Amazon.Runtime;
 using Amazon.S3;
 using Amazon.S3.Model;
 using S3CompareService.Core.Models;
@@ -49,11 +50,42 @@ public interface IS3ObjectReader
 public sealed class S3Lister : IS3Lister, IS3ObjectReader
 {
     private readonly IAmazonS3 _client;
+    private readonly int _maxAttempts;
 
-    public S3Lister(IAmazonS3 client)
+    /// <param name="client">The SDK client. Does not own it.</param>
+    /// <param name="maxAttempts">Tries per call (1 = no retry). The scan uses clients without SDK retries and retries here, so each attempt shows in the diagnostics.</param>
+    public S3Lister(IAmazonS3 client, int maxAttempts = 1)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
+        _maxAttempts = Math.Max(1, maxAttempts);
     }
+
+    /// <summary>Retries a call on transient failures (5xx, throttling, timeouts, network errors) with a short back-off, reporting the attempt number.</summary>
+    private async Task<T> WithRetryAsync<T>(Func<Task<T>> call, CancellationToken ct)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            var op = InFlightTracker.CurrentRequest.Value;
+            if (op != null) op.Attempt = attempt;
+            try
+            {
+                return await call().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (attempt < _maxAttempts && !ct.IsCancellationRequested && IsTransient(ex))
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(5000, 400 * Math.Pow(2, attempt - 1))), ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>True for failures worth another try: server errors, throttling, timeouts and network errors (not 4xx such as AccessDenied).</summary>
+    public static bool IsTransient(Exception ex) => ex switch
+    {
+        AmazonServiceException s => (int)s.StatusCode >= 500 || (int)s.StatusCode is 408 or 429 || (s.ErrorCode?.Contains("SlowDown", StringComparison.OrdinalIgnoreCase) ?? false) || (s.ErrorCode?.Contains("Throttl", StringComparison.OrdinalIgnoreCase) ?? false) || (s.ErrorCode?.Contains("RequestTimeout", StringComparison.OrdinalIgnoreCase) ?? false),
+        Amazon.Runtime.AmazonClientException => true,
+        HttpRequestException or IOException or TimeoutException or TaskCanceledException => true,
+        _ => false
+    };
 
     public async Task<S3ListPage> ListPageAsync(
         string bucket,
@@ -74,7 +106,7 @@ public sealed class S3Lister : IS3Lister, IS3ObjectReader
             MaxKeys = Math.Clamp(maxKeys, 1, 1000)
         };
 
-        var response = await _client.ListObjectsV2Async(request, cancellationToken).ConfigureAwait(false);
+        var response = await WithRetryAsync(() => _client.ListObjectsV2Async(request, cancellationToken), cancellationToken).ConfigureAwait(false);
         var objects = response.S3Objects ?? new List<S3Object>();
         var items = new List<S3ObjectSummary>(objects.Count);
         foreach (var obj in objects) items.Add(ToSummary(obj));
@@ -91,7 +123,7 @@ public sealed class S3Lister : IS3Lister, IS3ObjectReader
     public async Task<Stream> OpenReadAsync(string bucket, string key, CancellationToken cancellationToken)
     {
         // Disposing the response stream releases the HTTP connection; the response object holds nothing else.
-        var response = await _client.GetObjectAsync(new GetObjectRequest { BucketName = bucket, Key = key }, cancellationToken).ConfigureAwait(false);
+        var response = await WithRetryAsync(() => _client.GetObjectAsync(new GetObjectRequest { BucketName = bucket, Key = key }, cancellationToken), cancellationToken).ConfigureAwait(false);
         return response.ResponseStream;
     }
 
