@@ -215,7 +215,9 @@ public class ParallelScanTests : TestDbBase
         var listerB = new FakeS3Lister(b) { Fault = call => call == 15 ? new InvalidOperationException("AccessDenied (simulated)") : null };
         var job = NewJob();
         var run = await NewRunAsync(job);
-        var engine = new ServiceComparisonEngine(job, run, RunRepo, DiffRepo, AuditRepo, options: Options(6, pageSize: 10), listerA: new FakeS3Lister(a), listerB: listerB);
+        var options = Options(6, pageSize: 10);
+        options.MaxDiscoveryDepth = 1; // one planner listing per bucket, so call 15 is a range listing
+        var engine = new ServiceComparisonEngine(job, run, RunRepo, DiffRepo, AuditRepo, options: options, listerA: new FakeS3Lister(a), listerB: listerB);
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => engine.RunAsync());
         StringAssert.Contains(ex.Message, "AccessDenied");
@@ -575,5 +577,141 @@ public class ParallelScanTests : TestDbBase
         public override long TimestampFrequency => TimeSpan.TicksPerSecond;
         public override long GetTimestamp() => _ticks;
         public void Advance(TimeSpan by) => _ticks += by.Ticks;
+    }
+
+    // ---------------- work stealing (range splitting) ----------------
+
+    private static ScanOptions SplitOptions(int partitions, int pageSize = 10)
+    {
+        var o = Options(partitions, pageSize);
+        o.MaxDiscoveryRequests = 0; // no plan: the whole keyspace is one range, so only splitting can parallelise it
+        o.MinRangeAgeForSplit = TimeSpan.FromMilliseconds(30);
+        o.SplitIdlePoll = TimeSpan.FromMilliseconds(10);
+        return o;
+    }
+
+    [TestMethod]
+    public async Task OneBigRange_IsSplitByIdleWorkers_AndMatchesSingleStream()
+    {
+        var (a, b) = Generate(71, HierarchicalKeys(40, 60));
+        var job = NewJob();
+        var expected = await RunSingleStreamAsync(job, a, b);
+
+        var listerA = new FakeS3Lister(a, TimeSpan.FromMilliseconds(2));
+        var actual = await RunPartitionedAsync(job, listerA, new FakeS3Lister(b, TimeSpan.FromMilliseconds(2)), SplitOptions(4));
+
+        var plan = actual.Engine.GetPartitionsSnapshot();
+        Assert.IsTrue(plan.Count > 1, "idle workers split the single range");
+        Assert.IsNull(PartitionPlanner.ValidateTiling(plan), string.Join(" ", plan));
+        Assert.IsTrue(plan.All(r => r.Completed));
+        Assert.IsTrue(listerA.MaxInFlight > 1, "the halves were listed at the same time");
+        Assert.AreEqual(RunStatus.Completed, actual.Run.Status);
+        AssertSameCounters(expected.Run, actual.Run);
+        CollectionAssert.AreEqual(Shape(expected.Diffs), Shape(actual.Diffs));
+        Assert.AreEqual(actual.Run.TotalDifferences, actual.Diffs.Count);
+    }
+
+    [TestMethod]
+    public async Task OneBigFlatRange_IsSplitByProbing_AndMatchesSingleStream()
+    {
+        var (a, b) = Generate(72, FlatKeys(72, 2500));
+        var job = NewJob();
+        var expected = await RunSingleStreamAsync(job, a, b);
+
+        var actual = await RunPartitionedAsync(job, new FakeS3Lister(a, TimeSpan.FromMilliseconds(2)), new FakeS3Lister(b, TimeSpan.FromMilliseconds(2)), SplitOptions(4));
+
+        var plan = actual.Engine.GetPartitionsSnapshot();
+        Assert.IsTrue(plan.Count > 1, "a flat namespace is split too (probe fallback)");
+        Assert.IsNull(PartitionPlanner.ValidateTiling(plan), string.Join(" ", plan));
+        AssertSameCounters(expected.Run, actual.Run);
+        CollectionAssert.AreEqual(Shape(expected.Diffs), Shape(actual.Diffs));
+    }
+
+    [TestMethod]
+    public async Task LopsidedPlan_IsBalancedBySplitting_AndMatchesSingleStream()
+    {
+        var (a, b) = Generate(75, RangeSplitterTests.Lopsided());
+        var job = NewJob();
+        var expected = await RunSingleStreamAsync(job, a, b);
+
+        var options = SplitOptions(4);
+        options.MaxDiscoveryRequests = 500;
+        options.MaxDiscoveryDepth = 1; // the old shallow plan: one range holds the big folder
+        var actual = await RunPartitionedAsync(job, new FakeS3Lister(a, TimeSpan.FromMilliseconds(2)), new FakeS3Lister(b, TimeSpan.FromMilliseconds(2)), options);
+
+        var plan = actual.Engine.GetPartitionsSnapshot();
+        Assert.IsTrue(plan.Count(r => (r.Lower ?? string.Empty).StartsWith("d/CV/V_", StringComparison.Ordinal)) > 0, "the big folder was split: " + string.Join(" ", plan));
+        Assert.IsNull(PartitionPlanner.ValidateTiling(plan), string.Join(" ", plan));
+        AssertSameCounters(expected.Run, actual.Run);
+        CollectionAssert.AreEqual(Shape(expected.Diffs), Shape(actual.Diffs));
+    }
+
+    [TestMethod]
+    public async Task SplitDisabled_KeepsOneRange()
+    {
+        var (a, b) = Generate(73, HierarchicalKeys(20, 40));
+        var job = NewJob();
+        var options = SplitOptions(4);
+        options.EnableRangeSplitting = false;
+        var actual = await RunPartitionedAsync(job, new FakeS3Lister(a, TimeSpan.FromMilliseconds(2)), new FakeS3Lister(b, TimeSpan.FromMilliseconds(2)), options);
+        Assert.AreEqual(1, actual.Engine.GetPartitionsSnapshot().Count);
+        Assert.AreEqual(RunStatus.Completed, actual.Run.Status);
+    }
+
+    [TestMethod]
+    public async Task CancelAfterSplits_ThenResume_GivesTheUninterruptedResult()
+    {
+        var (a, b) = Generate(74, HierarchicalKeys(40, 60));
+        var job = NewJob();
+        var expected = await RunSingleStreamAsync(job, a, b);
+
+        var listerA = new FakeS3Lister(a, TimeSpan.FromMilliseconds(2));
+        var listerB = new FakeS3Lister(b, TimeSpan.FromMilliseconds(2));
+        var run = await NewRunAsync(job);
+        using var cts = new CancellationTokenSource();
+        ServiceComparisonEngine? engine1 = null;
+        int found = 0;
+        engine1 = new ServiceComparisonEngine(job, run, RunRepo, DiffRepo, AuditRepo, options: SplitOptions(4), listerA: listerA, listerB: listerB);
+        engine1.DifferenceFound += _ =>
+        {
+            // Cancel once the range has been split and about half of the differences are in.
+            if (Interlocked.Increment(ref found) >= expected.Run.TotalDifferences / 2 && engine1!.GetPartitionsSnapshot().Count > 2 && !cts.IsCancellationRequested)
+            {
+                engine1.MarkServiceShutdown();
+                cts.Cancel();
+            }
+        };
+        await Assert.ThrowsAsync<OperationCanceledException>(() => engine1.RunAsync(cts.Token));
+
+        var cp = (await RunRepo.GetCheckpointAsync(run.Id))!;
+        Assert.IsNotNull(cp.Partitions);
+        Assert.IsTrue(cp.Partitions.Count > 2, "the checkpoint holds the split plan");
+        Assert.IsNull(PartitionPlanner.ValidateTiling(cp.Partitions), string.Join(" ", cp.Partitions));
+        Assert.AreEqual(cp.TotalDifferences, await DiffRepo.GetDifferenceCountAsync(run.Id));
+
+        var reopened = (await RunRepo.ReopenForResumeAsync(run.Id))!;
+        var resumed = await RunPartitionedAsync(job, listerA, listerB, SplitOptions(4), reopened, cp);
+
+        Assert.AreEqual(RunStatus.Completed, resumed.Run.Status);
+        AssertSameCounters(expected.Run, resumed.Run);
+        CollectionAssert.AreEqual(Shape(expected.Diffs), Shape(resumed.Diffs));
+        Assert.AreEqual(resumed.Run.TotalDifferences, resumed.Diffs.Count);
+    }
+
+    [TestMethod]
+    public async Task SplitWithSequenceGaps_MatchesSingleStream()
+    {
+        var keys = Enumerable.Range(0, 3000).Where(i => i % 97 != 5).Select(i => $"logs/file_{i:00000}.dat").ToList();
+        var items = keys.Select(k => Obj(k)).ToList();
+        var job = NewJob();
+        job.DetectSequenceGaps = true;
+        var expected = await RunSingleStreamAsync(job, items, items);
+
+        var actual = await RunPartitionedAsync(job, new FakeS3Lister(items, TimeSpan.FromMilliseconds(2)), new FakeS3Lister(items, TimeSpan.FromMilliseconds(2)), SplitOptions(4));
+
+        Assert.IsTrue(actual.Engine.GetPartitionsSnapshot().Count > 1);
+        AssertSameCounters(expected.Run, actual.Run);
+        Assert.AreEqual(expected.Run.SequenceGapCount, actual.Run.SequenceGapCount);
+        CollectionAssert.AreEqual(Shape(expected.Diffs), Shape(actual.Diffs));
     }
 }

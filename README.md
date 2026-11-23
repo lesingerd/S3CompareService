@@ -268,11 +268,20 @@ A scan compares two sorted listings (merge join). A single listing stream is lim
 
 **2. Key-range partitioning.** Before the scan, a planner splits the keyspace into ranges that tile it exactly (no gaps, no overlap), using both buckets:
 
-- **Delimiter discovery**: lists the "folders" (`Delimiter = "/"`) level by level, down to `MaxDiscoveryDepth` levels, until there are enough boundaries.
+- **Delimiter discovery**: lists the "folders" (`Delimiter = "/"`) level by level, down to `MaxDiscoveryDepth` levels. It keeps descending after it has enough boundaries, as long as the next level can be listed completely within half of the remaining budget: the ranges are spaced evenly over the folders found, so a folder with thousands of subfolders must contribute them. (Stopping early used to put most of a bucket into one range when a few near-empty top folders each held one big subfolder.)
 - **Probe fallback** for flat keyspaces (no folders) or too few folders, inside the deepest folder level found: first it skips the part of the names that all keys share (`file_00001.dat`, `IMG_0001.jpg`, `logs-2024-...` are split where they differ, not at `f`), then single-key requests (`MaxKeys = 1`, `StartAfter = prefix + probe`) at evenly spaced characters find real keys to use as boundaries, coarse to fine over up to 4 rounds. The budget is split evenly over the rounds, the folders and the two buckets, so a small budget still spreads its probes over the whole alphabet.
 - Both stop at `MaxDiscoveryRequests` requests. If the planner fails or finds nothing, the scan runs as one range, exactly as before.
 
-The plan has about `MaxParallelPartitions × PartitionOversubscription` ranges. `MaxParallelPartitions` workers take ranges from a queue, so a large range does not leave the other workers idle. Each range is a separate merge join over the two listings with `StartAfter` at its lower bound; it stops at its upper bound. One database writer stores differences in batches; the statistics, the difference cap (`MaxRecordedDifferencesPerRun`), the events, pause and cancel are shared by all workers.
+The plan has about `MaxParallelPartitions × PartitionOversubscription` ranges. `MaxParallelPartitions` workers take ranges from a queue. Each range is a separate merge join over the two listings with `StartAfter` at its lower bound; it stops at its upper bound. One database writer stores differences in batches; the statistics, the difference cap (`MaxRecordedDifferencesPerRun`), the events, pause and cancel are shared by all workers.
+
+**3. Work stealing (range splitting).** A plan can still be uneven: folder names say nothing about how many objects they hold. When a worker finds the queue empty while other ranges are still running, it splits one of them and takes the second half:
+
+- It picks the running range left alone longest (running, or last split, at least 5 s ago).
+- It lists the subfolders still ahead of that range's worker (`Delimiter = "/"`, `StartAfter` = the worker's current key, both buckets, from the top folder down) and cuts at the middle subfolder of the shallowest folder with at least two ahead (paging up to 5 pages). Flat keyspaces use a small probe plan instead (at most 40 requests).
+- The cut is applied only if the worker has not reached it yet: the running range then ends at the cut and the new range starts after it. Both are part of the plan and the checkpoint, so a resumed scan keeps them.
+- An attempt costs a few list requests (within the rate limit). If it finds no cut it backs off (10 s, doubling up to 2 min) and gives up on that range after 6 tries.
+- All `MaxParallelPartitions` workers start even when fewer ranges are left (for example on resume), so the idle ones can split.
+- The Scan Diagnostics tab shows `PARTITIONS ... · N split by idle workers`, the banner `· N split`, and every split is logged (`Split key range #i: an idle worker took (...]`). `S3Compare:EnableRangeSplitting = false` turns it off.
 
 | Setting | Default | Range | Meaning |
 |---|---|---|---|
@@ -285,6 +294,7 @@ The plan has about `MaxParallelPartitions × PartitionOversubscription` ranges. 
 | `S3Compare:MaxPlanningSeconds` | `60` | 0 to 86400 | Time box of the planner. When used up, the ranges are built from the candidates found so far. `0` = no limit. |
 | `S3Compare:PartitionOversubscription` | `4` | 1 to 64 | Ranges planned per worker. |
 | `S3Compare:MaxDiscoveryDepth` | `3` | 0 to 10 | Folder levels the planner lists. |
+| `S3Compare:EnableRangeSplitting` | `true` | true/false | Work stealing: idle workers split running ranges (see above). |
 
 In `appsettings.json`, a value above its range is clamped to the maximum, and a value that is not a number or is below the range falls back to the default; both are written to the service's error output at start. The S3 client's connection limit is raised to fit the scan (at least 16, otherwise `2 × partitions + content checks + 4`).
 
@@ -294,7 +304,7 @@ In `appsettings.json`, a value above its range is clamped to the maximum, and a 
 
 - Throughput per bucket ≈ `MaxParallelPartitions × 1,000 / page latency (s)`, capped at `MaxListRequestsPerSecond × 1,000`. With 150 ms pages, 8 partitions give about 53,000 objects per second unthrottled; with the default limit of 20 requests per second it is 20,000. In the test suite (simulated 25 ms pages, no rate limit), 8 partitions finish several times faster than one.
 - To go faster, raise `MaxListRequestsPerSecond` first (for example `100` for 100,000 objects per second), then `MaxParallelPartitions` until `partitions × 1,000 / latency` exceeds it. More than 32 partitions rarely helps.
-- Partitioning needs structure to split: a bucket with few keys, or with all keys under one very long common prefix, may get fewer ranges than planned.
+- Partitioning needs structure to split: a bucket with few keys, or with all keys under one very long common prefix, may get fewer ranges than planned. Work stealing evens out what the plan gets wrong while the scan runs; the Scan Diagnostics tab shows how many ranges are active.
 - Memory: about `2 × partitions × (PrefetchPages + 1) × 1,000` object summaries in flight (8 partitions, 2 pages: about 48,000 objects, a few tens of MB). The 512-page cap per bucket bounds this at about 1 million summaries (a few hundred MB) whatever the settings.
 - For a fragile on-premises store, keep `MaxListRequestsPerSecond` low (or set `MaxParallelPartitions` to `1`); the limit applies however many partitions there are.
 

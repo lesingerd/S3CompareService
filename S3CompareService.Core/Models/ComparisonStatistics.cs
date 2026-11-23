@@ -69,7 +69,30 @@ public sealed class PartitionRange
     [System.Text.Json.Serialization.JsonIgnore]
     public long ObjectsCompared { get; set; }
 
-    public PartitionRange Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed, Active = Active, ObjectsCompared = ObjectsCompared };
+    /// <summary>
+    /// The relative key the worker is processing (or last processed); a split key must sort after it. Live only. The worker
+    /// sets it under the engine's state lock together with its check against <see cref="Upper"/>, which a split may lower.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? InFlightKey { get; set; }
+
+    /// <summary>Engine clock (ms) when a worker started this range, or when it was last split. Live only.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public long ActiveSinceMs { get; set; }
+
+    /// <summary>True while an idle worker looks for a split key of this range. Live only.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool Splitting { get; set; }
+
+    /// <summary>Engine clock (ms) before which no new split of this range is attempted (back-off after a failed attempt). Live only.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public long NextSplitAttemptMs { get; set; }
+
+    /// <summary>Split attempts of this range that found no usable key, in a row. Live only.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public int SplitFailures { get; set; }
+
+    public PartitionRange Clone() => new() { Lower = Lower, Upper = Upper, LastCompletedKey = LastCompletedKey, Completed = Completed, Active = Active, ObjectsCompared = ObjectsCompared, InFlightKey = InFlightKey };
 
     public override string ToString() => $"({Lower ?? "-inf"}, {Upper ?? "+inf"}]{(Completed ? " done" : LastCompletedKey != null ? " @" + LastCompletedKey : string.Empty)}";
 }

@@ -85,6 +85,18 @@ public sealed class ScanOptions
     /// </summary>
     public int MaxPlanningSeconds { get; set; } = DefaultMaxPlanningSeconds;
 
+    /// <summary>
+    /// Work stealing: when a worker has no queued range left, it splits the rest of a running range and takes the second half,
+    /// so one big range cannot leave the other workers idle. On by default.
+    /// </summary>
+    public bool EnableRangeSplitting { get; set; } = true;
+
+    /// <summary>A range must have been running this long before an idle worker splits it (not a configuration setting; tests shorten it).</summary>
+    public TimeSpan MinRangeAgeForSplit { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>How often an idle worker looks again for a range to split (not a configuration setting; tests shorten it).</summary>
+    public TimeSpan SplitIdlePoll { get; set; } = TimeSpan.FromSeconds(1);
+
     /// <summary>Time limit of one partition-planner request (not a configuration setting; tests shorten it).</summary>
     public TimeSpan PlannerRequestTimeout { get; set; } = TimeSpan.FromSeconds(15);
 

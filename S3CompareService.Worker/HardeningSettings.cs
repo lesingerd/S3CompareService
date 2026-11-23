@@ -31,7 +31,7 @@ public static class HardeningSettings
     /// <summary>
     /// Reads the scan limits and the parallel-scan throughput defaults (<c>S3Compare:MaxParallelPartitions</c>,
     /// <c>PrefetchPages</c>, <c>MaxObjectsPerSecond</c>, <c>MaxConcurrentContentChecks</c>, <c>MaxDiscoveryRequests</c>,
-    /// <c>PartitionOversubscription</c>, <c>MaxDiscoveryDepth</c>, <c>MaxPlanningSeconds</c>). A missing value keeps its default. A value above its
+    /// <c>PartitionOversubscription</c>, <c>MaxDiscoveryDepth</c>, <c>MaxPlanningSeconds</c>, <c>EnableRangeSplitting</c>). A missing value keeps its default. A value above its
     /// limit is clamped to the limit; an unreadable or too small value keeps the default. Both are reported through
     /// <paramref name="warn"/>.
     /// </summary>
@@ -49,6 +49,12 @@ public static class HardeningSettings
         options.PartitionOversubscription = ReadInt(configuration, "PartitionOversubscription", options.PartitionOversubscription, 1, ScanOptions.PartitionOversubscriptionLimit, warn);
         options.MaxDiscoveryDepth = ReadInt(configuration, "MaxDiscoveryDepth", options.MaxDiscoveryDepth, 0, ScanOptions.MaxDiscoveryDepthLimit, warn);
         options.MaxPlanningSeconds = ReadInt(configuration, "MaxPlanningSeconds", options.MaxPlanningSeconds, 0, ScanOptions.MaxPlanningSecondsLimit, warn);
+        string? splitting = configuration["S3Compare:EnableRangeSplitting"];
+        if (!string.IsNullOrWhiteSpace(splitting))
+        {
+            if (bool.TryParse(splitting, out var on)) options.EnableRangeSplitting = on;
+            else warn?.Invoke($"S3Compare:EnableRangeSplitting = '{splitting}' is not true or false; using the default {options.EnableRangeSplitting}.");
+        }
         if (options.ApplyMemoryCap())
         {
             warn?.Invoke($"S3Compare:PrefetchPages lowered to {options.PrefetchPages}: MaxParallelPartitions x (PrefetchPages + 1) may not exceed {ScanOptions.MaxBufferedPagesPerBucket} list pages per bucket.");
