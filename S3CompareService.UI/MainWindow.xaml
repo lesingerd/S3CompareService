@@ -489,12 +489,35 @@
                             </Style>
                         </TextBlock.Style>
                     </TextBlock>
-                    <TextBlock Text="{Binding CurrentActiveScan.LastError, StringFormat='Last error: {0}'}" Foreground="#FF6B6B" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0">
+                    <TextBlock Text="{Binding CurrentActiveScan.IssuesLine}" Foreground="#9AA0A6" FontSize="11" TextWrapping="Wrap" Margin="0,2,0,0">
                         <TextBlock.Style>
                             <Style TargetType="TextBlock">
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding CurrentActiveScan.HasLastError}" Value="False">
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.HasIssuesLine}" Value="False">
                                         <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </TextBlock.Style>
+                    </TextBlock>
+                    <TextBlock Text="{Binding CurrentActiveScan.TopIssueText}" Foreground="#9AA0A6" FontSize="11" TextWrapping="Wrap" Margin="0,1,0,0">
+                        <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.HasTopIssue}" Value="False">
+                                        <Setter Property="Visibility" Value="Collapsed" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.TopIssueOutcome}" Value="Failed">
+                                        <Setter Property="Foreground" Value="#FF6B6B" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.TopIssueOutcome}" Value="Degraded">
+                                        <Setter Property="Foreground" Value="#FFB74D" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.TopIssueOutcome}" Value="Recorded">
+                                        <Setter Property="Foreground" Value="#FFB74D" />
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding CurrentActiveScan.TopIssueOutcome}" Value="Recovered">
+                                        <Setter Property="Foreground" Value="#8FBF9F" />
                                     </DataTrigger>
                                 </Style.Triggers>
                             </Style>
@@ -1368,7 +1391,36 @@
                     </Grid.RowDefinitions>
 
                     <Border Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12">
-                        <TextBlock Text="{Binding DiagnosticsSummary}" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" TextWrapping="Wrap" />
+                        <StackPanel>
+                            <TextBlock Text="{Binding DiagnosticsSummary}" FontFamily="Consolas" FontSize="12" Foreground="#E0E0E0" TextWrapping="Wrap" />
+                            <TextBlock Text="RECENT ISSUES (newest first; red = the scan or a range stopped, amber = slower or recorded per object, grey/green = handled, no impact)" FontFamily="Consolas" FontSize="11" Foreground="#888888" TextWrapping="Wrap" Margin="0,6,0,2" />
+                            <ItemsControl ItemsSource="{Binding DiagnosticsRecentIssues}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Line}" FontFamily="Consolas" FontSize="12" Foreground="#9AA0A6" TextWrapping="Wrap" Margin="0,1,0,0">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding Outcome}" Value="Failed">
+                                                            <Setter Property="Foreground" Value="#FF6B6B" />
+                                                        </DataTrigger>
+                                                        <DataTrigger Binding="{Binding Outcome}" Value="Degraded">
+                                                            <Setter Property="Foreground" Value="#FFB74D" />
+                                                        </DataTrigger>
+                                                        <DataTrigger Binding="{Binding Outcome}" Value="Recorded">
+                                                            <Setter Property="Foreground" Value="#FFB74D" />
+                                                        </DataTrigger>
+                                                        <DataTrigger Binding="{Binding Outcome}" Value="Recovered">
+                                                            <Setter Property="Foreground" Value="#8FBF9F" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
                     </Border>
 
                     <TextBlock Grid.Row="1" Text="{Binding DiagnosticsPartitionsNote}" Foreground="#888888" FontSize="11" Margin="0,8,0,0" />
