@@ -186,6 +186,8 @@ The background service hosts a lightweight REST API on `http://localhost:5088`:
 | `/api/runs/{id}/pause` | `POST` | Pause an active scan |
 | `/api/runs/{id}/resume` | `POST` | Resume a paused scan |
 | `/api/runs/{id}/cancel` | `POST` | Cancel an active scan |
+| `/api/runs/{id}/diagnostics` | `GET` | Live diagnostics of an active scan: phase, planner, per-bucket request stats, partition table (at most 256 rows), in-flight operations |
+| `/api/settings/scan-defaults` | `GET` | The effective service-wide scan settings (what empty per-job overrides use) |
 | `/api/logs` | `GET` | Retrieve service audit and crash recovery logs |
 | `/api/idlemon/status` | `GET` | IdleMon reporter status: enabled, last send time, queue length, spool files and size, last error, accepted and rejected counters, the settings file path and whether it exists, and whether an API key is set (never the key). Works when reporting is off. |
 
@@ -248,6 +250,7 @@ Scan threads do not use Windows background I/O mode (`THREAD_MODE_BACKGROUND_BEG
     "MaxObjectsPerSecond": 0,
     "MaxConcurrentContentChecks": 8,
     "MaxDiscoveryRequests": 500,
+    "MaxPlanningSeconds": 60,
     "MaxRecordedDifferencesPerRun": 100000,
     "Retention": { "KeepRunsPerJob": 500, "KeepDays": 180, "AuditLogDays": 90 },
     "Notifications": { "DeliveryTimeoutSeconds": 30 }
@@ -279,12 +282,13 @@ The plan has about `MaxParallelPartitions × PartitionOversubscription` ranges. 
 | `S3Compare:MaxObjectsPerSecond` | `0` | 0 to 100000000 | Limits compared **keys** per second, all partitions together. A key present in both buckets counts once, like a key present in only one, so it is the same unit as `ObjectsCompared` and the `obj/sec` speed. `0` = unlimited. |
 | `S3Compare:MaxConcurrentContentChecks` | `8` | 1 to 256 | Full Data mode: object content comparisons running at the same time. |
 | `S3Compare:MaxDiscoveryRequests` | `500` | 0 to 100000 | Request budget of the planner (both buckets). `0` = no planning, one range. |
+| `S3Compare:MaxPlanningSeconds` | `60` | 0 to 86400 | Time box of the planner. When used up, the ranges are built from the candidates found so far. `0` = no limit. |
 | `S3Compare:PartitionOversubscription` | `4` | 1 to 64 | Ranges planned per worker. |
 | `S3Compare:MaxDiscoveryDepth` | `3` | 0 to 10 | Folder levels the planner lists. |
 
 In `appsettings.json`, a value above its range is clamped to the maximum, and a value that is not a number or is below the range falls back to the default; both are written to the service's error output at start. The S3 client's connection limit is raised to fit the scan (at least 16, otherwise `2 × partitions + content checks + 4`).
 
-**Per-job overrides.** `MaxParallelPartitions`, `PrefetchPages`, `MaxListRequestsPerSecond`, `MaxObjectsPerSecond`, `MaxConcurrentContentChecks` and `MaxDiscoveryRequests` can be set per job: in the UI job editor under "Performance / Throttling", or in the API as `performance: { ... }` on the job. An empty (null) value uses the service setting. A value outside the range above, or a job that sets both `MaxParallelPartitions` and `PrefetchPages` with `partitions × (PrefetchPages + 1)` above 512, is refused with `400 Bad Request`. When only one of the two is set, `PrefetchPages` is lowered at scan start if needed.
+**Per-job overrides.** `MaxParallelPartitions`, `PrefetchPages`, `MaxListRequestsPerSecond`, `MaxObjectsPerSecond`, `MaxConcurrentContentChecks`, `MaxDiscoveryRequests` and `MaxPlanningSeconds` can be set per job: in the UI job editor under "Performance / Throttling", or in the API as `performance: { ... }` on the job. An empty (null) value uses the service setting. A value outside the range above, or a job that sets both `MaxParallelPartitions` and `PrefetchPages` with `partitions × (PrefetchPages + 1)` above 512, is refused with `400 Bad Request`. When only one of the two is set, `PrefetchPages` is lowered at scan start if needed.
 
 **Sizing.**
 
@@ -308,6 +312,23 @@ In `appsettings.json`, a value above its range is clamped to the maximum, and a 
 
 - "(Tail)" in a difference refers to the end of a range, not of the whole bucket.
 - The planner probes ASCII characters; keys that start with other characters are compared, but in the neighbouring ranges.
+
+### Seeing what a scan is doing (phase, planner, diagnostics)
+
+A scan has a **phase**: `Preparing` (state, S3 clients), `Planning` (the partition planner), `Scanning` (workers compare ranges) and `Finalizing` (flush, metadata, final state). While paused the phase shows as `Paused`, and after a cancel request as `Cancelling`.
+
+- **Banner (top of the UI).** A second line shows the phase in one sentence, for example `PLANNING: 132/500 requests · 41 candidates · probe round 2 · 0:48 of 1:00`, then during the scan `SCANNING: 3/32 partitions done · 8 active · 21 queued`, `FINALIZING: ...`, `PAUSED (...)` or `CANCELLING… (12 s) · waiting for S3 12 s (was ...)`. Below it: the oldest S3 request and database call in flight with their age (and the retry attempt), and the last error in red. The old "Speed 0 obj/s, Partitions -" values are still shown, but the phase line says why they are 0.
+- **Scan Diagnostics tab.** One screen for a screenshot: run and elapsed time, phase, what the engine is doing now, the planner (requests used/budget, candidates, step, elapsed/limit, request errors, whether the time limit was hit, shared-prefix jump mode, last planner error), per bucket (requests, requests/s against the limit, requests in flight, average/last/max latency, time spent waiting in the rate limiter, errors), the partition counts, the oldest S3 request and database call in flight, the last error, and a table of partitions (index, lower, upper, state queued/active/done, last completed key, compared keys in this process). The table shows at most 256 rows (active first, then queued, then the most recently finished) and says how many are not shown. It is refreshed with the normal status polling (1.5 s), and the Service Audit Logs tab refreshes about every 6 s while a scan is active.
+- **API.** `GET /api/status` has, per active scan, `Phase`, `PhaseText`, `Operation`, `LastError`, `CancelRequestedSeconds`, `Planner`, `OldestS3`, `OldestDb` and `PartitionsQueued`. `GET /api/runs/{id}/diagnostics` returns the full snapshot (404 when the run is not active). `GET /api/settings/scan-defaults` returns the effective service-wide throughput settings; the job editor shows them as grey hints ("default: 8") in empty override boxes (built-in defaults when the service is offline).
+- **Audit log (Service Audit Logs tab, category ScanEngine / ScanCoordinator).** INFO lines for every step: `Scan step: Preparing run state`, `Creating S3 clients`, `Planning started ...` (budget, target ranges, rate limit, time limit, depth, prefixes, per-request timeout), `Planner step: delimiter depth 1 / shared-prefix jump / probe round 2 ...`, `Partition plan ...` (method, candidates, requests, errors, whether the time limit was hit), `Scan phase: Scanning ...`, `Scan step: Workers started (N ...)`, `Scan phase: Finalizing ...`. WARN for every failed or timed-out planner request (the first 20, then a count), for a shared-prefix check that fails, for the planning time limit, for S3 requests in flight longer than 20 s and for database calls that take longer than 5 s (named). `Cancel requested ...` is logged at once; see below for what happens when a cancel does not finish.
+
+**Planning time box and robustness.** `S3Compare:MaxPlanningSeconds` (default `60`, `0` = no limit, per-job override `performance.maxPlanningSeconds`) limits how long the planner may search. When it is used up, in-flight planner requests are cancelled, no more are sent, and the ranges are built from the candidates found so far (the ranges always tile the keyspace, so the scan is complete; only the balance of the ranges may be worse). It is logged as a WARN. Every planner request has its own 15 s timeout (counted after the rate limiter, so throttling is not a timeout); a request that fails or times out is logged and skipped and never aborts planning. If the shared-prefix check (`StartAfter = prefix + U+10FFFF`) is rejected, the planner falls back to `prefix + "~"` (WARN once); if that fails too, the jump is disabled for the rest of the plan and probing continues. Only the scan's own cancellation ends planning with an exception. A bucket with no folders is recognised after the first delimiter page (no further pages are requested), and the independent requests of the planner (both buckets, the lengths tested while searching a shared prefix, the probes of a round) run concurrently, at most 16 in flight in total, within the per-bucket rate limit.
+
+**S3 timeouts and retries.** Scan clients use an HTTP attempt timeout of 30 s with `MaxErrorRetry = 0`; list requests and object reads are retried by the service itself (3 attempts on 5xx, throttling, timeouts and network errors, with a short back-off), so each attempt is visible as "attempt N" in the diagnostics. Before, one hung request could stall 45 s × 4 attempts (more than 3 minutes). Clients for connection tests use 30 s and 2 SDK retries.
+
+**Cancel watchdog.** A cancel is logged at once (INFO) and the engine stops through its cancellation token. S3 calls and database calls of a scan are also abandoned when the token is cancelled, even if the call itself ignores it. If the scan still has not ended 20 seconds after the cancel (or the service stop), the service logs an ERROR naming the stuck operations and their age, marks the run `Cancelled` (`Interrupted` at a service stop, so it resumes at the next start), removes it from the active scans (the banner clears and the job can run again) and detaches the engine: a detached engine refuses every further database write (run state, checkpoints, differences, log lines). The banner shows `CANCELLING… (N s)` while waiting.
+
+**Database waits are bounded.** SQLite connections use a 10 s busy timeout and a 30 s command timeout; every database call of the engine is also limited to 60 s and tracked as "in flight" (visible in the diagnostics, and logged when it takes longer than 5 s).
 
 ---
 
