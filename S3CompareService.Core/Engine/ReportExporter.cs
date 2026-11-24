@@ -138,6 +138,10 @@ public static class ReportExporter
     /// result set is never materialized. Same shape as <see cref="ExportToJsonAsync"/> except that, because the
     /// count is only known at the end, <c>totalExportedDifferences</c> is written after the <c>differences</c> array.
     /// The stream is left open.
+    /// <para>The writer writes into a memory buffer, never into <paramref name="outputStream"/> directly: JsonSerializer.Serialize
+    /// flushes its writer synchronously, and a synchronous write to an ASP.NET response stream throws ("Synchronous operations are
+    /// disallowed"), which cut the HTTP export off mid-response. The buffer is copied to the stream with WriteAsync every 500
+    /// differences (or when it passes 1 MB), so memory stays bounded.</para>
     /// </summary>
     public static async Task ExportToJsonStreamAsync(
         Stream outputStream,
@@ -147,7 +151,16 @@ public static class ReportExporter
         bool includeGracePeriodItems = true,
         CancellationToken cancellationToken = default)
     {
-        await using var writer = new Utf8JsonWriter(outputStream, new JsonWriterOptions { Indented = false, SkipValidation = false });
+        var buffer = new System.Buffers.ArrayBufferWriter<byte>(256 * 1024);
+        await using var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = false, SkipValidation = false });
+
+        async Task DrainAsync()
+        {
+            writer.Flush(); // into the memory buffer only
+            if (buffer.WrittenCount == 0) return;
+            await outputStream.WriteAsync(buffer.WrittenMemory, cancellationToken).ConfigureAwait(false);
+            buffer.Clear();
+        }
 
         writer.WriteStartObject();
         writer.WriteString("generatedAtUtc", DateTime.UtcNow);
@@ -165,6 +178,7 @@ public static class ReportExporter
         writer.WriteEndObject();
 
         writer.WriteStartArray("differences");
+        await DrainAsync().ConfigureAwait(false);
         long count = 0;
         await foreach (var diff in differences.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -174,15 +188,16 @@ public static class ReportExporter
             JsonSerializer.Serialize(writer, diff, StreamJsonOptions);
             count++;
 
-            if (count % 500 == 0)
+            if (count % 500 == 0 || writer.BytesPending + buffer.WrittenCount > 1024 * 1024)
             {
-                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                await DrainAsync().ConfigureAwait(false);
             }
         }
         writer.WriteEndArray();
 
         writer.WriteNumber("totalExportedDifferences", count);
         writer.WriteEndObject();
-        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await DrainAsync().ConfigureAwait(false);
+        await outputStream.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 }

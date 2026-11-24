@@ -44,8 +44,15 @@ public class PlannerRobustnessTests
     public async Task TimeBox_StopsPlanning_AndBuildsValidRangesFromPartialCandidates()
     {
         var keys = FlatKeys(5000);
-        var a = Fake(keys, TimeSpan.FromMilliseconds(60));
-        var b = Fake(keys, TimeSpan.FromMilliseconds(60));
+        // The first requests answer quickly, later ones take 10 s: the time limit always cuts planning short, and always after
+        // some candidates were found, however loaded the machine is.
+        var a = Fake(keys, TimeSpan.FromMilliseconds(5));
+        var b = Fake(keys, TimeSpan.FromMilliseconds(5));
+        foreach (var f in new[] { a, b })
+        {
+            var lister = f;
+            lister.OnCall = call => { if (call > 15) lister.Latency = TimeSpan.FromSeconds(10); };
+        }
         var logs = new Logs();
         var planner = new PartitionPlanner(a, "a", null, null, b, "b", null, null, 64, 3, 100_000, null,
             maxPlanningTime: TimeSpan.FromMilliseconds(500), log: logs.Add);
