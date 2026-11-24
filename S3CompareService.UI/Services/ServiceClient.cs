@@ -520,10 +520,26 @@ public class ServiceClient
         {
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
             using var resp = await SendAsync(_longHttp, req, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
-            await using (var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false))
-            await using (var dst = File.Create(tempPath))
+            long received = 0;
+            try
             {
-                await src.CopyToAsync(dst).ConfigureAwait(false);
+                await using var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                await using var dst = File.Create(tempPath);
+                var chunk = new byte[81920];
+                int n;
+                while ((n = await src.ReadAsync(chunk).ConfigureAwait(false)) > 0)
+                {
+                    await dst.WriteAsync(chunk.AsMemory(0, n)).ConfigureAwait(false);
+                    received += n;
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or IOException)
+            {
+                // The service sent the headers, then stopped: an error while it was generating the file (it is in the
+                // service's log), or the service stopped. Say so instead of the bare transport message.
+                throw new ServiceApiException(
+                    $"The service stopped sending the {(json ? "JSON" : "CSV")} export after {received / 1024.0 / 1024.0:N1} MB, so the file was not saved. "
+                    + $"It probably hit an error while generating the file (see the service's log), or the service was stopped. Details: {ex.Message}", null, ex);
             }
             File.Move(tempPath, destinationPath, overwrite: true);
         }

@@ -158,6 +158,28 @@ public class WorkerApiTests
         Assert.AreEqual(1000, doc.GetProperty("take").GetInt32());
     }
 
+
+    [TestMethod]
+    public async Task Export_StreamsJson_WithManyDifferences()
+    {
+        var factory = new SqliteConnectionFactory(DatabaseConfig.GetConnectionString());
+        var run = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = "j", JobName = "my job" };
+        await new ScanRunRepository(factory).CreateAsync(run);
+        var diffs = Enumerable.Range(0, 5000).Select(i => new RecordedDifference
+        {
+            ScanRunId = run.Id, Key = $"dir/{i:00000}/file.dat", Type = DifferenceType.MissingInBucketB,
+            Details = "Object exists in Bucket A but is missing in Bucket B.", BucketASize = i, BucketAETag = "\"e\""
+        }).ToList();
+        await new DifferenceRepository(factory).InsertBatchAsync(diffs);
+
+        var resp = await _client.GetAsync($"/api/runs/{run.Id}/export/json");
+        Assert.AreEqual(HttpStatusCode.OK, resp.StatusCode);
+        Assert.AreEqual("application/json", resp.Content.Headers.ContentType?.MediaType);
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.AreEqual(5000, doc.RootElement.GetProperty("differences").GetArrayLength());
+        Assert.AreEqual(5000, doc.RootElement.GetProperty("totalExportedDifferences").GetInt64());
+        Assert.AreEqual(run.Id, doc.RootElement.GetProperty("run").GetProperty("id").GetString());
+    }
     [TestMethod]
     public async Task Export_StreamsCsvWithDisposition()
     {

@@ -429,6 +429,25 @@ app.MapGet("/api/runs/{id}/differences", async (
     });
 });
 
+// An export that fails after the response has started can only be cut off; record why in the audit log (visible in the
+// UI's Service Audit Logs tab), then let it propagate so the client sees an incomplete download rather than a bad file.
+static async Task LoggedExportAsync(IAuditLogRepository audit, ScanRun run, string format, Func<Task> export, CancellationToken ct)
+{
+    try
+    {
+        await export();
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        throw; // the client went away
+    }
+    catch (Exception ex)
+    {
+        try { await audit.LogAsync("ERROR", "Export", $"FAILED: {format} export of run '{run.Id}' ({run.JobName}) stopped partway: {ex.GetType().Name}: {ex.Message}. The downloaded file was discarded.", ex.ToString(), run.Id, run.JobId); } catch { }
+        throw;
+    }
+}
+
 static string SanitizeFileNamePart(string input)
 {
     if (string.IsNullOrWhiteSpace(input)) return "job";
@@ -442,6 +461,7 @@ app.MapGet("/api/runs/{id}/export/csv", async (
     HttpContext http,
     IScanRunRepository runRepo,
     IDifferenceRepository diffRepo,
+    IAuditLogRepository audit,
     [FromQuery] bool includeGracePeriod = true) =>
 {
     var run = await runRepo.GetByIdAsync(id);
@@ -451,7 +471,7 @@ app.MapGet("/api/runs/{id}/export/csv", async (
     string filename = $"s3compare_report_{SanitizeFileNamePart(run.JobName)}_{shortId}.csv";
     var ct = http.RequestAborted;
     return Results.Stream(
-        stream => ReportExporter.ExportToCsvStreamAsync(stream, run, diffRepo.StreamAllForRunAsync(id, includeGracePeriod ? null : false, ct), includeGracePeriod, ct),
+        stream => LoggedExportAsync(audit, run, "CSV", () => ReportExporter.ExportToCsvStreamAsync(stream, run, diffRepo.StreamAllForRunAsync(id, includeGracePeriod ? null : false, ct), includeGracePeriod, ct), ct),
         "text/csv",
         filename);
 });
@@ -462,6 +482,7 @@ app.MapGet("/api/runs/{id}/export/json", async (
     HttpContext http,
     IScanRunRepository runRepo,
     IDifferenceRepository diffRepo,
+    IAuditLogRepository audit,
     [FromQuery] bool includeGracePeriod = true) =>
 {
     var run = await runRepo.GetByIdAsync(id);
@@ -472,7 +493,7 @@ app.MapGet("/api/runs/{id}/export/json", async (
     string filename = $"s3compare_report_{SanitizeFileNamePart(run.JobName)}_{shortId}.json";
     var ct = http.RequestAborted;
     return Results.Stream(
-        stream => ReportExporter.ExportToJsonStreamAsync(stream, run, diffRepo.StreamAllForRunAsync(id, includeGracePeriod ? null : false, ct), snapshots, includeGracePeriod, ct),
+        stream => LoggedExportAsync(audit, run, "JSON", () => ReportExporter.ExportToJsonStreamAsync(stream, run, diffRepo.StreamAllForRunAsync(id, includeGracePeriod ? null : false, ct), snapshots, includeGracePeriod, ct), ct),
         "application/json",
         filename);
 });
