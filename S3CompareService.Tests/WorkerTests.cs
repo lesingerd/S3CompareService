@@ -180,6 +180,36 @@ public class WorkerApiTests
         Assert.AreEqual(5000, doc.RootElement.GetProperty("totalExportedDifferences").GetInt64());
         Assert.AreEqual(run.Id, doc.RootElement.GetProperty("run").GetProperty("id").GetString());
     }
+
+    [TestMethod]
+    public async Task ExportView_StreamsEveryPageOfTheFilteredView_AsCsv()
+    {
+        var factory = new SqliteConnectionFactory(DatabaseConfig.GetConnectionString());
+        var run = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = "j", JobName = "view job" };
+        await new ScanRunRepository(factory).CreateAsync(run);
+        var diffs = Enumerable.Range(0, 3000).Select(i => new RecordedDifference
+        {
+            ScanRunId = run.Id,
+            Key = $"{(i % 2 == 0 ? "keep" : "other")}/{i:00000}.dat",
+            Type = i % 3 == 0 ? DifferenceType.SizeMismatch : DifferenceType.MissingInBucketB,
+            IsWithinGracePeriod = i % 5 == 0,
+            Details = "d"
+        }).ToList();
+        await new DifferenceRepository(factory).InsertBatchAsync(diffs);
+        int expected = diffs.Count(d => d.Key.Contains("keep/") && d.Type == DifferenceType.MissingInBucketB && !d.IsWithinGracePeriod);
+
+        var resp = await _client.GetAsync($"/api/runs/{run.Id}/export/view-csv?type=MissingInBucketB&withinGracePeriod=false&searchKey=keep%2F");
+        Assert.AreEqual(HttpStatusCode.OK, resp.StatusCode);
+        Assert.AreEqual("text/csv", resp.Content.Headers.ContentType?.MediaType);
+        string csv = await resp.Content.ReadAsStringAsync();
+        StringAssert.Contains(csv, "# Explorer View Filter    : MissingInBucketB; confirmed disparities only; key contains 'keep/'");
+        var rows = csv.Split('\n').SkipWhile(l => !l.StartsWith("Id,Key,")).Skip(1).Where(l => l.Trim().Length > 0).ToList();
+        Assert.AreEqual(expected, rows.Count, "every page of the filtered view, nothing else");
+        Assert.IsTrue(expected > 50 * 5, "more than a few explorer pages");
+        var bad = rows.FirstOrDefault(r => !(r.Contains(",\"keep/") && r.Contains(",MissingInBucketB,") && r.Contains(",False,")));
+        Assert.IsNull(bad, bad);
+    }
+
     [TestMethod]
     public async Task Export_StreamsCsvWithDisposition()
     {

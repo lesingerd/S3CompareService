@@ -330,7 +330,7 @@ public class IdleMonCollectorTests : TestDbBase
         var alerts = new S3CompareService.Core.Notifications.AlertNotificationService();
         var coordinator = new ScanExecutionCoordinator(JobRepo, RunRepo, DiffRepo, AuditRepo, alerts, NullLogger<ScanExecutionCoordinator>.Instance, new ThrowingEvents());
         await new CrashRecoveryManager(RunRepo, JobRepo, AuditRepo, coordinator, NullLogger<CrashRecoveryManager>.Instance, new ThrowingEvents()).RunStartupRecoveryAsync();
-        Assert.AreEqual(RunStatus.Interrupted, (await RunRepo.GetByIdAsync(crashed.Id))!.Status);
+        Assert.AreEqual(RunStatus.Failed, (await RunRepo.GetByIdAsync(crashed.Id))!.Status, "no checkpoint: closed, not left Interrupted");
 
         var events = new IdleMonEvents(_reporter, Options(), _clock, "1.0.0");
         var coordinator2 = new ScanExecutionCoordinator(JobRepo, RunRepo, DiffRepo, AuditRepo, alerts, NullLogger<ScanExecutionCoordinator>.Instance, events);

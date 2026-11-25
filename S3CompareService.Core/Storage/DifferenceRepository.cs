@@ -38,6 +38,17 @@ public interface IDifferenceRepository
         string scanRunId,
         bool? withinGracePeriodFilter = null,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Streams the differences that match the same filter as <see cref="GetDifferencesAsync"/> (every page of it, in the same
+    /// order), without buffering them. Used to export the Disparity Explorer's current view.
+    /// </summary>
+    IAsyncEnumerable<RecordedDifference> StreamFilteredAsync(
+        string scanRunId,
+        DifferenceType? typeFilter,
+        bool? withinGracePeriodFilter,
+        string? searchKey,
+        CancellationToken cancellationToken = default);
 }
 
 public class DifferenceRepository : IDifferenceRepository
@@ -159,14 +170,22 @@ public class DifferenceRepository : IDifferenceRepository
         return list;
     }
 
-    public async IAsyncEnumerable<RecordedDifference> StreamAllForRunAsync(
+    public IAsyncEnumerable<RecordedDifference> StreamAllForRunAsync(
         string scanRunId,
         bool? withinGracePeriodFilter = null,
+        CancellationToken cancellationToken = default)
+        => StreamFilteredAsync(scanRunId, null, withinGracePeriodFilter, null, cancellationToken);
+
+    public async IAsyncEnumerable<RecordedDifference> StreamFilteredAsync(
+        string scanRunId,
+        DifferenceType? typeFilter,
+        bool? withinGracePeriodFilter,
+        string? searchKey,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
 
-        var (whereSql, dp) = BuildFilter(scanRunId, null, withinGracePeriodFilter, null);
+        var (whereSql, dp) = BuildFilter(scanRunId, typeFilter, withinGracePeriodFilter, searchKey);
         string sql = $"SELECT * FROM RecordedDifferences {whereSql} ORDER BY Key ASC, Id ASC;";
 
         await foreach (var r in conn.QueryUnbufferedAsync(sql, dp).ConfigureAwait(false))

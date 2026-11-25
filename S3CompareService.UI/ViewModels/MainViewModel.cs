@@ -374,6 +374,7 @@ public class MainViewModel : ViewModelBase
 
     public RelayCommand ExportCsvCommand { get; }
     public RelayCommand ExportJsonCommand { get; }
+    public RelayCommand ExportViewCsvCommand { get; }
     public RelayCommand RefreshLogsCommand { get; }
 
     public MainViewModel()
@@ -427,6 +428,7 @@ public class MainViewModel : ViewModelBase
 
         ExportCsvCommand = new RelayCommand(async () => await ExportReportAsync(false));
         ExportJsonCommand = new RelayCommand(async () => await ExportReportAsync(true));
+        ExportViewCsvCommand = new RelayCommand(async () => await ExportCurrentViewAsync());
         RefreshLogsCommand = new RelayCommand(async () => await SafeAsync(LoadLogsAsync, "load logs"));
 
         // Initialize presets
@@ -902,6 +904,55 @@ public class MainViewModel : ViewModelBase
         if (string.IsNullOrWhiteSpace(input)) return "job";
         var invalid = Path.GetInvalidFileNameChars();
         return new string(input.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+    }
+
+    private bool? CurrentGraceFilter => GracePeriodFilterMode switch
+    {
+        0 => false,
+        2 => true,
+        _ => null
+    };
+
+    /// <summary>Exports what the Disparity Explorer shows (current type, in-flight and key filters), every page, as CSV.</summary>
+    private async Task ExportCurrentViewAsync()
+    {
+        if (SelectedRun == null)
+        {
+            MessageBox.Show("Please select a scan run first.", "Export View", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var run = SelectedRun;
+        var type = FilterType;
+        var grace = CurrentGraceFilter;
+        string search = FilterSearchKey;
+        int expected = _diffTotalCount;
+        string filter = S3CompareService.Core.Engine.ReportExporter.DescribeViewFilter(type, grace, search);
+
+        string shortId = run.Id.Length >= 8 ? run.Id[..8] : run.Id;
+        var dlg = new SaveFileDialog
+        {
+            FileName = $"s3compare_view_{SanitizeFileName(run.JobName)}_{shortId}{(type.HasValue ? "_" + type.Value : string.Empty)}.csv",
+            Filter = "CSV Files (*.csv)|*.csv",
+            Title = $"Export current view ({expected:N0} rows: {filter})"
+        };
+        if (dlg.ShowDialog() != true) return;
+
+        try
+        {
+            StatusMessage = $"Exporting current view ({expected:N0} rows)...";
+            await _client.ExportViewCsvAsync(run.Id, type, grace, search, dlg.FileName);
+            StatusMessage = $"Exported current view to {dlg.FileName}";
+            string message = $"Exported the current view to {dlg.FileName}\n\nFilter: {filter}\nRows in view: {expected:N0} (all pages)";
+            if (run.DifferencesTruncated) message += $"\n\nNote: {TruncationWarning}";
+            MessageBox.Show(message, "Export View Completed", MessageBoxButton.OK,
+                run.DifferencesTruncated ? MessageBoxImage.Warning : MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = "Export of current view failed.";
+            MessageBox.Show($"Export failed:\n{ex.Message}", "Export View", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
     }
 
     private async Task ExportReportAsync(bool isJson)
