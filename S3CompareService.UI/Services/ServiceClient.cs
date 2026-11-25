@@ -514,9 +514,29 @@ public class ServiceClient
     }
 
     /// <summary>Streams the server-generated CSV/JSON export to <paramref name="destinationPath"/> (long timeout).</summary>
-    public async Task ExportRunAsync(string runId, bool json, bool includeGracePeriod, string destinationPath)
+    public Task ExportRunAsync(string runId, bool json, bool includeGracePeriod, string destinationPath)
     {
         string url = $"/api/runs/{Uri.EscapeDataString(runId)}/export/{(json ? "json" : "csv")}?includeGracePeriod={(includeGracePeriod ? "true" : "false")}";
+        return DownloadExportAsync(url, json ? "JSON" : "CSV", destinationPath);
+    }
+
+    /// <summary>
+    /// Streams the Disparity Explorer's current view (same filter as <see cref="GetDifferencesAsync"/>, all pages) as CSV to
+    /// <paramref name="destinationPath"/>.
+    /// </summary>
+    public Task ExportViewCsvAsync(string runId, DifferenceType? type, bool? withinGracePeriod, string? searchKey, string destinationPath)
+    {
+        var query = new List<string>();
+        if (type.HasValue) query.Add($"type={type.Value}");
+        if (withinGracePeriod.HasValue) query.Add($"withinGracePeriod={(withinGracePeriod.Value ? "true" : "false")}");
+        if (!string.IsNullOrWhiteSpace(searchKey)) query.Add($"searchKey={Uri.EscapeDataString(searchKey)}");
+        string url = $"/api/runs/{Uri.EscapeDataString(runId)}/export/view-csv" + (query.Count > 0 ? "?" + string.Join("&", query) : string.Empty);
+        return DownloadExportAsync(url, "CSV", destinationPath);
+    }
+
+    private async Task DownloadExportAsync(string url, string format, string destinationPath)
+    {
+        bool json = format == "JSON";
         string tempPath = destinationPath + ".part";
         try
         {

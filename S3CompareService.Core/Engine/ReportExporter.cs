@@ -33,7 +33,21 @@ public static class ReportExporter
         return $"\"{val.Replace("\"", "\"\"")}\"";
     }
 
-    private static async Task WriteCsvHeaderAsync(TextWriter writer, ScanRun run)
+    /// <summary>A readable description of a Disparity Explorer filter (for the CSV header and the UI).</summary>
+    public static string DescribeViewFilter(DifferenceType? type, bool? withinGracePeriod, string? searchKey)
+    {
+        string types = type?.ToString() ?? "all types";
+        string grace = withinGracePeriod switch
+        {
+            false => "confirmed disparities only",
+            true => "in-flight (grace period) only",
+            null => "all raw differences"
+        };
+        string search = string.IsNullOrWhiteSpace(searchKey) ? "no key search" : $"key contains '{searchKey.Trim()}'";
+        return $"{types}; {grace}; {search}";
+    }
+
+    private static async Task WriteCsvHeaderAsync(TextWriter writer, ScanRun run, string? viewFilterDescription = null)
     {
         await writer.WriteLineAsync("# S3 Bucket Comparison Continuous Audit Report").ConfigureAwait(false);
         await writer.WriteLineAsync($"# Generated (UTC)         : {DateTime.UtcNow:O}").ConfigureAwait(false);
@@ -51,6 +65,8 @@ public static class ReportExporter
         await writer.WriteLineAsync($"# Scan Window Clipped     : {run.IsScanWindowClipped} - {run.ScanWindowNotes}").ConfigureAwait(false);
         if (run.DifferencesTruncated)
             await writer.WriteLineAsync("# TRUNCATED              : Yes - the run hit the recorded-differences limit; the counters above are complete but the rows below are only the first ones stored.").ConfigureAwait(false);
+        if (!string.IsNullOrWhiteSpace(viewFilterDescription))
+            await writer.WriteLineAsync($"# Explorer View Filter    : {viewFilterDescription.Replace('\r', ' ').Replace('\n', ' ')} (only the rows matching this filter are below)").ConfigureAwait(false);
         await writer.WriteLineAsync($"# Breakdown               : MissingInB={run.MissingInBucketBCount:N0}, MissingInA={run.MissingInBucketACount:N0}, SizeMismatch={run.SizeMismatchCount:N0}, ETagMismatch={run.ETagMismatchCount:N0}, ContentMismatch={run.ContentMismatchCount:N0}, SequenceGaps={run.SequenceGapCount:N0}, ContentCheckErrors={run.ContentCheckErrorCount:N0}").ConfigureAwait(false);
         await writer.WriteLineAsync().ConfigureAwait(false);
 
@@ -88,10 +104,11 @@ public static class ReportExporter
         ScanRun run,
         IAsyncEnumerable<RecordedDifference> differences,
         bool includeGracePeriodItems = true,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? viewFilterDescription = null)
     {
         await using var writer = new StreamWriter(outputStream, new UTF8Encoding(false), 16 * 1024, leaveOpen: true);
-        await WriteCsvHeaderAsync(writer, run).ConfigureAwait(false);
+        await WriteCsvHeaderAsync(writer, run, viewFilterDescription).ConfigureAwait(false);
 
         await foreach (var diff in differences.WithCancellation(cancellationToken).ConfigureAwait(false))
         {

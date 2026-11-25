@@ -487,6 +487,31 @@ app.MapGet("/api/runs/{id}/export/csv", async (
         filename);
 });
 
+// 9b. Export the Disparity Explorer's current view as CSV: the same filter as /differences (type, in-flight, key search),
+// every page of it, same columns as the full CSV export.
+app.MapGet("/api/runs/{id}/export/view-csv", async (
+    string id,
+    HttpContext http,
+    IScanRunRepository runRepo,
+    IDifferenceRepository diffRepo,
+    IAuditLogRepository audit,
+    [FromQuery] DifferenceType? type,
+    [FromQuery] bool? withinGracePeriod,
+    [FromQuery] string? searchKey) =>
+{
+    var run = await runRepo.GetByIdAsync(id);
+    if (run == null) return Error(404, $"Run '{id}' not found.");
+
+    string filter = ReportExporter.DescribeViewFilter(type, withinGracePeriod, searchKey);
+    string shortId = run.Id.Length >= 8 ? run.Id[..8] : run.Id;
+    string filename = $"s3compare_view_{SanitizeFileNamePart(run.JobName)}_{shortId}.csv";
+    var ct = http.RequestAborted;
+    return Results.Stream(
+        stream => LoggedExportAsync(audit, run, "Explorer view CSV", () => ReportExporter.ExportToCsvStreamAsync(stream, run, diffRepo.StreamFilteredAsync(id, type, withinGracePeriod, searchKey, ct), true, ct, filter), ct),
+        "text/csv",
+        filename);
+});
+
 // 10. Export JSON
 app.MapGet("/api/runs/{id}/export/json", async (
     string id,

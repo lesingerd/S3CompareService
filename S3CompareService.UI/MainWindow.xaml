@@ -1189,7 +1189,16 @@
                             <DataGridTextColumn Header="Confirmed Disparities" Binding="{Binding FilteredDifferencesCount, StringFormat={}{0:N0}}" Width="150" />
                             <DataGridTextColumn Header="In-Flight Lag" Binding="{Binding InFlightDifferencesCount, StringFormat={}{0:N0}}" Width="110" />
                             <DataGridTextColumn Header="Grace Period" Binding="{Binding ReplicationGracePeriodMinutes, StringFormat={}{0}m}" Width="100" />
-                            <DataGridTextColumn Header="Clipped Window" Binding="{Binding ScanWindowNotes}" Width="*" />
+                            <DataGridTextColumn Header="Clipped Window" Binding="{Binding ScanWindowNotes}" Width="*" MinWidth="380">
+                                <!-- Never cut off: the text wraps and the row grows to show all of it. -->
+                                <DataGridTextColumn.ElementStyle>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="TextWrapping" Value="Wrap" />
+                                        <Setter Property="TextTrimming" Value="None" />
+                                        <Setter Property="VerticalAlignment" Value="Top" />
+                                    </Style>
+                                </DataGridTextColumn.ElementStyle>
+                            </DataGridTextColumn>
                         </DataGrid.Columns>
                     </DataGrid>
 
@@ -1287,7 +1296,9 @@
                             <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
                                 <Button Content="◀ Prev" Command="{Binding PrevDiffPageCommand}" Style="{StaticResource SecondaryButton}" Padding="8,4" Margin="0,0,6,0" />
                                 <TextBlock Text="{Binding PaginationDisplay}" VerticalAlignment="Center" Margin="0,0,6,0" Foreground="#AAAAAA" />
-                                <Button Content="Next ▶" Command="{Binding NextDiffPageCommand}" Style="{StaticResource SecondaryButton}" Padding="8,4" />
+                                <Button Content="Next ▶" Command="{Binding NextDiffPageCommand}" Style="{StaticResource SecondaryButton}" Padding="8,4" Margin="0,0,12,0" />
+                                <Button Content="Export View (CSV)" Command="{Binding ExportViewCsvCommand}" Style="{StaticResource SecondaryButton}" Padding="8,4"
+                                        ToolTip="Exports every page of the current view (filter mode, type and key search) as CSV, with the same columns as the full CSV report." />
                             </StackPanel>
                         </Grid>
                     </Border>

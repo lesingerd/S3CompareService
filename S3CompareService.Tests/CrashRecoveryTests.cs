@@ -94,4 +94,28 @@ public class CrashRecoveryTests
         Assert.IsNotNull(recoveryLog);
         Assert.IsTrue(recoveryLog.Message.Contains(crashedRun.Id));
     }
+
+    [TestMethod]
+    public async Task CrashRecovery_RunWithoutCheckpoint_IsClosedOnce_AndNotReportedAtEveryStart()
+    {
+        var job = new ComparisonJob { Name = "No Checkpoint Job", IsEnabled = true };
+        await _jobRepo.SaveAsync(job);
+        var run = new ScanRun { JobId = job.Id, JobName = job.Name, Status = RunStatus.Interrupted, EndTimeUtc = DateTime.UtcNow };
+        await _runRepo.CreateAsync(run);
+
+        var alertService = new S3CompareService.Core.Notifications.AlertNotificationService(_auditRepo);
+        var coordinator = new ScanExecutionCoordinator(_jobRepo, _runRepo, _diffRepo, _auditRepo, alertService, NullLogger<ScanExecutionCoordinator>.Instance);
+        var recovery = new CrashRecoveryManager(_runRepo, _jobRepo, _auditRepo, coordinator, NullLogger<CrashRecoveryManager>.Instance);
+
+        await recovery.RunStartupRecoveryAsync();
+        var closed = (await _runRepo.GetByIdAsync(run.Id))!;
+        Assert.AreEqual(RunStatus.Failed, closed.Status);
+        StringAssert.Contains(closed.ErrorMessage, "cannot be resumed");
+        Assert.AreEqual(0, (await _runRepo.GetUnfinishedRunsAsync()).Count);
+
+        await recovery.RunStartupRecoveryAsync(); // second start: nothing left to recover
+        var logs = await _auditRepo.GetRecentLogsAsync(50);
+        Assert.AreEqual(1, logs.Count(l => l.Level == "RECOVERY"));
+        Assert.IsTrue(logs.Any(l => l.Message.Contains("No interrupted scan runs found")));
+    }
 }

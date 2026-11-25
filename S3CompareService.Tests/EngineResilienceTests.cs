@@ -174,6 +174,8 @@ public class EngineResilienceTests : TestDbBase
             => _inner.GetAllForRunAsync(scanRunId, withinGracePeriodFilter, cancellationToken);
         public IAsyncEnumerable<RecordedDifference> StreamAllForRunAsync(string scanRunId, bool? withinGracePeriodFilter = null, CancellationToken cancellationToken = default)
             => _inner.StreamAllForRunAsync(scanRunId, withinGracePeriodFilter, cancellationToken);
+        public IAsyncEnumerable<RecordedDifference> StreamFilteredAsync(string scanRunId, DifferenceType? typeFilter, bool? withinGracePeriodFilter, string? searchKey, CancellationToken cancellationToken = default)
+            => _inner.StreamFilteredAsync(scanRunId, typeFilter, withinGracePeriodFilter, searchKey, cancellationToken);
     }
 
     [TestMethod]
