@@ -120,7 +120,7 @@ public sealed class RetentionManager
         }
 
         // Rows of runs deleted by hand whose clean-up was stopped part way (e.g. by a service restart).
-        var orphans = await DeleteOrphanedRowsAsync(options, cancellationToken).ConfigureAwait(false);
+        var orphans = await DeleteOrphanedRowsAsync(options, compact: false, cancellationToken).ConfigureAwait(false); // the pass compacts at its end
         diffs += orphans.Differences;
         snaps += orphans.Snapshots;
 
@@ -179,9 +179,13 @@ public sealed class RetentionManager
 
     /// <summary>
     /// Deletes differences and snapshots whose run no longer exists (after <see cref="DeleteRunAsync"/>, or left by a delete
-    /// that was stopped part way), in small batches. Returns (differences, snapshots) removed.
+    /// that was stopped part way), in small batches, and deduplicated records that no existing run refers to (a record shared
+    /// with a run that still exists is kept). Returns (differences, snapshots) removed.
     /// </summary>
     public async Task<(long Differences, long Snapshots)> DeleteOrphanedRowsAsync(RetentionOptions options, CancellationToken cancellationToken = default)
+        => await DeleteOrphanedRowsAsync(options, compact: true, cancellationToken).ConfigureAwait(false);
+
+    private async Task<(long Differences, long Snapshots)> DeleteOrphanedRowsAsync(RetentionOptions options, bool compact, CancellationToken cancellationToken)
     {
         options = options.Normalized();
         long diffs = 0, snaps = 0;
@@ -200,7 +204,11 @@ public sealed class RetentionManager
                 if (counter == 0) diffs += n; else snaps += n;
             }
         }
-        if (diffs + snaps > 0)
+
+        // Deduplicated store: records that no existing run refers to any more (their runs were all deleted).
+        diffs += await DifferenceStore.CollectGarbageAsync(_factory, options.BatchSize, ct => PauseAsync(options, ct), cancellationToken).ConfigureAwait(false);
+
+        if (compact && diffs + snaps > 0)
         {
             await CheckpointWalAsync(cancellationToken).ConfigureAwait(false);
             await IncrementalVacuumAsync(options, cancellationToken).ConfigureAwait(false);
@@ -334,8 +342,8 @@ public sealed class RetentionManager
             // Busy: the next pass tries again.
         }
 
-        // The vacuum itself writes through the WAL; trim it again.
-        if (total > 0) await CheckpointWalAsync(ct).ConfigureAwait(false);
+        // The vacuum (and opening connections) writes through the WAL; trim it again so a pass always ends with a short WAL.
+        await CheckpointWalAsync(ct).ConfigureAwait(false);
         return total;
     }
 

@@ -33,7 +33,8 @@ public class RetentionTests : TestDbBase
         {
             await DiffRepo.InsertBatchAsync(Enumerable.Range(0, differences).Select(i => new RecordedDifference
             {
-                ScanRunId = run.Id, Key = $"k/{i:D6}", Type = DifferenceType.MissingInBucketB, Details = "x", DetectedAtUtc = start
+                // Details differ per run, so the deduplicated store keeps one record per run (as these tests expect).
+                ScanRunId = run.Id, Key = $"k/{i:D6}", Type = DifferenceType.MissingInBucketB, Details = $"x {run.Id}", DetectedAtUtc = start
             }).ToList());
         }
 
@@ -48,8 +49,15 @@ public class RetentionTests : TestDbBase
         return run;
     }
 
-    private Task<long> CountAsync(string table, string? runId = null) =>
-        RawScalarAsync<long>(runId == null ? $"SELECT COUNT(*) FROM {table}" : $"SELECT COUNT(*) FROM {table} WHERE ScanRunId = @r", new { r = runId });
+    // "RecordedDifferences" means stored differences in either store: a run's view, or every stored row/record.
+    private async Task<long> CountAsync(string table, string? runId = null)
+    {
+        if (table == "RecordedDifferences")
+            return runId != null
+                ? await DiffRepo.GetDifferenceCountAsync(runId)
+                : await RawScalarAsync<long>("SELECT (SELECT COUNT(*) FROM RecordedDifferences) + (SELECT COUNT(*) FROM DifferenceRecords)");
+        return await RawScalarAsync<long>(runId == null ? $"SELECT COUNT(*) FROM {table}" : $"SELECT COUNT(*) FROM {table} WHERE ScanRunId = @r", new { r = runId });
+    }
 
     private async Task<bool> RunExistsAsync(ScanRun run) => await RawScalarAsync<long>("SELECT COUNT(*) FROM ScanRuns WHERE Id = @Id", new { run.Id }) == 1;
 

@@ -12,7 +12,43 @@ public class DatabaseMigrator
     }
 
     /// <summary>Latest schema version. Bump and add a step in <see cref="ApplyStepAsync"/> for every schema change.</summary>
-    public const int LatestVersion = 4;
+    public const int LatestVersion = 5;
+
+    private const string DedupSql = @"
+            CREATE TABLE IF NOT EXISTS Sequences (
+                Name TEXT PRIMARY KEY,
+                Value INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS IX_ScanRuns_JobId_DiffSeq ON ScanRuns (JobId, DiffSeq);
+
+            CREATE TABLE IF NOT EXISTS DifferenceRecords (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                JobId TEXT NOT NULL,
+                FirstSeq INTEGER NOT NULL,
+                LastSeq INTEGER NOT NULL,
+                FirstScanRunId TEXT NOT NULL,
+                Key TEXT NOT NULL,
+                Type INTEGER NOT NULL,
+                Details TEXT,
+                BucketASize INTEGER,
+                BucketBSize INTEGER,
+                BucketAETag TEXT,
+                BucketBETag TEXT,
+                BucketALastModified TEXT,
+                BucketBLastModified TEXT,
+                BucketAStorageClass TEXT,
+                BucketBStorageClass TEXT,
+                DetectedAtUtc TEXT NOT NULL,
+                IsWithinGracePeriod INTEGER NOT NULL DEFAULT 0,
+                GracePeriodCutoffUtc TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS IX_DiffRec_Key ON DifferenceRecords (JobId, Key, FirstSeq, LastSeq);
+            CREATE INDEX IF NOT EXISTS IX_DiffRec_Grace ON DifferenceRecords (JobId, IsWithinGracePeriod, Key, FirstSeq, LastSeq);
+            CREATE INDEX IF NOT EXISTS IX_DiffRec_Type ON DifferenceRecords (JobId, Type, Key, FirstSeq, LastSeq, IsWithinGracePeriod);
+            CREATE INDEX IF NOT EXISTS IX_DiffRec_Seq ON DifferenceRecords (JobId, FirstSeq, LastSeq);
+";
 
     public async Task MigrateAsync(CancellationToken cancellationToken = default)
     {
@@ -72,6 +108,16 @@ public class DatabaseMigrator
                 // Exports and per-range resume clean-up read differences by (ScanRunId, Key); version 2 created this index,
                 // repeated here so a database that lost it still gets it.
                 await conn.ExecuteAsync(new CommandDefinition("CREATE INDEX IF NOT EXISTS IX_Differences_ScanRun_Key ON RecordedDifferences (ScanRunId, Key);", transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
+                break;
+            case 5:
+                // Deduplicated difference storage. A run gets a DiffSeq (from a counter that never goes back, so a number is
+                // never reused after a run is deleted). A DifferenceRecords row belongs to every run of its job whose DiffSeq is
+                // in [FirstSeq, LastSeq]; a repeat scan that finds the same difference only raises LastSeq instead of adding a
+                // row. Runs with DiffSeq NULL (all runs from before this version) keep using RecordedDifferences unchanged, so no
+                // existing data is converted. The indexes carry FirstSeq/LastSeq so that paging and counting one run never
+                // reads the wide rows.
+                await AddColumnIfMissingAsync(conn, trans, "ScanRuns", "DiffSeq", "INTEGER", ct).ConfigureAwait(false);
+                await conn.ExecuteAsync(new CommandDefinition(DedupSql, transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
                 break;
             default:
                 throw new InvalidOperationException($"No migration defined for schema version {version}.");

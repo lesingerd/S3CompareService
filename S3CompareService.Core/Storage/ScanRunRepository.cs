@@ -116,6 +116,11 @@ public class ScanRunRepository : IScanRunRepository
     public async Task CreateAsync(ScanRun run, CancellationToken cancellationToken = default)
     {
         await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var trans = await conn.BeginTransactionAsync(IsolationLevel.Serializable, cancellationToken).ConfigureAwait(false);
+
+        // Every new run takes the next number of the deduplicated difference store (never reused, even after deletes).
+        run.DiffSeq ??= await NextDiffSeqAsync(conn, trans, cancellationToken).ConfigureAwait(false);
+
         string sql = @"
             INSERT INTO ScanRuns (
                 Id, JobId, JobName, StartTimeUtc, EndTimeUtc, Status, Mode,
@@ -138,10 +143,19 @@ public class ScanRunRepository : IScanRunRepository
                 @BucketAObjectsRead, @BucketBObjectsRead, @BucketABytesRead, @BucketBBytesRead,
                 @DurationSeconds, @ErrorMessage
             );
+            UPDATE ScanRuns SET DiffSeq = @DiffSeq WHERE Id = @Id;
         ";
 
-        await conn.ExecuteAsync(new CommandDefinition(sql, BuildParams(run), cancellationToken: cancellationToken)).ConfigureAwait(false);
+        var p = new DynamicParameters(BuildParams(run));
+        p.Add("DiffSeq", run.DiffSeq);
+        await conn.ExecuteAsync(new CommandDefinition(sql, p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        await trans.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    internal static async Task<long> NextDiffSeqAsync(System.Data.Common.DbConnection conn, System.Data.Common.DbTransaction trans, CancellationToken ct)
+        => await conn.ExecuteScalarAsync<long>(new CommandDefinition(
+            "INSERT INTO Sequences (Name, Value) VALUES ('DiffSeq', 1) ON CONFLICT(Name) DO UPDATE SET Value = Value + 1 RETURNING Value;",
+            transaction: trans, cancellationToken: ct)).ConfigureAwait(false);
 
     // Shared SET list: counters plus the run metadata the engine sets at start (start time, grace window, resume info).
     private const string ProgressSetClause = @"
@@ -209,7 +223,7 @@ public class ScanRunRepository : IScanRunRepository
         ResumeCount, SupersededByRunId, DifferencesTruncated, ObjectsCompared, MatchedCount, TotalDifferences,
         FilteredDifferencesCount, InFlightDifferencesCount, MissingInBucketBCount, MissingInBucketACount,
         SizeMismatchCount, ETagMismatchCount, ContentMismatchCount, SequenceGapCount, ContentCheckErrorCount, BucketAObjectsRead,
-        BucketBObjectsRead, BucketABytesRead, BucketBBytesRead, DurationSeconds, ErrorMessage";
+        BucketBObjectsRead, BucketABytesRead, BucketBBytesRead, DurationSeconds, ErrorMessage, DiffSeq";
 
     private const string AllRunColumns = SummaryRunColumns + ", ScanWindowNotes, LastEvaluatedKey, ResumedFromKey";
 
@@ -291,9 +305,21 @@ public class ScanRunRepository : IScanRunRepository
 
         if (!string.IsNullOrEmpty(fromRunId) && fromRunId != runId)
         {
-            await conn.ExecuteAsync(new CommandDefinition(
-                "UPDATE RecordedDifferences SET ScanRunId = @New WHERE ScanRunId = @Old",
-                new { New = runId, Old = fromRunId }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+            var old = await DifferenceStore.GetRunStorageAsync(conn, trans, fromRunId, cancellationToken).ConfigureAwait(false);
+            if (old?.DiffSeq is long oldSeq)
+            {
+                // Deduplicated: the new run takes over the old run's place in the store; the superseded run keeps none.
+                await conn.ExecuteAsync(new CommandDefinition(
+                    "UPDATE ScanRuns SET DiffSeq = NULL WHERE Id = @Old; UPDATE ScanRuns SET DiffSeq = @Seq WHERE Id = @New;",
+                    new { New = runId, Old = fromRunId, Seq = oldSeq }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+            }
+            else
+            {
+                // Legacy rows move to the new run, which then stays a legacy run as well.
+                await conn.ExecuteAsync(new CommandDefinition(
+                    "UPDATE RecordedDifferences SET ScanRunId = @New WHERE ScanRunId = @Old; UPDATE ScanRuns SET DiffSeq = NULL WHERE Id = @New;",
+                    new { New = runId, Old = fromRunId }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+            }
             await conn.ExecuteAsync(new CommandDefinition(
                 "UPDATE ScanRuns SET SupersededByRunId = @New WHERE Id = @Old",
                 new { New = runId, Old = fromRunId }, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
@@ -305,10 +331,16 @@ public class ScanRunRepository : IScanRunRepository
         // SQLite's default BINARY collation compares UTF-8 bytes, i.e. the same order S3 lists keys in. Difference keys are
         // relative to the bucket prefix, like the range bounds.
         int deleted = 0;
+        var storage = await DifferenceStore.GetRunStorageAsync(conn, trans, runId, cancellationToken).ConfigureAwait(false);
         foreach (var range in ranges)
         {
             if (range.Completed) continue;
             string? after = range.ResumeAfter;
+            if (storage?.DiffSeq is long seq)
+            {
+                deleted += await DifferenceStore.RemoveRunAsync(conn, trans, storage.JobId, seq, after, range.Upper, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
             string sql = "DELETE FROM RecordedDifferences WHERE ScanRunId = @RunId"
                 + (after != null ? " AND Key > @After" : string.Empty)
                 + (range.Upper != null ? " AND Key <= @Upper" : string.Empty);
@@ -327,6 +359,9 @@ public class ScanRunRepository : IScanRunRepository
         var p = new { Id = runId };
 
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM RecordedDifferences WHERE ScanRunId = @Id", p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        var storage = await DifferenceStore.GetRunStorageAsync(conn, trans, runId, cancellationToken).ConfigureAwait(false);
+        if (storage?.DiffSeq is long seq)
+            await DifferenceStore.RemoveRunAsync(conn, trans, storage.JobId, seq, null, null, cancellationToken).ConfigureAwait(false);
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM BucketMetadataSnapshots WHERE ScanRunId = @Id", p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
         await conn.ExecuteAsync(new CommandDefinition("DELETE FROM Checkpoints WHERE ScanRunId = @Id", p, transaction: trans, cancellationToken: cancellationToken)).ConfigureAwait(false);
         await conn.ExecuteAsync(new CommandDefinition(@"
@@ -488,6 +523,7 @@ public class ScanRunRepository : IScanRunRepository
             ResumeCount = (int)Num("ResumeCount"),
             SupersededByRunId = Str("SupersededByRunId"),
             DifferencesTruncated = Num("DifferencesTruncated") == 1,
+            DiffSeq = Raw("DiffSeq") is { } seq and not DBNull ? Convert.ToInt64(seq, System.Globalization.CultureInfo.InvariantCulture) : null,
             ObjectsCompared = Num("ObjectsCompared"),
             MatchedCount = Num("MatchedCount"),
             TotalDifferences = Num("TotalDifferences"),

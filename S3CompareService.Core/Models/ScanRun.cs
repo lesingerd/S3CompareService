@@ -34,6 +34,12 @@ public class ScanRun
     /// </summary>
     public bool DifferencesTruncated { get; set; }
 
+    /// <summary>
+    /// Position of this run in the deduplicated difference store (assigned when the run is created, never reused). Null for
+    /// runs created before deduplication: their differences are stored one row per run, as before.
+    /// </summary>
+    public long? DiffSeq { get; set; }
+
     // Summary counts
     public long ObjectsCompared { get; set; }
     public long MatchedCount { get; set; }
