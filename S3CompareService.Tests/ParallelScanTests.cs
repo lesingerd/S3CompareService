@@ -556,6 +556,28 @@ public class ParallelScanTests : TestDbBase
         Assert.IsNotNull(ScanOptions.Validate(new JobPerformanceSettings { MaxConcurrentContentChecks = 0 }));
         Assert.IsNotNull(ScanOptions.Validate(new JobPerformanceSettings { MaxDiscoveryRequests = -1 }));
         Assert.IsNull(ScanOptions.Validate(new JobPerformanceSettings { MaxDiscoveryRequests = 0, MaxListRequestsPerSecond = 0, MaxObjectsPerSecond = 0 }));
+        Assert.IsNull(ScanOptions.Validate(new JobPerformanceSettings { MaxRecordedDifferencesPerRun = 0 }));
+        Assert.IsNotNull(ScanOptions.Validate(new JobPerformanceSettings { MaxRecordedDifferencesPerRun = -1 }));
+        Assert.IsNotNull(ScanOptions.Validate(new JobPerformanceSettings { MaxRecordedDifferencesPerRun = ScanOptions.MaxRecordedDifferencesPerRunLimit + 1 }));
+        Assert.IsFalse(new JobPerformanceSettings { MaxRecordedDifferencesPerRun = 5 }.IsEmpty);
+    }
+
+    [TestMethod]
+    public async Task JobOverride_OfTheStoredDifferencesLimit_IsUsedByTheScan()
+    {
+        var (a, b) = Generate(91, HierarchicalKeys(10, 30));
+        var job = NewJob();
+        var service = Options(4); // MaxRecordedDifferencesPerRun = 0 (unlimited) at service level
+        job.Performance.MaxRecordedDifferencesPerRun = 25;
+        var capped = await RunPartitionedAsync(job, new FakeS3Lister(a), new FakeS3Lister(b), service.ForJob(job));
+        Assert.IsTrue(capped.Run.DifferencesTruncated);
+        Assert.AreEqual(25, capped.Diffs.Count);
+        Assert.IsTrue(capped.Run.TotalDifferences > 25, "the counters still count every difference");
+
+        job.Performance.MaxRecordedDifferencesPerRun = 0;
+        var unlimited = await RunPartitionedAsync(job, new FakeS3Lister(a), new FakeS3Lister(b), service.ForJob(job));
+        Assert.IsFalse(unlimited.Run.DifferencesTruncated);
+        Assert.AreEqual(unlimited.Run.TotalDifferences, unlimited.Diffs.Count);
     }
 
     [TestMethod]

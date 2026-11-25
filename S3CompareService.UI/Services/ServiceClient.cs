@@ -92,6 +92,7 @@ public class ScanDefaultsDto
     public int MaxConcurrentContentChecks { get; set; } = ScanOptions.DefaultMaxConcurrentContentChecks;
     public int MaxDiscoveryRequests { get; set; } = ScanOptions.DefaultMaxDiscoveryRequests;
     public int MaxPlanningSeconds { get; set; } = ScanOptions.DefaultMaxPlanningSeconds;
+    public long MaxRecordedDifferencesPerRun { get; set; } = ScanOptions.DefaultMaxRecordedDifferencesPerRun;
 
     public string MaxParallelPartitionsHint => $"default: {MaxParallelPartitions}";
     public string PrefetchPagesHint => $"default: {PrefetchPages}";
@@ -100,6 +101,7 @@ public class ScanDefaultsDto
     public string MaxConcurrentContentChecksHint => $"default: {MaxConcurrentContentChecks}";
     public string MaxDiscoveryRequestsHint => $"default: {MaxDiscoveryRequests}";
     public string MaxPlanningSecondsHint => MaxPlanningSeconds > 0 ? $"default: {MaxPlanningSeconds}" : "default: no limit";
+    public string MaxRecordedDifferencesPerRunHint => MaxRecordedDifferencesPerRun > 0 ? $"default: {MaxRecordedDifferencesPerRun:N0}" : "default: unlimited";
 }
 
 public class DifferencePageResult

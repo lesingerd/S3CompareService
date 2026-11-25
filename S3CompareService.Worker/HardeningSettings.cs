@@ -38,8 +38,12 @@ public static class HardeningSettings
     public static ScanOptions Scan(IConfiguration configuration, Action<string>? warn = null)
     {
         var options = new ScanOptions();
-        if (long.TryParse(configuration["S3Compare:MaxRecordedDifferencesPerRun"], out var cap) && cap >= 0)
-            options.MaxRecordedDifferencesPerRun = cap;
+        string? capText = configuration["S3Compare:MaxRecordedDifferencesPerRun"];
+        if (!string.IsNullOrWhiteSpace(capText))
+        {
+            if (long.TryParse(capText, out var cap) && cap >= 0) options.MaxRecordedDifferencesPerRun = cap;
+            else warn?.Invoke($"S3Compare:MaxRecordedDifferencesPerRun = '{capText}' is not a whole number of at least 0; using the default {options.MaxRecordedDifferencesPerRun:N0}.");
+        }
         options.MaxListRequestsPerSecond = ReadDouble(configuration, "MaxListRequestsPerSecond", options.MaxListRequestsPerSecond, ScanOptions.MaxListRequestsPerSecondLimit, warn);
         options.MaxObjectsPerSecond = ReadDouble(configuration, "MaxObjectsPerSecond", options.MaxObjectsPerSecond, ScanOptions.MaxObjectsPerSecondLimit, warn);
         options.MaxParallelPartitions = ReadInt(configuration, "MaxParallelPartitions", options.MaxParallelPartitions, 1, ScanOptions.MaxParallelPartitionsLimit, warn);
@@ -60,6 +64,19 @@ public static class HardeningSettings
             warn?.Invoke($"S3Compare:PrefetchPages lowered to {options.PrefetchPages}: MaxParallelPartitions x (PrefetchPages + 1) may not exceed {ScanOptions.MaxBufferedPagesPerBucket} list pages per bucket.");
         }
         return options;
+    }
+
+    /// <summary>One audit log line with the effective service-wide scan defaults (what a job without overrides uses).</summary>
+    public static string DescribeScan(ScanOptions o)
+    {
+        static string Limit(double v) => v > 0 ? v.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) : "unlimited";
+        return "Effective scan defaults (jobs can override most of them under Performance / Throttling): "
+            + $"MaxRecordedDifferencesPerRun = {(o.MaxRecordedDifferencesPerRun > 0 ? o.MaxRecordedDifferencesPerRun.ToString("N0") : "unlimited")}; "
+            + $"MaxParallelPartitions = {o.MaxParallelPartitions}; PrefetchPages = {o.PrefetchPages}; "
+            + $"MaxListRequestsPerSecond = {Limit(o.MaxListRequestsPerSecond)}; MaxObjectsPerSecond = {Limit(o.MaxObjectsPerSecond)}; "
+            + $"MaxConcurrentContentChecks = {o.MaxConcurrentContentChecks}; MaxDiscoveryRequests = {o.MaxDiscoveryRequests}; "
+            + $"MaxPlanningSeconds = {(o.MaxPlanningSeconds > 0 ? o.MaxPlanningSeconds.ToString() : "no limit")}; PartitionOversubscription = {o.PartitionOversubscription}; "
+            + $"MaxDiscoveryDepth = {o.MaxDiscoveryDepth}; EnableRangeSplitting = {(o.EnableRangeSplitting ? "true" : "false")}.";
     }
 
     private static double ReadDouble(IConfiguration configuration, string name, double fallback, double max, Action<string>? warn)
