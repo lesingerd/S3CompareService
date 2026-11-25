@@ -236,6 +236,7 @@ public class ScanExecutionCoordinator
             await _jobRepo.UpdateRunScheduleStateAsync(job.Id, DateTime.UtcNow, null, RunStatus.Completed);
             _logger.LogInformation("Scan execution finished for Job '{JobName}' (RunId: {RunId})", job.Name, run.Id);
             Notify(() => _events.RunCompleted(job, run));
+            await SafeAsync(() => LogStorageStatsAsync(job, run), "log difference storage");
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -305,6 +306,16 @@ public class ScanExecutionCoordinator
     {
         try { action(); }
         catch { }
+    }
+
+    /// <summary>Audit log line: how many of the run's differences were new records and how many were carried over unchanged.</summary>
+    private async Task LogStorageStatsAsync(ComparisonJob job, ScanRun run)
+    {
+        var stats = await _diffRepo.GetStorageStatsAsync(run.Id).ConfigureAwait(false);
+        if (stats == null || !stats.Deduplicated) return;
+        await _auditLogRepo.LogAsync("INFO", "Storage",
+            $"Run '{run.Id}' ({job.Name}): {stats.InRun:N0} stored difference(s); {stats.NewRecords:N0} new or changed (stored now), {stats.CarriedOver:N0} unchanged from the previous run (not stored again).",
+            scanRunId: run.Id, jobId: job.Id).ConfigureAwait(false);
     }
 
     private async Task SafeAsync(Func<Task> action, string what)
