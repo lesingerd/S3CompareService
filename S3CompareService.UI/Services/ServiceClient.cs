@@ -603,6 +603,24 @@ public class ServiceClient
         }
     }
 
+    /// <summary>Deletes a finished run (its stored differences are removed by the service in the background).</summary>
+    public async Task<(bool Success, string Message)> DeleteRunAsync(string runId)
+    {
+        try
+        {
+            using var resp = await SendWriteAsync(HttpMethod.Delete, $"/api/runs/{Uri.EscapeDataString(runId)}").ConfigureAwait(false);
+            return (true, string.Empty);
+        }
+        catch (ServiceOfflineException)
+        {
+            return (false, "The service must be running to delete runs.");
+        }
+        catch (ServiceApiException ex)
+        {
+            return (false, ex.Message);
+        }
+    }
+
     public Task<(bool Success, string Message)> PauseRunAsync(string runId) => PostRunActionAsync(runId, "pause");
     public Task<(bool Success, string Message)> ResumeRunAsync(string runId) => PostRunActionAsync(runId, "resume");
     public Task<(bool Success, string Message)> CancelRunAsync(string runId) => PostRunActionAsync(runId, "cancel");

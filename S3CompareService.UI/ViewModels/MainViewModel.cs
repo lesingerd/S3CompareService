@@ -368,6 +368,7 @@ public class MainViewModel : ViewModelBase
     public RelayCommand TestDailyDigestCommand { get; }
 
     public RelayCommand RefreshRunsCommand { get; }
+    public RelayCommand DeleteRunsCommand { get; }
     public RelayCommand RefreshDifferencesCommand { get; }
     public RelayCommand NextDiffPageCommand { get; }
     public RelayCommand PrevDiffPageCommand { get; }
@@ -408,6 +409,7 @@ public class MainViewModel : ViewModelBase
         TestDailyDigestCommand = new RelayCommand(async () => await TestDailyDigestAsync());
 
         RefreshRunsCommand = new RelayCommand(async () => await SafeAsync(LoadRunsAsync, "load runs"));
+        DeleteRunsCommand = new RelayCommand(async p => await DeleteRunsAsync(p));
         RefreshDifferencesCommand = new RelayCommand(async () => await SafeAsync(LoadDifferencesAsync, "load differences"));
         NextDiffPageCommand = new RelayCommand(async () =>
         {
@@ -760,6 +762,51 @@ public class MainViewModel : ViewModelBase
             MessageBox.Show($"[FAILED] Daily all-clear digest report failed:\n{msg}", "Daily Digest Test", MessageBoxButton.OK, MessageBoxImage.Error);
             StatusMessage = "Daily digest test failed.";
         }
+    }
+
+    /// <summary>Deletes the runs selected in the Audit Runs grid (parameter: the grid's SelectedItems) after a confirmation.</summary>
+    private async Task DeleteRunsAsync(object? parameter)
+    {
+        var runs = (parameter as System.Collections.IList)?.OfType<ScanRun>().ToList() ?? new List<ScanRun>();
+        if (runs.Count == 0 && SelectedRun != null) runs.Add(SelectedRun);
+        if (runs.Count == 0)
+        {
+            MessageBox.Show("Select one or more runs first (Ctrl+click or Shift+click to select several).", "Delete Runs", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var active = runs.Where(r => r.Status is RunStatus.Running or RunStatus.Paused or RunStatus.Pending).ToList();
+        var deletable = runs.Except(active).ToList();
+        if (deletable.Count == 0)
+        {
+            MessageBox.Show("The selected run(s) are still active. Cancel a scan before deleting it.", "Delete Runs", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        long rows = deletable.Sum(r => r.TotalDifferences);
+        string list = string.Join("\n", deletable.Take(10).Select(r => $"  • {r.StartTimeUtc:yyyy-MM-dd HH:mm}  {r.JobName}  ({r.Status}, {r.TotalDifferences:N0} differences)"));
+        if (deletable.Count > 10) list += $"\n  … and {deletable.Count - 10} more";
+        string skipped = active.Count > 0 ? $"\n\n{active.Count} active run(s) in the selection will be skipped." : string.Empty;
+        var answer = MessageBox.Show(
+            $"Permanently delete {deletable.Count} run(s) and their stored differences (up to {rows:N0} rows)?\n\n{list}{skipped}\n\nThis cannot be undone. Audit log lines about these runs are kept.",
+            "Confirm Delete Runs", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+        if (answer != MessageBoxResult.Yes) return;
+
+        int ok = 0;
+        var failures = new List<string>();
+        foreach (var run in deletable)
+        {
+            StatusMessage = $"Deleting run {ok + failures.Count + 1} of {deletable.Count}...";
+            var (success, message) = await _client.DeleteRunAsync(run.Id);
+            if (success) ok++;
+            else failures.Add($"{run.StartTimeUtc:yyyy-MM-dd HH:mm} {run.JobName}: {message}");
+        }
+
+        if (SelectedRun != null && deletable.Any(r => r.Id == SelectedRun.Id)) SelectedRun = null;
+        await SafeAsync(LoadRunsAsync, "refresh runs");
+        StatusMessage = $"Deleted {ok} run(s). Their stored differences are being removed in the background (see Service Audit Logs, category RunDelete).";
+        if (failures.Count > 0)
+            MessageBox.Show($"Deleted {ok} run(s). {failures.Count} could not be deleted:\n\n{string.Join("\n", failures.Take(10))}", "Delete Runs", MessageBoxButton.OK, MessageBoxImage.Warning);
     }
 
     public async Task LoadRunsAsync()
