@@ -27,9 +27,15 @@ public class JobPerformanceSettings
     /// <summary>Time box of the partition planner in seconds (service default 60). 0 = no limit.</summary>
     public int? MaxPlanningSeconds { get; set; }
 
+    /// <summary>
+    /// Difference rows stored per run (service default S3Compare:MaxRecordedDifferencesPerRun, 100,000). Past it the counters stay
+    /// exact but no more rows are stored, so the Disparity Explorer and the exports show only the first ones. 0 = unlimited.
+    /// </summary>
+    public long? MaxRecordedDifferencesPerRun { get; set; }
+
     /// <summary>True when no override is set.</summary>
     public bool IsEmpty =>
         MaxParallelPartitions is null && PrefetchPages is null && MaxListRequestsPerSecond is null
         && MaxObjectsPerSecond is null && MaxConcurrentContentChecks is null && MaxDiscoveryRequests is null
-        && MaxPlanningSeconds is null;
+        && MaxPlanningSeconds is null && MaxRecordedDifferencesPerRun is null;
 }

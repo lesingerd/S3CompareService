@@ -558,7 +558,7 @@ public class ServiceComparisonEngine
             {
                 await LogAsync("WARN", $"Checkpoint for run '{_scanRun.Id}' was discarded ({CheckpointDiscardReason}); starting a fresh scan.").ConfigureAwait(false);
             }
-            await LogAsync("INFO", $"Starting scan run '{_scanRun.Id}' for job '{_job.Name}' (Grace Period: {_job.ReplicationGracePeriodMinutes}m){(IsResuming ? $", resuming after key '{FrontierKey()}'" : string.Empty)}").ConfigureAwait(false);
+            await LogAsync("INFO", $"Starting scan run '{_scanRun.Id}' for job '{_job.Name}' (Grace Period: {_job.ReplicationGracePeriodMinutes}m, stored-differences limit: {(_maxRecordedDifferences > 0 ? _maxRecordedDifferences.ToString("N0") : "unlimited")}{(_job.Performance?.MaxRecordedDifferencesPerRun != null ? " (job override)" : string.Empty)}){(IsResuming ? $", resuming after key '{FrontierKey()}'" : string.Empty)}").ConfigureAwait(false);
 
             if (_options.MaxObjectsPerSecond > 0)
             {

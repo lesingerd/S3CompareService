@@ -112,4 +112,78 @@ public class IdleMonSettingsFileTests
             Environment.SetEnvironmentVariable(envName, null);
         }
     }
+
+    // ---------------- settings file visibility (audit log) ----------------
+
+    private static async Task<List<string>> SettingsLogsAsync(HttpClient client)
+    {
+        using var doc = JsonDocument.Parse(await client.GetStringAsync("/api/logs?count=200"));
+        return doc.RootElement.EnumerateArray()
+            .Where(e => e.GetProperty("category").GetString() == "Settings")
+            .Select(e => e.GetProperty("level").GetString() + " " + e.GetProperty("message").GetString())
+            .ToList();
+    }
+
+    [TestMethod]
+    public async Task Startup_LogsThatTheLocalFileWasLoaded_WithItsValues_AndMasksSecrets()
+    {
+        File.WriteAllText(LocalSettings.PathFor(_dir), """
+            {
+              // comments and trailing commas are allowed, as in appsettings.json
+              "S3Compare": { "MaxRecordedDifferencesPerRun": 0, "MaxParallelPartitions": 16, },
+              "IdleMon": { "ApiKey": "do-not-log-me" }
+            }
+            """);
+        await using var factory = Factory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-S3Compare-Client", "ui");
+        var logs = await SettingsLogsAsync(client);
+
+        var loaded = logs.Single(l => l.Contains("Local settings file loaded"));
+        StringAssert.StartsWith(loaded, "INFO ");
+        StringAssert.Contains(loaded, LocalSettings.PathFor(_dir));
+        StringAssert.Contains(loaded, "S3Compare:MaxRecordedDifferencesPerRun = 0");
+        StringAssert.Contains(loaded, "S3Compare:MaxParallelPartitions = 16");
+        StringAssert.Contains(loaded, "IdleMon:ApiKey = ********");
+        Assert.IsFalse(logs.Any(l => l.Contains("do-not-log-me")), "secrets are never logged");
+
+        var effective = logs.Single(l => l.Contains("Effective scan defaults"));
+        StringAssert.Contains(effective, "MaxRecordedDifferencesPerRun = unlimited");
+        StringAssert.Contains(effective, "MaxParallelPartitions = 16");
+    }
+
+    [TestMethod]
+    public async Task Startup_WithoutLocalFile_LogsThatItWasNotFound()
+    {
+        await using var factory = Factory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-S3Compare-Client", "ui");
+        var logs = await SettingsLogsAsync(client);
+        Assert.IsTrue(logs.Any(l => l.StartsWith("INFO ") && l.Contains("Local settings file not found")), string.Join("\n", logs));
+        Assert.IsTrue(logs.Any(l => l.Contains("MaxRecordedDifferencesPerRun = 100,000")), string.Join("\n", logs));
+    }
+
+    [TestMethod]
+    public async Task Startup_BrokenLocalFile_IsIgnored_TheServiceStillStarts_AndTheErrorIsLogged()
+    {
+        File.WriteAllText(LocalSettings.PathFor(_dir), """{ "S3Compare": { "MaxRecordedDifferencesPerRun": 0 """); // unterminated
+        await using var factory = Factory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-S3Compare-Client", "ui");
+        var logs = await SettingsLogsAsync(client);
+        var error = logs.Single(l => l.Contains("could not be read and was IGNORED"));
+        StringAssert.StartsWith(error, "ERROR FAILED:");
+        Assert.IsTrue(logs.Any(l => l.Contains("MaxRecordedDifferencesPerRun = 100,000")), "the defaults apply");
+    }
+
+    [TestMethod]
+    public async Task Startup_UnreadableValue_IsLoggedAsAWarning()
+    {
+        File.WriteAllText(LocalSettings.PathFor(_dir), """{ "S3Compare": { "MaxRecordedDifferencesPerRun": "lots" } }""");
+        await using var factory = Factory();
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-S3Compare-Client", "ui");
+        var logs = await SettingsLogsAsync(client);
+        Assert.IsTrue(logs.Any(l => l.StartsWith("WARN ") && l.Contains("MaxRecordedDifferencesPerRun = 'lots'")), string.Join("\n", logs));
+    }
 }

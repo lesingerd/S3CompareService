@@ -180,6 +180,8 @@ public class MainViewModel : ViewModelBase
             if (SetField(ref _selectedRun, value))
             {
                 OnPropertyChanged(nameof(HasSelectedRun));
+                if (value?.Id != _storedCountRunId) { _storedDifferenceCount = -1; _storedCountRunId = null; }
+                RaiseTruncationWarning();
                 if (!_suppressRunReload) _ = SafeAsync(() => LoadRunDetailsAsync(value), "load run details");
                 UpdateCurrentActiveScan();
             }
@@ -187,6 +189,46 @@ public class MainViewModel : ViewModelBase
     }
     private bool _suppressRunReload;
     public bool HasSelectedRun => SelectedRun != null;
+
+    // ---- Stored-differences limit: a run that hit it holds only the first N rows ----
+    private long _storedDifferenceCount = -1;
+    private string? _storedCountRunId;
+
+    /// <summary>True when the selected run hit the stored-differences limit (its list and exports are incomplete).</summary>
+    public bool ShowTruncationWarning => SelectedRun?.DifferencesTruncated == true;
+
+    /// <summary>"Only 100,000 of 1,000,000 differences were stored ..." for the Disparity Explorer banner and the export dialog.</summary>
+    public string TruncationWarning
+    {
+        get
+        {
+            var run = SelectedRun;
+            if (run == null || !run.DifferencesTruncated) return string.Empty;
+            string stored = _storedDifferenceCount >= 0 && _storedCountRunId == run.Id ? _storedDifferenceCount.ToString("N0") : "only some";
+            var m = System.Text.RegularExpressions.Regex.Match(run.ScanWindowNotes ?? string.Empty, @"only the first ([\d,.Â â€¯ ]+) differences");
+            string cap = m.Success ? $" (limit: {m.Groups[1].Value.Trim()} stored differences per run)" : string.Empty;
+            return $"âš  LIMIT REACHED: {stored} of {run.TotalDifferences:N0} differences were stored for this run{cap}. "
+                + "The counters are exact, but this list and the CSV/JSON exports contain only the stored rows (with parallel scanning, the first ones found, not the first by key). "
+                + "To keep them all, raise \"Max Stored Differences\" for this job (Comparison Jobs > Performance / Throttling; 0 = unlimited) or S3Compare:MaxRecordedDifferencesPerRun for the service, then run a new scan.";
+        }
+    }
+
+    private void RaiseTruncationWarning()
+    {
+        OnPropertyChanged(nameof(ShowTruncationWarning));
+        OnPropertyChanged(nameof(TruncationWarning));
+    }
+
+    /// <summary>Counts the rows stored for a truncated run (unfiltered), for the banner.</summary>
+    private async Task LoadStoredDifferenceCountAsync(ScanRun run)
+    {
+        if (!run.DifferencesTruncated || _storedCountRunId == run.Id) return;
+        var page = await _client.GetDifferencesAsync(run.Id, null, null, null, 0, 1);
+        if (SelectedRun?.Id != run.Id) return;
+        _storedDifferenceCount = page.TotalCount;
+        _storedCountRunId = run.Id;
+        RaiseTruncationWarning();
+    }
 
     public ObservableCollection<BucketMetadataSnapshot> SelectedRunSnapshots { get; } = new();
 
@@ -782,6 +824,7 @@ public class MainViewModel : ViewModelBase
 
         var snapshots = await _client.GetSnapshotsAsync(run.Id);
         foreach (var s in snapshots) SelectedRunSnapshots.Add(s);
+        await SafeAsync(() => LoadStoredDifferenceCountAsync(run), "count stored differences");
 
         _diffPageIndex = 0;
         await SafeAsync(LoadDifferencesAsync, "load differences");
@@ -869,6 +912,13 @@ public class MainViewModel : ViewModelBase
             return;
         }
 
+        if (SelectedRun.DifferencesTruncated)
+        {
+            var answer = MessageBox.Show(TruncationWarning + "\n\nExport the stored rows anyway?", "Export: stored-differences limit reached",
+                MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (answer != MessageBoxResult.Yes) return;
+        }
+
         string safeJobName = SanitizeFileName(SelectedRun.JobName);
         string shortId = SelectedRun.Id.Length >= 8 ? SelectedRun.Id[..8] : SelectedRun.Id;
 
@@ -889,7 +939,10 @@ public class MainViewModel : ViewModelBase
                 // Use the service's streaming export endpoint (all rows, long timeout) instead of paging.
                 await _client.ExportRunAsync(SelectedRun.Id, isJson, includeGrace, dlg.FileName);
                 StatusMessage = $"Exported report to {dlg.FileName}";
-                MessageBox.Show($"Exported report to {dlg.FileName}", "Export Completed", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(SelectedRun?.DifferencesTruncated == true
+                        ? $"Exported report to {dlg.FileName}\n\nIt contains only the stored rows: {TruncationWarning}"
+                        : $"Exported report to {dlg.FileName}",
+                    "Export Completed", MessageBoxButton.OK, SelectedRun?.DifferencesTruncated == true ? MessageBoxImage.Warning : MessageBoxImage.Information);
             }
             catch (Exception ex)
             {

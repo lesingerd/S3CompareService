@@ -847,6 +847,23 @@
                                             </Grid>
                                             <TextBlock Grid.Column="3" Text="Parallel Partitions = 1 skips planning entirely (one key range)." FontSize="11" Foreground="#888888" VerticalAlignment="Center" />
                                         </Grid>
+
+                                        <Grid Margin="0,8,0,0">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="230" />
+                                                <ColumnDefinition Width="100" />
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="*" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Text="Max Stored Differences (per run):" VerticalAlignment="Center"
+                                                       ToolTip="Difference rows stored per scan run (service default 100,000). Past it the counters stay exact, but the Disparity Explorer and the exports hold only the stored rows. 0 = unlimited (each row is roughly 1 KB of database)." />
+                                            <Grid Grid.Column="1">
+                                                <TextBox x:Name="PerfMaxRecordedDifferences" Text="{Binding SelectedJob.Performance.MaxRecordedDifferencesPerRun, TargetNullValue='', UpdateSourceTrigger=PropertyChanged}"
+                                                         ToolTip="0 to 1000000000 (0 = unlimited). Empty = service default (S3Compare:MaxRecordedDifferencesPerRun, 100,000)." />
+                                                <TextBlock Style="{StaticResource HintText}" Text="{Binding ScanDefaults.MaxRecordedDifferencesPerRunHint}" Tag="{Binding Text, ElementName=PerfMaxRecordedDifferences}" />
+                                            </Grid>
+                                            <TextBlock Grid.Column="3" Text="About 1 KB of database per stored difference: 1,000,000 ≈ 1 GB per run, kept until retention removes the run." FontSize="11" Foreground="#888888" VerticalAlignment="Center" TextWrapping="Wrap" />
+                                        </Grid>
                                     </StackPanel>
                                 </Border>
 
@@ -1212,6 +1229,8 @@
                     <Grid.RowDefinitions>
                         <!-- Filters -->
                         <RowDefinition Height="Auto" />
+                        <!-- Stored-differences limit warning -->
+                        <RowDefinition Height="Auto" />
                         <!-- Grid -->
                         <RowDefinition Height="*" />
                         <!-- Detail Side-by-Side card -->
@@ -1273,8 +1292,14 @@
                         </Grid>
                     </Border>
 
+                    <!-- Stored-differences limit warning (only for a run that hit the limit) -->
+                    <Border Grid.Row="1" Background="#3A2E12" BorderBrush="#FFB300" BorderThickness="1" CornerRadius="4" Padding="10,8" Margin="0,0,0,10"
+                            Visibility="{Binding ShowTruncationWarning, Converter={StaticResource BoolToVisConverter}}">
+                        <TextBox Style="{StaticResource SelectableText}" Text="{Binding TruncationWarning, Mode=OneWay}" Foreground="#FFD166" FontWeight="SemiBold" />
+                    </Border>
+
                     <!-- Differences Table -->
-                    <DataGrid Grid.Row="1" ItemsSource="{Binding Differences}" SelectedItem="{Binding SelectedDifference}">
+                    <DataGrid Grid.Row="2" ItemsSource="{Binding Differences}" SelectedItem="{Binding SelectedDifference}">
                         <DataGrid.Columns>
                             <!-- Scan Window Tag -->
                             <DataGridTemplateColumn Header="Replication Tag" Width="170">
@@ -1308,7 +1333,7 @@
                     </DataGrid>
 
                     <!-- Side-by-Side Detail Inspection Card -->
-                    <Border Grid.Row="2" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,10,0,0">
+                    <Border Grid.Row="3" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1" CornerRadius="4" Padding="12" Margin="0,10,0,0">
                         <Grid>
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />

@@ -34,6 +34,8 @@ public sealed class ScanOptions
     public const int MaxDiscoveryRequestsLimit = 100_000;
     public const int PartitionOversubscriptionLimit = 64;
     public const int MaxDiscoveryDepthLimit = 10;
+    /// <summary>Upper limit of a per-job MaxRecordedDifferencesPerRun override (0 = unlimited is always allowed).</summary>
+    public const long MaxRecordedDifferencesPerRunLimit = 1_000_000_000;
     public const int MaxPlanningSecondsLimit = 86_400;
 
     /// <summary>
@@ -132,6 +134,7 @@ public sealed class ScanOptions
         if (p.MaxConcurrentContentChecks is int cc) o.MaxConcurrentContentChecks = cc;
         if (p.MaxDiscoveryRequests is int dr) o.MaxDiscoveryRequests = dr;
         if (p.MaxPlanningSeconds is int ps) o.MaxPlanningSeconds = ps;
+        if (p.MaxRecordedDifferencesPerRun is long md) o.MaxRecordedDifferencesPerRun = md;
         o.ApplyMemoryCap();
         return o;
     }
@@ -161,6 +164,9 @@ public sealed class ScanOptions
             ?? CheckInt(p.MaxConcurrentContentChecks, nameof(p.MaxConcurrentContentChecks), 1, MaxConcurrentContentChecksLimit)
             ?? CheckInt(p.MaxDiscoveryRequests, nameof(p.MaxDiscoveryRequests), 0, MaxDiscoveryRequestsLimit)
             ?? CheckInt(p.MaxPlanningSeconds, nameof(p.MaxPlanningSeconds), 0, MaxPlanningSecondsLimit)
+            ?? (p.MaxRecordedDifferencesPerRun is long md && (md < 0 || md > MaxRecordedDifferencesPerRunLimit)
+                ? $"MaxRecordedDifferencesPerRun must be between 0 and {MaxRecordedDifferencesPerRunLimit} (0 = unlimited, or empty for the service default)."
+                : null)
             ?? (p.MaxParallelPartitions is int mp && p.PrefetchPages is int pf && (long)mp * (pf + 1) > MaxBufferedPagesPerBucket
                 ? $"MaxParallelPartitions x (PrefetchPages + 1) must not exceed {MaxBufferedPagesPerBucket} (list pages held in memory per bucket)."
                 : null);

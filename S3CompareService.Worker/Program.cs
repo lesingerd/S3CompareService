@@ -33,7 +33,10 @@ if (!string.IsNullOrWhiteSpace(dataDirectory))
 
 // Optional override file in the data directory (survives service updates; restart to apply). Command-line arguments still win.
 string localSettingsFile = LocalSettings.PathFor(Path.GetDirectoryName(DatabaseConfig.GetDefaultDatabasePath())!);
-LocalSettings.Apply(builder.Configuration, localSettingsFile, args);
+var localSettingsLoad = LocalSettings.Apply(builder.Configuration, localSettingsFile, args);
+// Setting warnings (out-of-range or unreadable values) go to the error output and, once the database is ready, to the audit log.
+var settingWarnings = new List<string>();
+Action<string> settingWarn = m => { Console.Error.WriteLine(m); settingWarnings.Add(m); };
 
 // Defense in depth for DNS rebinding: Kestrel's host filtering plus the explicit middleware below.
 builder.Configuration["AllowedHosts"] = "localhost;127.0.0.1;[::1]";
@@ -49,10 +52,11 @@ builder.Host.UseWindowsService(options =>
 
 // Core Storage & Repositories
 // Long-run hardening settings (retention, difference cap, request rate limit, process priority).
-HardeningSettings.ApplyPriority(builder.Configuration[HardeningSettings.ProcessPriorityKey], m => Console.Error.WriteLine(m));
+HardeningSettings.ApplyPriority(builder.Configuration[HardeningSettings.ProcessPriorityKey], settingWarn);
 var retentionOptions = HardeningSettings.Retention(builder.Configuration);
 builder.Services.AddSingleton(retentionOptions);
-builder.Services.AddSingleton(HardeningSettings.Scan(builder.Configuration, m => Console.Error.WriteLine(m)));
+var scanDefaults = HardeningSettings.Scan(builder.Configuration, settingWarn);
+builder.Services.AddSingleton(scanDefaults);
 builder.Services.AddSingleton<RetentionManager>();
 builder.Services.AddSingleton<SqliteConnectionFactory>();
 builder.Services.AddSingleton<DatabaseMigrator>();
@@ -85,6 +89,13 @@ using (var scope = app.Services.CreateScope())
     var auditRepo = scope.ServiceProvider.GetRequiredService<IAuditLogRepository>();
     await migrator.MigrateAsync();
     await auditRepo.LogAsync("INFO", "ServiceHost", "Database migrations initialized successfully in WAL mode.");
+
+    // Show that the settings were read: the local override file (found / loaded with its values / ignored and why), any
+    // setting that was out of range or unreadable, and the effective scan defaults the jobs fall back to.
+    var (settingsLevel, settingsMessage) = LocalSettings.Describe(localSettingsLoad);
+    await auditRepo.LogAsync(settingsLevel, "Settings", settingsMessage);
+    foreach (var w in settingWarnings) await auditRepo.LogAsync("WARN", "Settings", w);
+    await auditRepo.LogAsync("INFO", "Settings", HardeningSettings.DescribeScan(scanDefaults));
 
     try
     {
@@ -514,7 +525,8 @@ app.MapGet("/api/settings/scan-defaults", (ScanOptions options) => Results.Ok(ne
     options.MaxObjectsPerSecond,
     options.MaxConcurrentContentChecks,
     options.MaxDiscoveryRequests,
-    options.MaxPlanningSeconds
+    options.MaxPlanningSeconds,
+    options.MaxRecordedDifferencesPerRun
 }));
 
 // 11. Run Controls (Pause, Resume, Cancel): 404 when the run is not active, 409 when the state does not allow it
