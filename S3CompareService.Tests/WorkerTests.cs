@@ -182,6 +182,41 @@ public class WorkerApiTests
     }
 
     [TestMethod]
+    public async Task DeleteRun_RemovesFinishedRuns_WithTheirRows_AndRefusesActiveOnes()
+    {
+        var factory = new SqliteConnectionFactory(DatabaseConfig.GetConnectionString());
+        var runs = new ScanRunRepository(factory);
+        var diffRepo = new DifferenceRepository(factory);
+
+        var interrupted = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = "j", JobName = "del", Status = RunStatus.Interrupted, EndTimeUtc = DateTime.UtcNow };
+        var cancelled = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = "j", JobName = "del", Status = RunStatus.Cancelled, EndTimeUtc = DateTime.UtcNow };
+        var running = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = "j", JobName = "del", Status = RunStatus.Running };
+        var keep = new ScanRun { Id = Guid.NewGuid().ToString("N"), JobId = "j", JobName = "del", Status = RunStatus.Completed, EndTimeUtc = DateTime.UtcNow };
+        foreach (var r in new[] { interrupted, cancelled, running, keep }) await runs.CreateAsync(r);
+        await runs.SaveCheckpointAsync(new ScanCheckpoint { ScanRunId = interrupted.Id, JobId = "j", LastEvaluatedKey = "k/1" });
+        foreach (var r in new[] { interrupted, cancelled, keep })
+            await diffRepo.InsertBatchAsync(Enumerable.Range(0, 2500).Select(i => new RecordedDifference { ScanRunId = r.Id, Key = $"k/{i}", Type = DifferenceType.MissingInBucketB }));
+
+        Assert.AreEqual(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/runs/{interrupted.Id}")).StatusCode);
+        Assert.AreEqual(HttpStatusCode.NoContent, (await _client.DeleteAsync($"/api/runs/{cancelled.Id}")).StatusCode);
+        Assert.AreEqual(HttpStatusCode.Conflict, (await _client.DeleteAsync($"/api/runs/{running.Id}")).StatusCode);
+        Assert.AreEqual(HttpStatusCode.NotFound, (await _client.DeleteAsync($"/api/runs/{cancelled.Id}")).StatusCode);
+
+        Assert.IsNull(await runs.GetByIdAsync(interrupted.Id));
+        Assert.IsNull(await runs.GetByIdAsync(cancelled.Id));
+        Assert.IsNull(await runs.GetCheckpointAsync(interrupted.Id), "the checkpoint goes with the run (no resume at the next start)");
+        Assert.IsNotNull(await runs.GetByIdAsync(running.Id));
+
+        // Rows are removed in the background.
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        while (DateTime.UtcNow < deadline && (await diffRepo.GetDifferenceCountAsync(interrupted.Id) + await diffRepo.GetDifferenceCountAsync(cancelled.Id)) > 0)
+            await Task.Delay(100);
+        Assert.AreEqual(0, await diffRepo.GetDifferenceCountAsync(interrupted.Id));
+        Assert.AreEqual(0, await diffRepo.GetDifferenceCountAsync(cancelled.Id));
+        Assert.AreEqual(2500, await diffRepo.GetDifferenceCountAsync(keep.Id), "other runs are untouched");
+    }
+
+    [TestMethod]
     public async Task ExportView_StreamsEveryPageOfTheFilteredView_AsCsv()
     {
         var factory = new SqliteConnectionFactory(DatabaseConfig.GetConnectionString());

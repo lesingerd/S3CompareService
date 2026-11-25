@@ -1173,11 +1173,14 @@
 
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
                         <Button Content="Refresh Runs" Command="{Binding RefreshRunsCommand}" Style="{StaticResource SecondaryButton}" Margin="0,0,10,0" />
-                        <TextBlock Text="Select a scan run to view its metadata snapshots and browse differences." VerticalAlignment="Center" Foreground="#888888" />
+                        <Button Content="Delete Selected Runs" Command="{Binding DeleteRunsCommand}" CommandParameter="{Binding SelectedItems, ElementName=RunsGrid}"
+                                Style="{StaticResource SecondaryButton}" Foreground="#FF8A80" Margin="0,0,10,0"
+                                ToolTip="Permanently deletes the selected finished runs (Completed, Failed, Cancelled, Interrupted) and their stored differences. Ctrl+click or Shift+click to select several." />
+                        <TextBlock Text="Select a scan run to view its metadata snapshots and browse differences. Ctrl/Shift+click selects several runs for deletion." VerticalAlignment="Center" Foreground="#888888" />
                     </StackPanel>
 
                     <!-- Runs DataGrid -->
-                    <DataGrid Grid.Row="1" ItemsSource="{Binding Runs}" SelectedItem="{Binding SelectedRun}">
+                    <DataGrid x:Name="RunsGrid" Grid.Row="1" ItemsSource="{Binding Runs}" SelectedItem="{Binding SelectedRun}" SelectionMode="Extended">
                         <DataGrid.Columns>
                             <DataGridTextColumn Header="Job Name" Binding="{Binding JobName}" Width="180" />
                             <DataGridTextColumn Header="Start Time (UTC)" Binding="{Binding StartTimeUtc, StringFormat={}{0:yyyy-MM-dd HH:mm:ss}}" Width="150" />

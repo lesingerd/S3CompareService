@@ -512,6 +512,60 @@ app.MapGet("/api/runs/{id}/export/view-csv", async (
         filename);
 });
 
+// 9c. Delete a run (any finished status: Completed, Failed, Cancelled, Interrupted). The run disappears at once; its stored
+// differences and snapshots are removed in the background in small batches (audit log lines when it starts and ends).
+var runCleanupLock = new SemaphoreSlim(1, 1);
+app.MapDelete("/api/runs/{id}", async (
+    string id,
+    IScanRunRepository runRepo,
+    RetentionManager retention,
+    RetentionOptions retentionOpts,
+    ScanExecutionCoordinator coordinator,
+    IAuditLogRepository audit,
+    IHostApplicationLifetime lifetime) =>
+{
+    if (coordinator.IsRunActive(id))
+        return Error(409, "This run is still active (running or paused). Cancel it before deleting it.");
+    var run = await runRepo.GetByIdAsync(id);
+    if (run == null) return Error(404, $"Run '{id}' not found.");
+
+    var refusal = await retention.DeleteRunAsync(id);
+    if (refusal == RetentionManager.DeleteRunRefusal.NotFound) return Error(404, $"Run '{id}' not found.");
+    if (refusal == RetentionManager.DeleteRunRefusal.Active)
+        return Error(409, $"Run '{id}' is {run.Status}; only finished runs (Completed, Failed, Cancelled, Interrupted) can be deleted.");
+
+    await audit.LogAsync("INFO", "RunDelete",
+        $"Deleted run '{id}' ({run.JobName}, {run.Status}, started {run.StartTimeUtc:yyyy-MM-dd HH:mm:ss}Z, {run.TotalDifferences:N0} differences). Its stored rows are being removed in the background.",
+        scanRunId: id, jobId: run.JobId);
+
+    var stopping = lifetime.ApplicationStopping;
+    _ = Task.Run(async () =>
+    {
+        await runCleanupLock.WaitAsync(stopping);
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var (diffs, snaps) = await retention.DeleteOrphanedRowsAsync(retentionOpts, stopping);
+            if (diffs + snaps > 0)
+                await audit.LogAsync("INFO", "RunDelete", $"Removed {diffs:N0} stored difference(s) and {snaps:N0} snapshot(s) of deleted run(s) in {sw.Elapsed.TotalSeconds:N1}s.");
+        }
+        catch (OperationCanceledException)
+        {
+            // Service stopping: the hourly retention pass finishes the clean-up.
+        }
+        catch (Exception ex)
+        {
+            try { await audit.LogAsync("ERROR", "RunDelete", $"FAILED: removing the stored rows of deleted run(s): {ex.GetType().Name}: {ex.Message}. The hourly retention pass will try again.", ex.ToString()); } catch { }
+        }
+        finally
+        {
+            runCleanupLock.Release();
+        }
+    });
+
+    return Results.NoContent();
+});
+
 // 10. Export JSON
 app.MapGet("/api/runs/{id}/export/json", async (
     string id,

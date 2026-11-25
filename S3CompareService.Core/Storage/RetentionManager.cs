@@ -119,6 +119,11 @@ public sealed class RetentionManager
             await PauseAsync(options, cancellationToken).ConfigureAwait(false);
         }
 
+        // Rows of runs deleted by hand whose clean-up was stopped part way (e.g. by a service restart).
+        var orphans = await DeleteOrphanedRowsAsync(options, cancellationToken).ConfigureAwait(false);
+        diffs += orphans.Differences;
+        snaps += orphans.Snapshots;
+
         long logs = 0;
         if (options.AuditLogDays > 0)
         {
@@ -142,6 +147,65 @@ public sealed class RetentionManager
             Checkpoint = checkpoint,
             PagesVacuumed = pages
         };
+    }
+
+    /// <summary>Why a manual delete of a run was refused (null = deleted).</summary>
+    public enum DeleteRunRefusal { NotFound, Active }
+
+    /// <summary>
+    /// Manual delete of one run, any finished status (Completed, Failed, Cancelled, Interrupted). Removes the run row and its
+    /// checkpoint in one transaction, refusing a run that is Pending/Running/Paused at that moment (the check is in the DELETE,
+    /// so a run resumed concurrently is never removed). The run's differences and snapshots are not removed here: call
+    /// <see cref="DeleteOrphanedRowsAsync"/> afterwards (it may take a while for a large run).
+    /// </summary>
+    public async Task<DeleteRunRefusal?> DeleteRunAsync(string runId, CancellationToken cancellationToken = default)
+    {
+        await using var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var tx = await conn.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+        int removed = await conn.ExecuteAsync(new CommandDefinition(
+            "DELETE FROM ScanRuns WHERE Id = @Id AND Status NOT IN (@Pending, @Running, @Paused);",
+            new { Id = runId, Pending = (int)RunStatus.Pending, Running = (int)RunStatus.Running, Paused = (int)RunStatus.Paused },
+            transaction: tx, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        if (removed == 0)
+        {
+            await tx.RollbackAsync(cancellationToken).ConfigureAwait(false);
+            int exists = await conn.ExecuteScalarAsync<int>(new CommandDefinition("SELECT COUNT(*) FROM ScanRuns WHERE Id = @Id;", new { Id = runId }, cancellationToken: cancellationToken)).ConfigureAwait(false);
+            return exists == 0 ? DeleteRunRefusal.NotFound : DeleteRunRefusal.Active;
+        }
+        await conn.ExecuteAsync(new CommandDefinition("DELETE FROM Checkpoints WHERE ScanRunId = @Id;", new { Id = runId }, transaction: tx, cancellationToken: cancellationToken)).ConfigureAwait(false);
+        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return null;
+    }
+
+    /// <summary>
+    /// Deletes differences and snapshots whose run no longer exists (after <see cref="DeleteRunAsync"/>, or left by a delete
+    /// that was stopped part way), in small batches. Returns (differences, snapshots) removed.
+    /// </summary>
+    public async Task<(long Differences, long Snapshots)> DeleteOrphanedRowsAsync(RetentionOptions options, CancellationToken cancellationToken = default)
+    {
+        options = options.Normalized();
+        long diffs = 0, snaps = 0;
+        foreach (var (table, counter) in new[] { ("RecordedDifferences", 0), ("BucketMetadataSnapshots", 1) })
+        {
+            List<string> orphanRuns;
+            await using (var conn = await _factory.CreateOpenConnectionAsync(cancellationToken).ConfigureAwait(false))
+            {
+                orphanRuns = (await conn.QueryAsync<string>(new CommandDefinition(
+                    $"SELECT DISTINCT ScanRunId FROM {table} WHERE ScanRunId NOT IN (SELECT Id FROM ScanRuns);",
+                    cancellationToken: cancellationToken)).ConfigureAwait(false)).ToList();
+            }
+            foreach (var runId in orphanRuns)
+            {
+                long n = await DeleteInBatchesAsync(table, "ScanRunId", runId, options, cancellationToken).ConfigureAwait(false);
+                if (counter == 0) diffs += n; else snaps += n;
+            }
+        }
+        if (diffs + snaps > 0)
+        {
+            await CheckpointWalAsync(cancellationToken).ConfigureAwait(false);
+            await IncrementalVacuumAsync(options, cancellationToken).ConfigureAwait(false);
+        }
+        return (diffs, snaps);
     }
 
     private async Task<List<string>> SelectDeletableRunIdsAsync(RetentionOptions o, DateTime nowUtc, bool skipAge, CancellationToken ct)
